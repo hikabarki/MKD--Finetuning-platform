@@ -3,9 +3,13 @@ datasets/*/raw/
 datasets/*/normalized.jsonl
 datasets/*/train.jsonl
 datasets/*/val.jsonl
+datasets/*/sample_100.jsonl
 models/
 checkpoints/*/
 exports/
+
+# Axolotl preprocessed cache
+last_run_prepared/
 
 # But keep the manifests / cards
 !data_cards/*.json
