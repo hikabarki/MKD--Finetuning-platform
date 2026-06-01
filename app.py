@@ -15,6 +15,12 @@ import time
 from pathlib import Path
 
 import gradio as gr
+import pandas as pd
+
+# ── Chat model state (loaded lazily) ─────────────────────────────────────────
+_chat_model  = None
+_chat_tok    = None
+_chat_name   = None
 
 # ── Project root ──────────────────────────────────────────────────────────────
 ROOT   = Path(os.environ.get("FT_PROJECT", Path(__file__).resolve().parent))
@@ -329,6 +335,29 @@ def read_log(run_name: str) -> str:
     return terminal_wrap(ansi_to_html("\n".join(lines)), height=420)
 
 
+def get_loss_df(run_name: str) -> pd.DataFrame:
+    """Parse training log and return DataFrame for loss chart."""
+    if not run_name:
+        return pd.DataFrame({"Step": [], "Loss": []})
+    p = ROOT / "logs" / f"train_{run_name}.log"
+    if not p.exists():
+        return pd.DataFrame({"Step": [], "Loss": []})
+    steps, losses = [], []
+    for line in p.read_text().splitlines():
+        m = re.search(r"['\"]loss['\"]\s*[=:]\s*([\d.]+).*?['\"]step['\"]\s*[=:]\s*(\d+)", line)
+        if not m:
+            m = re.search(r"step['\"]?\s*[=:]\s*(\d+).*?loss['\"]?\s*[=:]\s*([\d.]+)", line)
+            if m:
+                steps.append(int(m.group(1)))
+                losses.append(float(m.group(2)))
+            continue
+        losses.append(float(m.group(1)))
+        steps.append(int(m.group(2)))
+    if not steps:
+        return pd.DataFrame({"Step": [], "Loss": []})
+    return pd.DataFrame({"Step": steps, "Loss": losses})
+
+
 def read_eval_summary(run_name: str) -> str:
     p = ROOT / "eval_results" / run_name / "summary.md"
     if not p.exists():
@@ -459,9 +488,15 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
         refresh_all_btn = gr.Button("↺  Refresh dashboard", size="sm",
                                     variant="secondary", scale=0)
 
+    # Auto-refresh every 10 seconds
+    dash_timer = gr.Timer(value=10)
+    dash_timer.tick(
+        lambda: (get_gpu_html(), get_pipeline_html(), get_stats_html(), get_state_html()),
+        outputs=[gpu_html, pipeline_html, stats_html, state_html],
+    )
     refresh_all_btn.click(
-        lambda: (get_pipeline_html(), get_stats_html(), get_state_html()),
-        outputs=[pipeline_html, stats_html, state_html],
+        lambda: (get_pipeline_html(), get_stats_html(), get_state_html(), get_gpu_html()),
+        outputs=[pipeline_html, stats_html, state_html, gpu_html],
     )
 
     gr.HTML('<div style="border-top:1px solid #30363d;margin:8px 0 16px;"></div>')
@@ -742,12 +777,30 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
             train_out = gr.HTML(terminal_wrap(""))
 
             gr.HTML('<div style="border-top:1px solid #30363d;margin:16px 0;"></div>')
-            gr.HTML('<h4 style="color:#c9d1d9;margin:0 0 10px;">Live training log</h4>')
+            gr.HTML('<h4 style="color:#c9d1d9;margin:0 0 10px;">Live training monitor</h4>')
             with gr.Row():
                 log_dd  = gr.Dropdown(label="Run", choices=list_checkpoints(),
                                        allow_custom_value=True, scale=3)
-                log_ref = gr.Button("↺ Refresh log", size="sm", variant="secondary", scale=0)
-            log_out = gr.HTML(terminal_wrap(""))
+                log_ref = gr.Button("↺ Refresh", size="sm", variant="secondary", scale=0)
+
+            with gr.Row():
+                with gr.Column(scale=2):
+                    log_out = gr.HTML(terminal_wrap(""))
+                with gr.Column(scale=3):
+                    loss_chart = gr.LinePlot(
+                        value=pd.DataFrame({"Step": [], "Loss": []}),
+                        x="Step", y="Loss",
+                        title="Training Loss",
+                        x_title="Step", y_title="Loss",
+                        height=300,
+                    )
+
+            # Auto-refresh loss chart every 15s when a run is selected
+            loss_timer = gr.Timer(value=15)
+            loss_timer.tick(
+                lambda r: get_loss_df(r),
+                inputs=log_dd, outputs=loss_chart,
+            )
 
             def do_smoke(c):
                 yield from run_ft(["smoke-test", f"configs/{c}"])
@@ -757,8 +810,10 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
 
             smoke_btn.click(do_smoke, inputs=train_cfg_dd, outputs=train_out, show_progress=False)
             train_btn.click(do_train, inputs=train_cfg_dd, outputs=train_out, show_progress=False)
-            log_ref.click(read_log, inputs=log_dd, outputs=log_out)
-            log_dd.change(read_log,  inputs=log_dd, outputs=log_out)
+            log_ref.click(lambda r: (read_log(r), get_loss_df(r)),
+                          inputs=log_dd, outputs=[log_out, loss_chart])
+            log_dd.change(lambda r: (read_log(r), get_loss_df(r)),
+                          inputs=log_dd, outputs=[log_out, loss_chart])
 
         # ── 6 · Eval ──────────────────────────────────────────────────────────
         with gr.Tab("6 · Eval"):
@@ -868,6 +923,142 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
 
                     pub_btn.click(do_publish, inputs=[pub_dd, hf_repo, gh_repo, pub_ack, pub_lic],
                                   outputs=pub_out, show_progress=False)
+
+        # ── 8 · Chat ──────────────────────────────────────────────────────────
+        with gr.Tab("8 · Chat"):
+            gr.HTML('<h3 style="color:#e6edf3;margin:0 0 4px;">Test your model</h3>'
+                    '<p style="color:#8b949e;font-size:13px;margin:0 0 16px;">'
+                    'Load any checkpoint or base model and chat with it directly.</p>')
+            with gr.Row():
+                with gr.Column(scale=1):
+                    chat_model_dd = gr.Dropdown(
+                        label="Model or checkpoint",
+                        choices=list_models() + list_checkpoints(),
+                        allow_custom_value=True,
+                    )
+                    gr.Button("↺ Refresh", size="sm", variant="secondary").click(
+                        lambda: gr.Dropdown(choices=list_models() + list_checkpoints()),
+                        outputs=chat_model_dd)
+                    chat_system = gr.Textbox(
+                        label="System prompt",
+                        value="You are a helpful assistant.",
+                        lines=3,
+                    )
+                    chat_max_tokens = gr.Slider(64, 1024, value=256, step=64,
+                                                 label="Max new tokens")
+                    with gr.Row():
+                        chat_load_btn  = gr.Button("Load model", variant="primary")
+                        chat_unload_btn = gr.Button("Unload", variant="secondary")
+                    chat_status = gr.HTML(
+                        '<div style="color:#8b949e;font-size:12px;padding:8px 0;">No model loaded.</div>')
+
+                with gr.Column(scale=2):
+                    chatbot = gr.Chatbot(height=420)
+                    with gr.Row():
+                        chat_input = gr.Textbox(
+                            placeholder="Type your message...",
+                            label="", scale=4, lines=1,
+                        )
+                        chat_send  = gr.Button("Send", variant="primary", scale=0)
+                    chat_clear = gr.Button("Clear conversation", size="sm", variant="secondary")
+
+            def load_model(model_name):
+                global _chat_model, _chat_tok, _chat_name
+                if not model_name:
+                    return '<div style="color:#f85149;padding:8px;">Select a model first.</div>'
+                # Unload previous
+                if _chat_model is not None:
+                    del _chat_model
+                    _chat_model = None
+                    import gc; gc.collect()
+                    try:
+                        import torch; torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+
+                model_path = ROOT / "models" / model_name
+                if not model_path.exists():
+                    model_path = ROOT / "checkpoints" / model_name
+                if not model_path.exists():
+                    model_path = Path(model_name)
+
+                try:
+                    from transformers import AutoTokenizer, AutoModelForCausalLM
+                    import torch
+                    _chat_tok = AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=False)
+                    _chat_model = AutoModelForCausalLM.from_pretrained(
+                        str(model_path), device_map="auto",
+                        torch_dtype=torch.bfloat16, trust_remote_code=False,
+                    )
+                    _chat_name = model_name
+                    return f'<div style="color:#3fb950;font-weight:600;padding:8px;">Loaded: {model_name}</div>'
+                except Exception as e:
+                    return f'<div style="color:#f85149;padding:8px;">Failed: {e}</div>'
+
+            def unload_model():
+                global _chat_model, _chat_tok, _chat_name
+                if _chat_model is not None:
+                    del _chat_model; _chat_model = None
+                    del _chat_tok;   _chat_tok = None
+                    _chat_name = None
+                    import gc; gc.collect()
+                    try:
+                        import torch; torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                return '<div style="color:#8b949e;padding:8px;">Model unloaded. GPU memory freed.</div>'
+
+            def chat_respond(message, history, system_prompt, max_tokens):
+                global _chat_model, _chat_tok
+                if not message.strip():
+                    yield history or [], ""
+                    return
+
+                history = history or []
+
+                if _chat_model is None:
+                    history = history + [[message, "No model loaded. Please load a model first."]]
+                    yield history, ""
+                    return
+
+                history = history + [[message, None]]
+                yield history, ""
+
+                try:
+                    import torch
+                    # Build messages from history
+                    msgs = [{"role": "system", "content": system_prompt}]
+                    for user_msg, bot_msg in history[:-1]:
+                        msgs.append({"role": "user", "content": user_msg})
+                        if bot_msg:
+                            msgs.append({"role": "assistant", "content": bot_msg})
+                    msgs.append({"role": "user", "content": message})
+
+                    text = _chat_tok.apply_chat_template(
+                        msgs, tokenize=False, add_generation_prompt=True)
+                    ids = _chat_tok(text, return_tensors="pt").input_ids.to(_chat_model.device)
+                    with torch.no_grad():
+                        out = _chat_model.generate(
+                            ids, max_new_tokens=max_tokens,
+                            do_sample=True, temperature=0.7, top_p=0.9,
+                            pad_token_id=_chat_tok.eos_token_id,
+                        )
+                    reply = _chat_tok.decode(out[0][ids.shape[1]:], skip_special_tokens=True).strip()
+                except Exception as e:
+                    reply = f"Error during generation: {e}"
+
+                history[-1][1] = reply
+                yield history, ""
+
+            chat_load_btn.click(load_model, inputs=chat_model_dd, outputs=chat_status)
+            chat_unload_btn.click(unload_model, outputs=chat_status)
+            chat_send.click(chat_respond,
+                            inputs=[chat_input, chatbot, chat_system, chat_max_tokens],
+                            outputs=[chatbot, chat_input], show_progress=False)
+            chat_input.submit(chat_respond,
+                              inputs=[chat_input, chatbot, chat_system, chat_max_tokens],
+                              outputs=[chatbot, chat_input], show_progress=False)
+            chat_clear.click(lambda: [], outputs=chatbot)
 
     # ── Footer ────────────────────────────────────────────────────────────────
     gr.HTML("""

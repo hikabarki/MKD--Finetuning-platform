@@ -237,9 +237,9 @@ logging_steps: 10
 output_dir: checkpoints/run_{ts}
 
 # --- Logging -----------------------------------------------------------------
-wandb_project: mkd-finetuning
-wandb_entity: mkd-hika
-wandb_name: {run_name}
+wandb_project: ""
+wandb_entity: ""
+wandb_name: ""
 wandb_log_model: "false"
 
 # --- Stability ---------------------------------------------------------------
