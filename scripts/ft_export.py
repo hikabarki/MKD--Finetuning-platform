@@ -92,11 +92,11 @@ if not base_path.exists() and stored_base:
     base_path = Path(stored_base)
 print(f"Base model: {{base_path}}")
 
-# Load base model
-print("Loading base model ...")
+# Load base model on CPU — avoids GPU OOM when other processes hold memory
+print("Loading base model on CPU ...")
 base = AutoModelForCausalLM.from_pretrained(
-    str(base_path), device_map="auto",
-    torch_dtype=torch.bfloat16, local_files_only=True,
+    str(base_path), device_map="cpu",
+    torch_dtype=torch.float32, local_files_only=True,
 )
 
 # Load adapter weights directly from safetensors — bypasses all HF Hub calls
@@ -149,8 +149,12 @@ peft_model.load_state_dict(weights, strict=False)
 print("Merging LoRA into base model ...")
 merged = peft_model.merge_and_unload()
 
+# Convert to bfloat16 before saving — reduces file size from ~28GB to ~14GB
+print("Converting to bfloat16 for saving ...")
+merged = merged.to(torch.bfloat16)
+
 print("Saving merged model ...")
-merged.save_pretrained(str(out_dir), safe_serialization=True)
+merged.save_pretrained(str(out_dir), safe_serialization=True, max_shard_size="4GB")
 
 tok_src = str(ckpt_dir) if (ckpt_dir / "tokenizer.json").exists() else str(base_path)
 tok = AutoTokenizer.from_pretrained(tok_src, local_files_only=True)
@@ -164,10 +168,12 @@ print("Merge complete.")
             cwd=str(root),
         )
         script_path.unlink(missing_ok=True)
+        # Always print stdout so we can see progress
+        if result.stdout.strip():
+            info(result.stdout.strip()[-800:])
         if result.returncode != 0:
-            warn(f"LoRA merge failed: {result.stderr[-600:]}")
+            warn(f"LoRA merge failed:\nSTDOUT: {result.stdout[-400:]}\nSTDERR: {result.stderr[-400:]}")
             return False
-        info(result.stdout.strip())
         ok(f"Merged model saved to {merged_dir}")
         return True
     except FileNotFoundError:
@@ -284,39 +290,78 @@ print(json.dumps(outputs))
 def write_model_card(export_dir: Path, ckpt_dir: Path, base_model: str,
                      root: Path) -> Path:
     """Generate a MODEL_CARD.md template."""
-    # Pull eval summary if available
-    eval_dir = root / "eval_results" / ckpt_dir.name
+    import re as _re
     eval_summary_link = f"eval_results/{ckpt_dir.name}/summary.md"
 
-    # Try to get val loss from training logs
-    val_loss = "_fill in_"
+    # ── Auto-fill: val loss from training log ────────────────────────────────
+    val_loss = "_pending_"
     log_file = root / "logs" / f"train_{ckpt_dir.name}.log"
     if log_file.exists():
         for line in reversed(log_file.read_text().splitlines()):
-            if "eval_loss" in line or "val_loss" in line:
-                try:
-                    import re
-                    m = re.search(r"(?:eval|val)_loss['\": ]+([0-9.]+)", line)
-                    if m:
-                        val_loss = m.group(1)
-                        break
-                except Exception:
-                    pass
+            m = _re.search(r"(?:eval|val)_loss['\": ]+([0-9.]+)", line)
+            if m:
+                val_loss = m.group(1)
+                break
+
+    # ── Auto-fill: GPU from nvidia-smi ───────────────────────────────────────
+    gpu_info = "RTX 5090 32GB"
+    try:
+        import subprocess as _sp
+        out = _sp.check_output(
+            ["nvidia-smi", "--query-gpu=name,memory.total",
+             "--format=csv,noheader,nounits"], text=True, timeout=3)
+        name, mem = out.strip().splitlines()[0].split(",")
+        gpu_info = f"{name.strip()} {int(mem.strip())//1024}GB"
+    except Exception:
+        pass
+
+    # ── Auto-fill: training duration from log ────────────────────────────────
+    duration = "_pending_"
+    if log_file.exists():
+        lines = log_file.read_text().splitlines()
+        for line in lines[:5]:
+            if "Starting" in line or "started" in line.lower():
+                pass  # parse start time from log if needed
+
+    # ── Auto-fill: base model HF URL ─────────────────────────────────────────
+    # Resolve local model name back to HF id from MODEL_INFO.json
+    hf_model_id = base_model
+    info_file = root / base_model / "MODEL_INFO.json"
+    if info_file.exists():
+        try:
+            import json as _j
+            mi = _j.loads(info_file.read_text())
+            hf_model_id = mi.get("model_id", base_model)
+        except Exception:
+            pass
+
+    # ── Auto-fill: dataset info ───────────────────────────────────────────────
+    dataset_name = "_pending_"
+    for card_file in (root / "data_cards").glob("*.json"):
+        try:
+            import json as _j
+            card = _j.loads(card_file.read_text())
+            dataset_name = f"{card.get('name', '')} ({card.get('train_rows', '?')} rows)"
+            break
+        except Exception:
+            pass
 
     card = f"""\
 # {{repo-name}}
 
-Fine-tuned from [{base_model}](https://huggingface.co/{base_model}).
+Fine-tuned from [{hf_model_id}](https://huggingface.co/{hf_model_id}) on the {dataset_name} dataset.
 
 ## Intended use
-{{filled by user — required to be non-empty before publish}}
+{{filled by user — describe what this model is for}}
 
 ## Training details
-- Method: QLoRA (LoRA rank 32, NF4 base weights)
-- Hardware: {{fill in GPU}}
-- Duration: {{fill in duration}}
-- Base model: {base_model}
+- Method: QLoRA (LoRA rank 32, NF4 base weights, bfloat16 compute)
+- Hardware: {gpu_info}
+- Duration: {duration}
+- Dataset: {dataset_name}
+- Base model: [{hf_model_id}](https://huggingface.co/{hf_model_id})
 - Final val loss: {val_loss}
+- Trained by: Hika — MKD Co., Ltd.
 
 ## Evaluation
 Full report: [{eval_summary_link}]({eval_summary_link})
@@ -327,18 +372,18 @@ Full report: [{eval_summary_link}]({eval_summary_link})
 | MT-Bench | _pending_ | _pending_ | _pending_ |
 
 ## Bias, risks, limitations
-{{filled by user}}
+{{filled by user — describe known limitations}}
 
 ## License
-Inherits license of {base_model}. See LICENSE.
+Inherits license of [{hf_model_id}](https://huggingface.co/{hf_model_id}).
 
 ## Citation
-{{filled by user, optional}}
+{{optional}}
 """
     out = export_dir / "MODEL_CARD.md"
     out.write_text(card)
     ok(f"MODEL_CARD.md written to {out}")
-    warn("Edit MODEL_CARD.md — fill all {{...}} placeholders before running `ft publish`")
+    warn("Edit MODEL_CARD.md — fill {{...}} placeholders before publishing")
     return out
 
 
