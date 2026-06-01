@@ -931,13 +931,34 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                     'Load any checkpoint or base model and chat with it directly.</p>')
             with gr.Row():
                 with gr.Column(scale=1):
+                    def list_chat_models():
+                        opts = []
+                        # Merged exports first (fine-tuned, ready to use)
+                        exp = ROOT / "exports"
+                        if exp.exists():
+                            for d in sorted(exp.iterdir()):
+                                m = d / "merged"
+                                if m.exists() and any(m.glob("model*.safetensors")):
+                                    opts.append(f"exports/{d.name}/merged  [fine-tuned]")
+                        # Base models
+                        opts += [f"models/{n}  [base]" for n in list_models()]
+                        # LoRA checkpoints
+                        opts += [f"checkpoints/{n}  [adapter]" for n in list_checkpoints()]
+                        return opts
+
+                    def resolve_chat_path(selection: str) -> str:
+                        """Strip label suffix and resolve to full path."""
+                        path = selection.split("  [")[0].strip()
+                        full = ROOT / path
+                        return str(full) if full.exists() else path
+
                     chat_model_dd = gr.Dropdown(
                         label="Model or checkpoint",
-                        choices=list_models() + list_checkpoints(),
+                        choices=list_chat_models(),
                         allow_custom_value=True,
                     )
                     gr.Button("↺ Refresh", size="sm", variant="secondary").click(
-                        lambda: gr.Dropdown(choices=list_models() + list_checkpoints()),
+                        lambda: gr.Dropdown(choices=list_chat_models()),
                         outputs=chat_model_dd)
                     chat_system = gr.Textbox(
                         label="System prompt",
@@ -976,22 +997,27 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                     except Exception:
                         pass
 
-                model_path = ROOT / "models" / model_name
+                # Resolve the path (strips label suffix like "  [fine-tuned]")
+                resolved = resolve_chat_path(model_name)
+                model_path = Path(resolved)
                 if not model_path.exists():
-                    model_path = ROOT / "checkpoints" / model_name
+                    model_path = ROOT / resolved
                 if not model_path.exists():
-                    model_path = Path(model_name)
+                    return f'<div style="color:#f85149;padding:8px;">Path not found: {resolved}</div>'
 
                 try:
                     from transformers import AutoTokenizer, AutoModelForCausalLM
                     import torch
-                    _chat_tok = AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=False)
+                    _chat_tok = AutoTokenizer.from_pretrained(
+                        str(model_path), trust_remote_code=False, local_files_only=True)
                     _chat_model = AutoModelForCausalLM.from_pretrained(
                         str(model_path), device_map="auto",
                         torch_dtype=torch.bfloat16, trust_remote_code=False,
+                        local_files_only=True,
                     )
                     _chat_name = model_name
-                    return f'<div style="color:#3fb950;font-weight:600;padding:8px;">Loaded: {model_name}</div>'
+                    label = model_name.split("  [")[0]
+                    return f'<div style="color:#3fb950;font-weight:600;padding:8px;">Loaded: {label}</div>'
                 except Exception as e:
                     return f'<div style="color:#f85149;padding:8px;">Failed: {e}</div>'
 
@@ -1014,24 +1040,38 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                     yield history or [], ""
                     return
 
-                history = history or []
+                history = list(history or [])
 
                 if _chat_model is None:
-                    history = history + [[message, "No model loaded. Please load a model first."]]
+                    history.append({"role": "user",      "content": message})
+                    history.append({"role": "assistant", "content": "No model loaded. Please load a model first."})
                     yield history, ""
                     return
 
-                history = history + [[message, None]]
-                yield history, ""
-
                 try:
                     import torch
-                    # Build messages from history
+                    # Build messages for the model
+                    def extract_text(content) -> str:
+                        """Gradio 6 stores content as str or [{'text':...,'type':'text'}]."""
+                        if isinstance(content, str):
+                            return content
+                        if isinstance(content, list):
+                            parts = []
+                            for item in content:
+                                if isinstance(item, dict):
+                                    parts.append(item.get("text", str(item)))
+                                else:
+                                    parts.append(str(item))
+                            return " ".join(parts)
+                        return str(content)
+
                     msgs = [{"role": "system", "content": system_prompt}]
-                    for user_msg, bot_msg in history[:-1]:
-                        msgs.append({"role": "user", "content": user_msg})
-                        if bot_msg:
-                            msgs.append({"role": "assistant", "content": bot_msg})
+                    for turn in history:
+                        if isinstance(turn, dict):
+                            msgs.append({
+                                "role": turn.get("role", "user"),
+                                "content": extract_text(turn.get("content", "")),
+                            })
                     msgs.append({"role": "user", "content": message})
 
                     text = _chat_tok.apply_chat_template(
@@ -1045,9 +1085,10 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                         )
                     reply = _chat_tok.decode(out[0][ids.shape[1]:], skip_special_tokens=True).strip()
                 except Exception as e:
-                    reply = f"Error during generation: {e}"
+                    reply = f"Error: {e}"
 
-                history[-1][1] = reply
+                history.append({"role": "user",      "content": message})
+                history.append({"role": "assistant", "content": reply})
                 yield history, ""
 
             chat_load_btn.click(load_model, inputs=chat_model_dd, outputs=chat_status)

@@ -45,64 +45,99 @@ def load_eval_suite(root: Path, suite_path: str) -> dict:
     }
 
 
-def resolve_model_args(ckpt_dir: Path, root: Path) -> str:
-    """Build the lm_eval --model_args string.
+def resolve_model_args(ckpt_dir: Path, root: Path) -> tuple[str, str | None]:
+    """Build (model_args_string, peft_path_or_None) for lm_eval.
 
-    If the checkpoint is a LoRA adapter (has adapter_config.json but no
-    model.safetensors), we need to pass the base model + peft adapter path.
+    Prefers a merged export if available (no PEFT needed).
+    Falls back to base + peft adapter.
+    Returns (model_args, peft_local_path) where peft_local_path is used
+    to write a patched wrapper script.
     """
+    run_id = ckpt_dir.name
+
+    # 1. Prefer merged export (no peft path needed — avoids HF validator)
+    merged = root / "exports" / run_id / "merged"
+    if merged.exists() and any(merged.glob("model*.safetensors")):
+        info(f"  Using merged export: {merged}")
+        return f"pretrained={merged},dtype=bfloat16", None
+
     has_weights = any(ckpt_dir.glob("model*.safetensors")) or \
-                  any(ckpt_dir.glob("model*.bin")) or \
-                  any(ckpt_dir.glob("pytorch_model*.bin"))
-    is_adapter   = (ckpt_dir / "adapter_config.json").exists()
-
+                  any(ckpt_dir.glob("model*.bin"))
     if has_weights:
-        # Full merged model — point directly at it
-        return f"pretrained={ckpt_dir}"
+        return f"pretrained={ckpt_dir},dtype=bfloat16", None
 
+    # 2. LoRA adapter — need base + peft
+    is_adapter = (ckpt_dir / "adapter_config.json").exists()
     if is_adapter:
-        # LoRA adapter — find the base model from adapter_config.json
         try:
             cfg = json.loads((ckpt_dir / "adapter_config.json").read_text())
             base = cfg.get("base_model_name_or_path", "")
         except Exception:
             base = ""
-
-        # Try local models/ directory first
         if base:
             safe_name = base.replace("/", "__").lower()
             local = root / "models" / safe_name
             if local.exists():
                 base = str(local)
-
         if base:
             info(f"  LoRA adapter detected. Base model: {base}")
-            return f"pretrained={base},peft={ckpt_dir},dtype=bfloat16"
-        else:
-            warn("  Could not determine base model from adapter_config.json")
-            return f"pretrained={ckpt_dir}"
+            return f"pretrained={base},peft={ckpt_dir},dtype=bfloat16", str(ckpt_dir)
 
-    # Fallback — try as-is
-    return f"pretrained={ckpt_dir}"
+    return f"pretrained={ckpt_dir},dtype=bfloat16", None
 
 
 def run_lm_eval(ckpt_dir: Path, tasks: list[str], num_fewshot: int,
                 output_dir: Path, name: str, root: Path) -> dict | None:
     """Run lm-evaluation-harness. Returns parsed results dict or None."""
     out_file = output_dir / f"{name}.json"
-    model_args = resolve_model_args(ckpt_dir, root)
-    cmd = [
-        sys.executable, "-m", "lm_eval",
-        "--model", "hf",
-        "--model_args", model_args,
-        "--tasks", ",".join(tasks),
-        "--num_fewshot", str(num_fewshot),
-        "--output_path", str(out_file),
-        "--batch_size", "auto",
-    ]
+    model_args, peft_path = resolve_model_args(ckpt_dir, root)
+
+    # If peft path is an absolute local path, lm_eval passes it to HF Hub
+    # which rejects it. Write a wrapper script that patches the validator.
+    if peft_path:
+        wrapper = root / "eval_results" / f".lm_eval_wrapper_{name}.py"
+        wrapper.write_text(f"""\
+import sys
+from pathlib import Path
+
+# Patch HF repo_id validator to accept absolute local paths
+import huggingface_hub.utils._validators as _v
+_orig = _v.validate_repo_id
+def _p(value, *a, **kw):
+    if Path(str(value)).exists(): return
+    _orig(value, *a, **kw)
+_v.validate_repo_id = _p
+
+import lm_eval.__main__
+sys.argv = {json.dumps([
+    "lm_eval",
+    "--model", "hf",
+    "--model_args", model_args,
+    "--tasks", ",".join(tasks),
+    "--num_fewshot", str(num_fewshot),
+    "--output_path", str(out_file),
+    "--batch_size", "auto",
+])}
+lm_eval.__main__.cli_evaluate()
+""")
+        cmd = [sys.executable, str(wrapper)]
+    else:
+        cmd = [
+            sys.executable, "-m", "lm_eval",
+            "--model", "hf",
+            "--model_args", model_args,
+            "--tasks", ",".join(tasks),
+            "--num_fewshot", str(num_fewshot),
+            "--output_path", str(out_file),
+            "--batch_size", "auto",
+        ]
+
     info(f"  Running lm_eval: {' '.join(tasks)} (few-shot={num_fewshot})")
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=3600, cwd=str(root))
+        if peft_path:
+            wrapper.unlink(missing_ok=True)
         if result.returncode != 0:
             warn(f"  lm_eval failed for {tasks}: {result.stderr[-500:]}")
             return None
