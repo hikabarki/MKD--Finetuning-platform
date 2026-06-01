@@ -61,42 +61,120 @@ def merge_lora(ckpt_dir: Path, base_model: str, merged_dir: Path) -> bool:
     """Merge LoRA adapters into the base model using PEFT."""
     info(f"Merging LoRA: {ckpt_dir.name} → {merged_dir.name}")
     merged_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        merge_script = f"""
-import sys
+
+    # Write a temp script file — avoids path escaping issues in -c strings
+    root = project_root()
+    script_path = root / "exports" / ".merge_tmp.py"
+    script_path.parent.mkdir(parents=True, exist_ok=True)
+    script_path.write_text(f"""\
+import os, sys, json
+os.chdir("{root}")
+
 from pathlib import Path
-from peft import AutoPeftModelForCausalLM
-from transformers import AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
 
-ckpt = "{ckpt_dir}"
-base = "{base_model}"
-out  = "{merged_dir}"
+ckpt_dir  = Path("{ckpt_dir}")
+base_path = Path("{base_model}")
+out_dir   = Path("{merged_dir}")
 
-print("Loading adapter...")
-model = AutoPeftModelForCausalLM.from_pretrained(ckpt, device_map="cpu")
-print("Merging and unloading...")
-merged = model.merge_and_unload()
-print("Saving merged model...")
-merged.save_pretrained(out, safe_serialization=True)
+# Read adapter config directly from disk — no HF Hub calls
+adapter_cfg_file = ckpt_dir / "adapter_config.json"
+if not adapter_cfg_file.exists():
+    print(f"ERROR: No adapter_config.json in {{ckpt_dir}}", file=sys.stderr)
+    sys.exit(1)
 
-tok = AutoTokenizer.from_pretrained(ckpt if Path(ckpt + "/tokenizer.json").exists() else base)
-tok.save_pretrained(out)
-print("Done.")
-"""
+adapter_cfg = json.loads(adapter_cfg_file.read_text())
+
+# Resolve base model
+stored_base = adapter_cfg.get("base_model_name_or_path", "")
+if not base_path.exists() and stored_base:
+    base_path = Path(stored_base)
+print(f"Base model: {{base_path}}")
+
+# Load base model
+print("Loading base model ...")
+base = AutoModelForCausalLM.from_pretrained(
+    str(base_path), device_map="auto",
+    torch_dtype=torch.bfloat16, local_files_only=True,
+)
+
+# Load adapter weights directly from safetensors — bypasses all HF Hub calls
+print("Loading adapter weights from disk ...")
+from peft import LoraConfig, get_peft_model
+
+# Build LoraConfig from the saved JSON
+lora_fields = {{
+    "r": adapter_cfg.get("r", 32),
+    "lora_alpha": adapter_cfg.get("lora_alpha", 64),
+    "lora_dropout": adapter_cfg.get("lora_dropout", 0.05),
+    "target_modules": adapter_cfg.get("target_modules"),
+    "bias": adapter_cfg.get("bias", "none"),
+    "task_type": adapter_cfg.get("task_type", "CAUSAL_LM"),
+}}
+lora_config = LoraConfig(**lora_fields)
+peft_model = get_peft_model(base, lora_config)
+
+# Find adapter weights — may be at root or in latest checkpoint-N subdir
+def find_adapter_weights(base_dir):
+    for candidate in [base_dir / "adapter_model.safetensors",
+                      base_dir / "adapter_model.bin"]:
+        if candidate.exists():
+            return candidate
+    # Search checkpoint-N subdirectories (pick highest step)
+    subdirs = sorted(
+        [d for d in base_dir.iterdir() if d.is_dir() and d.name.startswith("checkpoint-")],
+        key=lambda d: int(d.name.split("-")[-1]),
+        reverse=True,
+    )
+    for sub in subdirs:
+        for candidate in [sub / "adapter_model.safetensors",
+                          sub / "adapter_model.bin"]:
+            if candidate.exists():
+                return candidate
+    return None
+
+weights_file = find_adapter_weights(ckpt_dir)
+if weights_file is None:
+    print("ERROR: No adapter_model.safetensors or adapter_model.bin found", file=sys.stderr)
+    sys.exit(1)
+print(f"Loading adapter weights from {{weights_file}} ...")
+if weights_file.suffix == ".safetensors":
+    from safetensors.torch import load_file
+    weights = load_file(str(weights_file))
+else:
+    weights = torch.load(str(weights_file), map_location="cpu")
+
+peft_model.load_state_dict(weights, strict=False)
+print("Merging LoRA into base model ...")
+merged = peft_model.merge_and_unload()
+
+print("Saving merged model ...")
+merged.save_pretrained(str(out_dir), safe_serialization=True)
+
+tok_src = str(ckpt_dir) if (ckpt_dir / "tokenizer.json").exists() else str(base_path)
+tok = AutoTokenizer.from_pretrained(tok_src, local_files_only=True)
+tok.save_pretrained(str(out_dir))
+print("Merge complete.")
+""")
+    try:
         result = subprocess.run(
-            [sys.executable, "-c", merge_script],
+            [sys.executable, str(script_path)],
             capture_output=True, text=True, timeout=1800,
+            cwd=str(root),
         )
+        script_path.unlink(missing_ok=True)
         if result.returncode != 0:
-            warn(f"LoRA merge failed: {result.stderr[-500:]}")
+            warn(f"LoRA merge failed: {result.stderr[-600:]}")
             return False
+        info(result.stdout.strip())
         ok(f"Merged model saved to {merged_dir}")
         return True
     except FileNotFoundError:
         warn("PEFT not installed. Install: pip install peft transformers")
         return False
     except subprocess.TimeoutExpired:
-        warn("Merge timed out (>30min)")
+        warn("Merge timed out (>30 min)")
         return False
 
 
