@@ -1,0 +1,44 @@
+{
+  "suites": [
+    {
+      "name": "mmlu",
+      "harness": "lm_eval",
+      "tasks": ["mmlu"],
+      "num_fewshot": 5
+    },
+    {
+      "name": "arc_challenge",
+      "harness": "lm_eval",
+      "tasks": ["arc_challenge"],
+      "num_fewshot": 25
+    },
+    {
+      "name": "hellaswag",
+      "harness": "lm_eval",
+      "tasks": ["hellaswag"],
+      "num_fewshot": 10
+    },
+    {
+      "name": "truthfulqa",
+      "harness": "lm_eval",
+      "tasks": ["truthfulqa_mc2"],
+      "num_fewshot": 0
+    },
+    {
+      "name": "gsm8k",
+      "harness": "lm_eval",
+      "tasks": ["gsm8k"],
+      "num_fewshot": 5
+    },
+    {
+      "name": "ifeval",
+      "harness": "lm_eval",
+      "tasks": ["ifeval"],
+      "num_fewshot": 0
+    }
+  ],
+  "contamination_ngram": 13,
+  "contamination_threshold": 0.005,
+  "judge_model": "gpt-4o",
+  "ab_prompts": 500
+}

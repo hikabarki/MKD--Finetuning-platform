@@ -1,0 +1,930 @@
+#!/usr/bin/env python3
+"""
+app.py — Production-grade Gradio UI for the MKD Fine-Tuning Platform.
+
+Launch:  ft ui  |  python app.py  |  python app.py --port 7860 --share
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import gradio as gr
+
+# ── Project root ──────────────────────────────────────────────────────────────
+ROOT   = Path(os.environ.get("FT_PROJECT", Path(__file__).resolve().parent))
+SCRIPTS = ROOT / "scripts"
+PYTHON  = sys.executable
+
+# ── ANSI → HTML terminal renderer ─────────────────────────────────────────────
+_ANSI_COLOR = {
+    "32": "#3fb950", "33": "#d29922", "31": "#f85149",
+    "36": "#39c5cf", "35": "#bc8cff", "34": "#58a6ff",
+    "2":  "#8b949e", "1":  None,
+}
+
+def ansi_to_html(text: str) -> str:
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    open_span = False
+
+    def replace(m):
+        nonlocal open_span
+        codes = m.group(1).split(";")
+        if codes == ["0"] or codes == [""]:
+            end = "</span>" if open_span else ""
+            open_span = False
+            return end
+        styles, attrs = [], []
+        for c in codes:
+            if c in _ANSI_COLOR:
+                v = _ANSI_COLOR[c]
+                if v:
+                    styles.append(f"color:{v}")
+                else:
+                    attrs.append("font-weight:bold")
+        style = ";".join(styles + attrs)
+        if style:
+            if open_span:
+                result = f"</span><span style='{style}'>"
+            else:
+                result = f"<span style='{style}'>"
+            open_span = True
+            return result
+        return ""
+
+    html = re.sub(r"\033\[([0-9;]*)m", replace, text)
+    html = re.sub(r"\033\[[0-9]*[A-HJKST]", "", html)
+    if open_span:
+        html += "</span>"
+    html = html.replace("\n", "<br>")
+    # Strip box-drawing chars that don't render cleanly in HTML
+    for ch, rep in [("╭","┌"),("╮","┐"),("╰","└"),("╯","┘"),("─","─"),("│","│")]:
+        pass  # keep them, they render fine
+    return html
+
+
+def terminal_wrap(content: str, height: int = 380) -> str:
+    return f"""
+<div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;
+            font-family:'JetBrains Mono',Consolas,monospace;font-size:13px;
+            color:#e6edf3;line-height:1.65;padding:16px;
+            max-height:{height}px;overflow-y:auto;white-space:pre-wrap;">
+{content if content else '<span style="color:#8b949e">Output will appear here...</span>'}
+</div>"""
+
+
+# ── Data helpers ───────────────────────────────────────────────────────────────
+def list_datasets()         -> list[str]:
+    d = ROOT / "datasets"
+    return [p.name for p in d.iterdir() if p.is_dir()] if d.exists() else []
+
+def list_cleaned_datasets() -> list[str]:
+    d = ROOT / "datasets"
+    return [p.name for p in d.iterdir()
+            if p.is_dir() and (p / "train.jsonl").exists()] if d.exists() else []
+
+def list_models()           -> list[str]:
+    d = ROOT / "models"
+    return [p.name for p in d.iterdir() if p.is_dir()] if d.exists() else []
+
+def list_configs()          -> list[str]:
+    d = ROOT / "configs"
+    return sorted([p.name for p in d.glob("run_*.yaml")], reverse=True) if d.exists() else []
+
+def list_checkpoints()      -> list[str]:
+    d = ROOT / "checkpoints"
+    return sorted([p.name for p in d.iterdir() if p.is_dir()], reverse=True) if d.exists() else []
+
+def list_exports()          -> list[str]:
+    d = ROOT / "exports"
+    return sorted([p.name for p in d.iterdir() if p.is_dir()], reverse=True) if d.exists() else []
+
+
+def get_gpu_html() -> str:
+    try:
+        rows = subprocess.check_output(
+            ["nvidia-smi",
+             "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
+             "--format=csv,noheader,nounits"],
+            text=True, timeout=4,
+        ).strip().splitlines()
+        cards = []
+        for row in rows:
+            idx, name, util, mu, mt, temp, pwr = [p.strip() for p in row.split(",")]
+            util_i = int(util)
+            bar_w  = util_i
+            bar_col = "#3fb950" if util_i < 70 else ("#d29922" if util_i < 90 else "#f85149")
+            cards.append(f"""
+<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px 18px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+    <span style="color:#e6edf3;font-weight:600;font-size:14px;">GPU {idx} · {name}</span>
+    <span style="color:#8b949e;font-size:12px;">{temp}°C · {pwr}W</span>
+  </div>
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
+    <span style="color:#8b949e;font-size:12px;width:36px;">Util</span>
+    <div style="flex:1;background:#21262d;border-radius:4px;height:8px;">
+      <div style="width:{bar_w}%;background:{bar_col};border-radius:4px;height:8px;transition:width 0.3s;"></div>
+    </div>
+    <span style="color:{bar_col};font-size:12px;font-weight:600;width:36px;">{util}%</span>
+  </div>
+  <div style="display:flex;align-items:center;gap:10px;">
+    <span style="color:#8b949e;font-size:12px;width:36px;">VRAM</span>
+    <div style="flex:1;background:#21262d;border-radius:4px;height:8px;">
+      <div style="width:{int(int(mu)/int(mt)*100)}%;background:#58a6ff;border-radius:4px;height:8px;"></div>
+    </div>
+    <span style="color:#58a6ff;font-size:12px;font-weight:600;width:80px;">{int(mu):,}/{int(mt):,} MiB</span>
+  </div>
+</div>""")
+        return "\n".join(cards)
+    except Exception as e:
+        return f'<div style="color:#f85149;padding:12px;">GPU unavailable: {e}</div>'
+
+
+def get_pipeline_html() -> str:
+    steps = [
+        ("", "Dataset",   (ROOT/"datasets").exists() and any((ROOT/"datasets").iterdir()) if (ROOT/"datasets").exists() else False),
+        ("", "Clean",     bool(list_cleaned_datasets())),
+        ("", "Model",     bool(list_models())),
+        ("", "Configure", bool(list_configs())),
+        ("", "Train",     bool(list_checkpoints())),
+        ("", "Eval",      (ROOT/"eval_results").exists() and any(
+            (ROOT/"eval_results").iterdir()) if (ROOT/"eval_results").exists() else False),
+        ("", "Export",    bool(list_exports())),
+    ]
+    items = []
+    for i, (icon, label, done) in enumerate(steps):
+        color  = "#3fb950" if done else "#30363d"
+        txt_c  = "#e6edf3" if done else "#8b949e"
+        circle = f'<div style="width:32px;height:32px;border-radius:50%;background:{color};display:flex;align-items:center;justify-content:center;font-size:14px;">{"✓" if done else str(i+1)}</div>'
+        items.append(f"""
+<div style="display:flex;flex-direction:column;align-items:center;gap:4px;">
+  {circle}
+  <span style="font-size:11px;color:{txt_c};font-weight:{'600' if done else '400'};">{label}</span>
+</div>""")
+        if i < len(steps) - 1:
+            line_col = "#3fb950" if done else "#30363d"
+            items.append(f'<div style="flex:1;height:2px;background:{line_col};margin-bottom:16px;"></div>')
+
+    return f"""
+<div style="background:#161b22;border:1px solid #30363d;border-radius:10px;padding:18px 24px;margin-bottom:4px;">
+  <div style="font-size:12px;color:#8b949e;margin-bottom:14px;font-weight:500;letter-spacing:0.05em;">
+    PIPELINE PROGRESS
+  </div>
+  <div style="display:flex;align-items:center;gap:0;">{''.join(items)}</div>
+</div>"""
+
+
+def get_stats_html() -> str:
+    ds  = len(list_datasets())
+    cds = len(list_cleaned_datasets())
+    mdl = len(list_models())
+    cfg = len(list_configs())
+    ckp = len(list_checkpoints())
+    exp = len(list_exports())
+
+    def card(label, value, sub, color):
+        return f"""
+<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px 20px;flex:1;">
+  <div style="font-size:28px;font-weight:700;color:{color};">{value}</div>
+  <div style="font-size:13px;font-weight:600;color:#e6edf3;margin-top:2px;">{label}</div>
+  <div style="font-size:11px;color:#8b949e;margin-top:2px;">{sub}</div>
+</div>"""
+
+    return f"""
+<div style="display:flex;gap:12px;margin-bottom:4px;">
+  {card("Datasets", ds, f"{cds} cleaned", "#58a6ff")}
+  {card("Models", mdl, f"{cfg} configs", "#3fb950")}
+  {card("Checkpoints", ckp, f"{exp} exports", "#bc8cff")}
+</div>"""
+
+
+def get_state_html() -> str:
+    p = ROOT / "STATE.md"
+    if not p.exists():
+        return '<div style="color:#8b949e;padding:8px;">STATE.md not found.</div>'
+    raw = p.read_text()
+    # Extract key fields
+    phase  = re.search(r"\*\*Phase:\*\*\s*(.+)", raw)
+    status = re.search(r"\*\*Status:\*\*\s*(.+)", raw)
+    nxt    = re.search(r"## Next action\n(.+)", raw)
+    phase_txt  = phase.group(1).strip()  if phase  else "—"
+    status_txt = status.group(1).strip() if status else "—"
+    next_txt   = nxt.group(1).strip()   if nxt    else "—"
+    color = "#3fb950" if "✓" in status_txt or "complete" in status_txt.lower() else \
+            "#d29922" if "running" in status_txt.lower() else "#58a6ff"
+    return f"""
+<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px 20px;">
+  <div style="font-size:12px;color:#8b949e;font-weight:500;letter-spacing:0.05em;margin-bottom:10px;">CURRENT STATE</div>
+  <div style="margin-bottom:8px;">
+    <span style="color:#8b949e;font-size:12px;">Phase</span><br>
+    <span style="color:#e6edf3;font-size:14px;font-weight:600;">{phase_txt}</span>
+  </div>
+  <div style="margin-bottom:8px;">
+    <span style="color:#8b949e;font-size:12px;">Status</span><br>
+    <span style="color:{color};font-size:13px;">{status_txt}</span>
+  </div>
+  <div>
+    <span style="color:#8b949e;font-size:12px;">Next action</span><br>
+    <span style="color:#e6edf3;font-size:13px;font-family:monospace;">{next_txt}</span>
+  </div>
+</div>"""
+
+
+# ── Next step card ────────────────────────────────────────────────────────────
+_NEXT_TAB = {
+    "add-dataset":   ("2 · Clean",         "Go to the Clean tab to deduplicate and split your dataset."),
+    "clean-dataset": ("3 · Model",          "Go to the Model tab to download a base model."),
+    "add-model":     ("4 · Configure",      "Go to Configure to generate your training recipe."),
+    "configure":     ("5 · Train",          "Go to Train — run Smoke Test first, then full training."),
+    "smoke-test":    ("5 · Train",          "Smoke test passed. Click Start Full Training."),
+    "train":         ("6 · Eval",           "Training complete. Go to Eval to benchmark your model."),
+    "eval":          ("7 · Export & Publish","Evaluation done. Go to Export & Publish."),
+    "export":        ("7 · Export & Publish","Export complete. Edit your Model Card then Publish."),
+}
+
+def next_step_card(command: str) -> str:
+    tab, msg = _NEXT_TAB.get(command, ("", ""))
+    if not tab:
+        return ""
+    return f"""
+<div style="background:#0d2a1a;border:1px solid #238636;border-radius:8px;
+            padding:14px 18px;margin-top:12px;">
+  <div style="font-size:12px;color:#3fb950;font-weight:600;letter-spacing:0.05em;
+              margin-bottom:6px;">COMPLETED — WHAT TO DO NEXT</div>
+  <div style="color:#e6edf3;font-size:14px;font-weight:600;margin-bottom:4px;">
+    Go to: <span style="color:#58a6ff;">{tab}</span>
+  </div>
+  <div style="color:#8b949e;font-size:13px;">{msg}</div>
+</div>"""
+
+
+# ── ft command runner ──────────────────────────────────────────────────────────
+def run_ft(args: list[str]):
+    cmd = [PYTHON, str(SCRIPTS / "ft")] + args
+    env = {**os.environ, "FT_PROJECT": str(ROOT),
+           "PYTHONUNBUFFERED": "1", "WANDB_DISABLED": "true", "FT_UI": "1"}
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1, env=env, cwd=str(ROOT))
+    output = ""
+    for line in iter(proc.stdout.readline, ""):
+        output += line
+        yield terminal_wrap(ansi_to_html(output))
+    proc.wait()
+    rc = proc.returncode
+    command = args[0] if args else ""
+    if rc == 0:
+        tail = '\n<span style="color:#3fb950;font-weight:bold;">✓ Done</span>'
+        card = next_step_card(command)
+        yield terminal_wrap(ansi_to_html(output) + tail) + card
+    else:
+        tail = f'\n<span style="color:#f85149;font-weight:bold;">✗ Failed (exit {rc})</span>'
+        yield terminal_wrap(ansi_to_html(output) + tail)
+
+
+def read_sample(name: str) -> str:
+    p = ROOT / "datasets" / name / "sample_100.jsonl"
+    if not p.exists():
+        return terminal_wrap('<span style="color:#d29922;">No sample — run clean-dataset first</span>')
+    lines = [json.loads(l) for l in p.read_text().splitlines()[:4] if l.strip()]
+    html = ""
+    for row in lines:
+        for m in row.get("messages", []):
+            role_col = {"user": "#58a6ff", "assistant": "#3fb950", "system": "#bc8cff"}.get(m["role"], "#e6edf3")
+            html += f'<span style="color:{role_col};font-weight:600;">[{m["role"].upper()}]</span> {m["content"][:300]}<br>'
+        html += '<span style="color:#30363d;">──────────────────────────────────</span><br>'
+    return terminal_wrap(html, height=320)
+
+
+def read_data_card(name: str) -> str:
+    p = ROOT / "data_cards" / f"{name}.json"
+    if not p.exists():
+        return terminal_wrap('<span style="color:#d29922;">No data card found</span>')
+    try:
+        card = json.loads(p.read_text())
+        html = ""
+        highlight = {"train_rows", "val_rows", "rows_raw", "license", "detected_format"}
+        for k, v in card.items():
+            col = "#58a6ff" if k in highlight else "#8b949e"
+            html += f'<span style="color:{col};">{k}</span>: <span style="color:#e6edf3;">{v}</span><br>'
+        return terminal_wrap(html, height=280)
+    except Exception:
+        return terminal_wrap(p.read_text())
+
+
+def read_config_file(name: str) -> str:
+    p = ROOT / "configs" / name
+    return p.read_text() if p.exists() else "# Config not found"
+
+
+def read_log(run_name: str) -> str:
+    p = ROOT / "logs" / f"train_{run_name}.log"
+    if not p.exists():
+        return terminal_wrap('<span style="color:#d29922;">No log file yet</span>')
+    lines = p.read_text().splitlines()[-60:]
+    return terminal_wrap(ansi_to_html("\n".join(lines)), height=420)
+
+
+def read_eval_summary(run_name: str) -> str:
+    p = ROOT / "eval_results" / run_name / "summary.md"
+    if not p.exists():
+        return terminal_wrap('<span style="color:#d29922;">No eval results yet. Run evaluation first.</span>')
+    return terminal_wrap(ansi_to_html(p.read_text()), height=360)
+
+
+def read_model_card(name: str) -> str:
+    p = ROOT / "exports" / name / "MODEL_CARD.md"
+    return p.read_text() if p.exists() else "# MODEL_CARD.md not found\n\nRun export first."
+
+
+def save_model_card(name: str, content: str) -> str:
+    p = ROOT / "exports" / name / "MODEL_CARD.md"
+    if not p.parent.exists():
+        return "Export directory not found."
+    p.write_text(content)
+    return "✓ Saved"
+
+
+# ── CSS ───────────────────────────────────────────────────────────────────────
+CSS = """
+footer { display:none !important; }
+
+/* Force all text inputs to be visible on dark background */
+* { box-sizing: border-box; }
+
+input:not([type=range]),
+textarea {
+  color: #e6edf3 !important;
+  background-color: #161b22 !important;
+  border-color: #30363d !important;
+  caret-color: #e6edf3 !important;
+}
+
+input:not([type=range])::placeholder,
+textarea::placeholder {
+  color: #6e7681 !important;
+  opacity: 1 !important;
+}
+
+/* Gradio 6 specific selectors */
+.svelte-1f354aw,
+[class*="svelte"] input,
+[class*="svelte"] textarea,
+.block input,
+.block textarea,
+.form input,
+.form textarea {
+  color: #e6edf3 !important;
+  background-color: #161b22 !important;
+}
+
+/* Labels */
+.block label span,
+.block > label,
+.form > label,
+span.text-sm {
+  color: #c9d1d9 !important;
+}
+
+/* Buttons */
+button.primary {
+  background: #238636 !important;
+  border-color: #238636 !important;
+  color: #fff !important;
+  font-weight: 600 !important;
+}
+button.primary:hover { background: #2ea043 !important; }
+button.secondary {
+  background: #21262d !important;
+  border-color: #30363d !important;
+  color: #c9d1d9 !important;
+}
+button.secondary:hover { background: #30363d !important; }
+
+/* Tabs */
+.tab-nav button { color: #8b949e !important; background: transparent !important; }
+.tab-nav button.selected { color: #e6edf3 !important; border-bottom-color: #58a6ff !important; }
+
+/* Sliders */
+input[type=range]::-webkit-slider-thumb { background: #58a6ff !important; }
+
+/* Code */
+.cm-content, .cm-line { color: #e6edf3 !important; }
+"""
+
+# ── App ───────────────────────────────────────────────────────────────────────
+with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    gr.HTML("""
+    <div style="background:linear-gradient(135deg,#0d1117 0%,#161b22 100%);
+                border:1px solid #30363d;border-radius:12px;padding:24px 32px;margin-bottom:16px;">
+      <div style="display:flex;align-items:center;gap:14px;">
+        <div style="width:42px;height:42px;background:#1f6feb;border-radius:8px;
+                    display:flex;align-items:center;justify-content:center;
+                    font-size:18px;font-weight:700;color:#fff;letter-spacing:-1px;">MKD</div>
+        <div>
+          <h1 style="margin:0;font-size:24px;font-weight:700;color:#e6edf3;">
+            MKD Fine-Tuning Platform
+          </h1>
+          <p style="margin:4px 0 0;color:#8b949e;font-size:14px;">
+            Guided LLM fine-tuning · each step tells you what to do next
+          </p>
+        </div>
+        <div style="margin-left:auto;text-align:right;">
+          <span style="background:#1f6feb;color:#e6edf3;padding:4px 12px;
+                       border-radius:20px;font-size:12px;font-weight:500;">
+            MKD Co., Ltd.
+          </span>
+        </div>
+      </div>
+    </div>
+    """)
+
+    # ── Pipeline + Stats + State row ──────────────────────────────────────────
+    pipeline_html = gr.HTML(get_pipeline_html())
+
+    with gr.Row(equal_height=True):
+        with gr.Column(scale=3):
+            stats_html = gr.HTML(get_stats_html())
+        with gr.Column(scale=2):
+            state_html = gr.HTML(get_state_html())
+
+    with gr.Row():
+        gpu_html = gr.HTML(get_gpu_html())
+        refresh_all_btn = gr.Button("↺  Refresh dashboard", size="sm",
+                                    variant="secondary", scale=0)
+
+    refresh_all_btn.click(
+        lambda: (get_pipeline_html(), get_stats_html(), get_state_html()),
+        outputs=[pipeline_html, stats_html, state_html],
+    )
+
+    gr.HTML('<div style="border-top:1px solid #30363d;margin:8px 0 16px;"></div>')
+
+    # ── Main tabs ─────────────────────────────────────────────────────────────
+    with gr.Tabs():
+
+        # ── 1 · Add Dataset ───────────────────────────────────────────────────
+        with gr.Tab("1 · Dataset"):
+            gr.HTML('<h3 style="color:#e6edf3;margin:0 0 4px;">Add a dataset</h3>'
+                    '<p style="color:#8b949e;font-size:13px;margin:0 0 16px;">'
+                    'Choose one source: HuggingFace / URL, or upload a file from your computer. '
+                    'Auto-detects: Alpaca · ShareGPT · OpenAI · ChatML · DPO</p>')
+            with gr.Row():
+                with gr.Column(scale=2):
+                    with gr.Tabs():
+                        with gr.Tab("HuggingFace / URL"):
+                            ds_src = gr.Textbox(
+                                label="HuggingFace dataset ID or URL",
+                                placeholder="tatsu-lab/alpaca",
+                            )
+                            ds_name_hf = gr.Textbox(
+                                label="Local name  (optional)",
+                                placeholder="alpaca")
+                            add_ds_hf_btn = gr.Button("Download & Normalize", variant="primary")
+
+                        with gr.Tab("Upload from computer"):
+                            ds_file = gr.File(
+                                label="Select a file from your computer",
+                                file_types=[".jsonl", ".json", ".csv", ".parquet"],
+                                file_count="single",
+                            )
+                            ds_name_file = gr.Textbox(
+                                label="Local name  (optional — defaults to filename)",
+                                placeholder="leave blank to use filename")
+                            add_ds_file_btn = gr.Button("Upload & Normalize", variant="primary")
+
+                        with gr.Tab("Already on server"):
+                            gr.HTML('<p style="color:#8b949e;font-size:12px;margin:8px 0;">Datasets already downloaded on the server:</p>')
+                            existing_ds_dd = gr.Dropdown(
+                                label="Select dataset",
+                                choices=list_datasets(),
+                                allow_custom_value=False,
+                            )
+                            with gr.Row():
+                                existing_ds_ref = gr.Button("↺ Refresh", size="sm", variant="secondary")
+                                existing_ds_use = gr.Button("Use this dataset", variant="primary")
+                            existing_ds_info = gr.HTML(terminal_wrap(""))
+
+                with gr.Column(scale=3):
+                    add_ds_out = gr.HTML(terminal_wrap(""))
+
+            def do_add_hf(src, name):
+                src = src.strip()
+                name = name.strip()
+                if not src:
+                    yield terminal_wrap('<span style="color:#f85149;">Please enter a dataset ID or URL.</span>')
+                    return
+                args = ["add-dataset", src] + (["--name", name] if name else [])
+                yield from run_ft(args)
+
+            def do_upload(file, name):
+                if file is None:
+                    yield terminal_wrap('<span style="color:#f85149;">No file selected.</span>')
+                    return
+                derived = name.strip() or Path(file.name).stem.lower().replace(" ", "-")
+                yield from run_ft(["add-dataset", file.name, "--name", derived])
+
+            def show_existing_ds(name):
+                if not name:
+                    return terminal_wrap("")
+                card = read_data_card(name)
+                rows = len(list_datasets())
+                p = ROOT / "datasets" / name
+                files = [f.name for f in p.iterdir() if f.is_file()] if p.exists() else []
+                info_html = f'<span style="color:#3fb950;font-weight:600;">Dataset: {name}</span><br>'
+                info_html += f'Files: {", ".join(files)}<br><br>'
+                return terminal_wrap(info_html)
+
+            add_ds_hf_btn.click(do_add_hf, inputs=[ds_src, ds_name_hf],
+                                outputs=add_ds_out, show_progress=False)
+            add_ds_file_btn.click(do_upload, inputs=[ds_file, ds_name_file],
+                                  outputs=add_ds_out, show_progress=False)
+            existing_ds_ref.click(lambda: gr.Dropdown(choices=list_datasets()), outputs=existing_ds_dd)
+            existing_ds_dd.change(show_existing_ds, inputs=existing_ds_dd, outputs=existing_ds_info)
+            existing_ds_use.click(
+                lambda n: terminal_wrap(f'<span style="color:#3fb950;font-weight:600;">Dataset "{n}" is ready.</span><br>Go to <strong>2 · Clean</strong> tab to clean it, or <strong>4 · Configure</strong> if already cleaned.'),
+                inputs=existing_ds_dd, outputs=existing_ds_info
+            )
+
+        # ── 2 · Clean Dataset ─────────────────────────────────────────────────
+        with gr.Tab("2 · Clean"):
+            gr.HTML('<h3 style="color:#e6edf3;margin:0 0 4px;">Clean, deduplicate & split</h3>'
+                    '<p style="color:#8b949e;font-size:13px;margin:0 0 16px;">'
+                    'Dedup · PII scrub · length filter · train/val split · 100-row sample</p>')
+            with gr.Row():
+                with gr.Column(scale=1):
+                    clean_dd = gr.Dropdown(label="Dataset", choices=list_datasets(),
+                                           allow_custom_value=True)
+                    clean_max = gr.Slider(4096, 131072, value=32768, step=4096,
+                                          label="Max chars per example")
+                    clean_val = gr.Slider(0.005, 0.1, value=0.01, step=0.005,
+                                          label="Validation ratio")
+                    clean_nopii = gr.Checkbox(label="Skip PII scrub  (not recommended)")
+                    with gr.Row():
+                        clean_ref_btn = gr.Button("↺ Refresh", size="sm", variant="secondary")
+                        clean_btn     = gr.Button(" Clean", variant="primary")
+                with gr.Column(scale=2):
+                    clean_out = gr.HTML(terminal_wrap(""))
+
+            gr.HTML('<div style="border-top:1px solid #30363d;margin:16px 0;"></div>')
+            gr.HTML('<h4 style="color:#c9d1d9;margin:0 0 10px;">Sample preview & data card</h4>')
+            with gr.Row():
+                with gr.Column(scale=1):
+                    sample_dd = gr.Dropdown(label="Dataset to preview",
+                                             choices=list_cleaned_datasets(),
+                                             allow_custom_value=True)
+                    gr.Button("↺ Refresh", size="sm", variant="secondary").click(
+                        lambda: gr.Dropdown(choices=list_cleaned_datasets()), outputs=sample_dd)
+                with gr.Column(scale=2):
+                    sample_out = gr.HTML(terminal_wrap(""))
+                with gr.Column(scale=2):
+                    card_out = gr.HTML(terminal_wrap(""))
+
+            def do_clean(n, mc, vr, nopii):
+                args = ["clean-dataset", n, "--max-chars", str(int(mc)), "--val-ratio", str(vr)]
+                if nopii: args.append("--no-pii")
+                yield from run_ft(args)
+
+            clean_ref_btn.click(lambda: gr.Dropdown(choices=list_datasets()), outputs=clean_dd)
+            clean_btn.click(
+                do_clean,
+                inputs=[clean_dd, clean_max, clean_val, clean_nopii],
+                outputs=clean_out, show_progress=False,
+            )
+            sample_dd.change(read_sample,    inputs=sample_dd, outputs=sample_out)
+            sample_dd.change(read_data_card, inputs=sample_dd, outputs=card_out)
+
+        # ── 3 · Add Model ─────────────────────────────────────────────────────
+        with gr.Tab("3 · Model"):
+            gr.HTML('<h3 style="color:#e6edf3;margin:0 0 4px;">Select a base model</h3>'
+                    '<p style="color:#8b949e;font-size:13px;margin:0 0 16px;">'
+                    'Use a model already on the server, or download a new one.</p>')
+            with gr.Row():
+                with gr.Column(scale=1):
+                    with gr.Tabs():
+                        with gr.Tab("Already on server"):
+                            gr.HTML('<p style="color:#8b949e;font-size:12px;margin:8px 0;">Models already downloaded on this server:</p>')
+                            existing_model_dd = gr.Dropdown(
+                                label="Select model",
+                                choices=list_models(),
+                                allow_custom_value=False,
+                            )
+                            with gr.Row():
+                                model_server_ref = gr.Button("↺ Refresh", size="sm", variant="secondary")
+                                model_server_use = gr.Button("Use this model", variant="primary")
+                            model_server_info = gr.HTML(terminal_wrap(""))
+
+                        with gr.Tab("Download from HuggingFace"):
+                            gr.HTML("""
+                            <div style="background:#1f2937;border:1px solid #374151;border-radius:8px;
+                                        padding:10px 14px;margin-bottom:12px;font-size:12px;">
+                              <span style="color:#3fb950;font-weight:600;">Open:</span>
+                              <code style="color:#58a6ff;margin:0 6px;">Qwen/Qwen2.5-7B-Instruct</code>
+                              <code style="color:#58a6ff;margin:0 6px;">microsoft/Phi-3.5-mini-instruct</code>
+                              <br><span style="color:#d29922;font-weight:600;">Gated:</span>
+                              <code style="color:#58a6ff;margin:0 6px;">meta-llama/Llama-3.1-8B-Instruct</code>
+                            </div>
+                            """)
+                            model_src = gr.Textbox(label="HuggingFace model ID",
+                                                    placeholder="Qwen/Qwen2.5-7B-Instruct")
+                            model_lic = gr.Checkbox(label="Accept restricted license")
+                            add_model_btn = gr.Button("Download Model", variant="primary")
+
+                with gr.Column(scale=2):
+                    add_model_out = gr.HTML(terminal_wrap(""))
+
+            def show_model_info(name):
+                if not name:
+                    return terminal_wrap("")
+                p = ROOT / "models" / name / "MODEL_INFO.json"
+                if p.exists():
+                    import json as _j
+                    info = _j.loads(p.read_text())
+                    html = f'<span style="color:#3fb950;font-weight:600;">Model ready: {info.get("model_id", name)}</span><br>'
+                    html += f'Parameters: <span style="color:#58a6ff;">{info.get("params_billion", "?")}B</span><br>'
+                    html += f'Architecture: {info.get("architecture", "?")}<br>'
+                    html += f'Chat template: {"Yes" if info.get("chat_template_present") else "No"}<br>'
+                    return terminal_wrap(html)
+                return terminal_wrap(f'<span style="color:#8b949e;">Model folder: {name}<br>No MODEL_INFO.json found.</span>')
+
+            def use_server_model(name):
+                if not name:
+                    return terminal_wrap('<span style="color:#f85149;">Select a model first.</span>')
+                return terminal_wrap(
+                    f'<span style="color:#3fb950;font-weight:bold;">Model "{name}" selected.</span><br>'
+                    f'<span style="color:#8b949e;">Go to <strong>4 · Configure</strong> and select this model.</span>'
+                ) + next_step_card("add-model")
+
+            def do_add_model(s, a):
+                s = s.strip()
+                yield from run_ft(["add-model", s] + (["--accept-license"] if a else []))
+
+            model_server_ref.click(lambda: gr.Dropdown(choices=list_models()), outputs=existing_model_dd)
+            existing_model_dd.change(show_model_info, inputs=existing_model_dd, outputs=model_server_info)
+            model_server_use.click(use_server_model, inputs=existing_model_dd, outputs=model_server_info)
+            add_model_btn.click(do_add_model, inputs=[model_src, model_lic],
+                                outputs=add_model_out, show_progress=False)
+
+        # ── 4 · Configure ─────────────────────────────────────────────────────
+        with gr.Tab("4 · Configure"):
+            gr.HTML('<h3 style="color:#e6edf3;margin:0 0 4px;">Generate training recipe</h3>'
+                    '<p style="color:#8b949e;font-size:13px;margin:0 0 16px;">'
+                    'Auto-detects GPU · sets micro-batch, optimizer, chat template · writes configs/run_&lt;ts&gt;.yaml</p>')
+            with gr.Row():
+                with gr.Column(scale=1):
+                    cfg_model = gr.Dropdown(label="Base model", choices=list_models(),
+                                             allow_custom_value=True)
+                    cfg_ds    = gr.Dropdown(label="Dataset", choices=list_cleaned_datasets(),
+                                             allow_custom_value=True)
+                    cfg_quant = gr.Radio(["4bit (QLoRA)", "8bit", "none (full LoRA)"],
+                                          value="4bit (QLoRA)", label="Quantization")
+                    with gr.Row():
+                        cfg_lr     = gr.Number(value=2e-4, label="Learning rate", precision=6)
+                        cfg_epochs = gr.Slider(1, 10, value=3, step=1, label="Epochs")
+                    cfg_seq = gr.Slider(512, 8192, value=2048, step=512, label="Sequence length")
+                    with gr.Row():
+                        gr.Button("↺ Refresh", size="sm", variant="secondary").click(
+                            lambda: (gr.Dropdown(choices=list_models()),
+                                     gr.Dropdown(choices=list_cleaned_datasets())),
+                            outputs=[cfg_model, cfg_ds])
+                        cfg_btn = gr.Button(" Generate", variant="primary")
+                with gr.Column(scale=2):
+                    cfg_out  = gr.HTML(terminal_wrap(""))
+                    cfg_yaml = gr.Code(label="Generated YAML", language="yaml",
+                                       lines=22, interactive=False)
+
+            def do_configure(model, ds, quant, lr, epochs, seq):
+                q = quant.split(" ")[0]
+                output_html = terminal_wrap("")
+                for chunk in run_ft([
+                    "configure", "--model", model, "--dataset", ds,
+                    "--quantize", q, "--lr", str(lr),
+                    "--epochs", str(int(epochs)), "--seq-len", str(int(seq)),
+                ]):
+                    output_html = chunk
+                    yield output_html, ""
+                cfgs = list_configs()
+                yaml_txt = read_config_file(cfgs[0]) if cfgs else ""
+                yield output_html, yaml_txt
+
+            cfg_btn.click(do_configure,
+                          inputs=[cfg_model, cfg_ds, cfg_quant, cfg_lr, cfg_epochs, cfg_seq],
+                          outputs=[cfg_out, cfg_yaml], show_progress=False)
+
+        # ── 5 · Train ─────────────────────────────────────────────────────────
+        with gr.Tab("5 · Train"):
+            gr.HTML('<h3 style="color:#e6edf3;margin:0 0 4px;">Smoke test → Full training</h3>'
+                    '<p style="color:#8b949e;font-size:13px;margin:0 0 16px;">'
+                    'Always run smoke test first · trains via Axolotl · live watchdog for NaN/OOM</p>')
+            with gr.Row():
+                train_cfg_dd = gr.Dropdown(label="Recipe", choices=list_configs(),
+                                            allow_custom_value=True, scale=3)
+                gr.Button("↺", size="sm", variant="secondary", scale=0).click(
+                    lambda: gr.Dropdown(choices=list_configs()), outputs=train_cfg_dd)
+
+            gr.HTML("""
+            <div style="background:#161b22;border:1px solid #d29922;border-radius:8px;
+                        padding:10px 16px;margin-bottom:12px;font-size:13px;color:#d29922;">
+              !  Always run <strong>Smoke Test</strong> before full training.
+              It takes 2 minutes and prevents wasting hours on a broken config.
+            </div>
+            """)
+            with gr.Row():
+                smoke_btn = gr.Button(" Smoke Test  (50 steps)", variant="secondary", scale=1)
+                train_btn = gr.Button(" Start Full Training", variant="primary", scale=1)
+
+            train_out = gr.HTML(terminal_wrap(""))
+
+            gr.HTML('<div style="border-top:1px solid #30363d;margin:16px 0;"></div>')
+            gr.HTML('<h4 style="color:#c9d1d9;margin:0 0 10px;">Live training log</h4>')
+            with gr.Row():
+                log_dd  = gr.Dropdown(label="Run", choices=list_checkpoints(),
+                                       allow_custom_value=True, scale=3)
+                log_ref = gr.Button("↺ Refresh log", size="sm", variant="secondary", scale=0)
+            log_out = gr.HTML(terminal_wrap(""))
+
+            def do_smoke(c):
+                yield from run_ft(["smoke-test", f"configs/{c}"])
+
+            def do_train(c):
+                yield from run_ft(["train", f"configs/{c}"])
+
+            smoke_btn.click(do_smoke, inputs=train_cfg_dd, outputs=train_out, show_progress=False)
+            train_btn.click(do_train, inputs=train_cfg_dd, outputs=train_out, show_progress=False)
+            log_ref.click(read_log, inputs=log_dd, outputs=log_out)
+            log_dd.change(read_log,  inputs=log_dd, outputs=log_out)
+
+        # ── 6 · Eval ──────────────────────────────────────────────────────────
+        with gr.Tab("6 · Eval"):
+            gr.HTML('<h3 style="color:#e6edf3;margin:0 0 4px;">Evaluate the fine-tuned model</h3>'
+                    '<p style="color:#8b949e;font-size:13px;margin:0 0 16px;">'
+                    'lm-eval-harness · contamination check · A/B vs base model</p>')
+            with gr.Row():
+                eval_dd  = gr.Dropdown(label="Checkpoint", choices=list_checkpoints(),
+                                        allow_custom_value=True, scale=3)
+                eval_ref = gr.Button("↺", size="sm", variant="secondary", scale=0)
+            eval_skip = gr.Checkbox(
+                label="Skip harness evals  (contamination check only — much faster for testing)")
+            eval_btn = gr.Button(" Run Evaluation", variant="primary")
+            eval_out = gr.HTML(terminal_wrap(""))
+            gr.HTML('<h4 style="color:#c9d1d9;margin:12px 0 8px;">Results</h4>')
+            eval_summary = gr.HTML(terminal_wrap(""))
+
+            def do_eval(ckpt, skip):
+                args = ["eval", f"checkpoints/{ckpt}"] + (["--skip-harness"] if skip else [])
+                for chunk in run_ft(args):
+                    yield chunk, terminal_wrap("")
+                yield chunk, read_eval_summary(ckpt)
+
+            eval_ref.click(lambda: gr.Dropdown(choices=list_checkpoints()), outputs=eval_dd)
+            eval_btn.click(do_eval, inputs=[eval_dd, eval_skip],
+                           outputs=[eval_out, eval_summary], show_progress=False)
+            eval_dd.change(read_eval_summary, inputs=eval_dd, outputs=eval_summary)
+
+        # ── 7 · Export & Publish ──────────────────────────────────────────────
+        with gr.Tab("7 · Export & Publish"):
+            gr.HTML('<h3 style="color:#e6edf3;margin:0 0 4px;">Merge · Quantize · Publish</h3>'
+                    '<p style="color:#8b949e;font-size:13px;margin:0 0 16px;">'
+                    'Merge LoRA into base · AWQ/GGUF quantize · edit model card · push to HuggingFace</p>')
+
+            with gr.Tabs():
+                # Export
+                with gr.Tab("Export"):
+                    with gr.Row():
+                        exp_dd  = gr.Dropdown(label="Checkpoint", choices=list_checkpoints(),
+                                               allow_custom_value=True, scale=3)
+                        exp_ref = gr.Button("↺", size="sm", variant="secondary", scale=0)
+                    with gr.Row():
+                        exp_quant = gr.Radio(["awq", "none"], value="awq",
+                                              label="Quantization format")
+                        exp_gguf  = gr.Checkbox(label="Also export GGUF  (for llama.cpp)")
+                    exp_btn = gr.Button(" Export Model", variant="primary")
+                    exp_out = gr.HTML(terminal_wrap(""))
+
+                    def do_export(ckpt, q, gguf):
+                        args = ["export", f"checkpoints/{ckpt}", "--merge", "--quantize", q]
+                        if gguf: args.append("--gguf")
+                        yield from run_ft(args)
+
+                    exp_ref.click(lambda: gr.Dropdown(choices=list_checkpoints()), outputs=exp_dd)
+                    exp_btn.click(do_export, inputs=[exp_dd, exp_quant, exp_gguf],
+                                  outputs=exp_out, show_progress=False)
+
+                # Model Card
+                with gr.Tab("Model Card"):
+                    with gr.Row():
+                        card_dd  = gr.Dropdown(label="Export", choices=list_exports(),
+                                                allow_custom_value=True, scale=3)
+                        card_ref = gr.Button("↺", size="sm", variant="secondary", scale=0)
+                        card_load = gr.Button(" Load", size="sm", variant="secondary", scale=0)
+                    card_editor = gr.Textbox(
+                        label="MODEL_CARD.md  —  fill in all {placeholders} before publishing",
+                        lines=22, placeholder="Select an export and click Load...")
+                    with gr.Row():
+                        card_save = gr.Button(" Save", variant="primary", scale=0)
+                        card_msg  = gr.Textbox(label="", lines=1, interactive=False, scale=2)
+
+                    card_ref.click(lambda: gr.Dropdown(choices=list_exports()), outputs=card_dd)
+                    card_load.click(read_model_card, inputs=card_dd, outputs=card_editor)
+                    card_save.click(save_model_card, inputs=[card_dd, card_editor],
+                                    outputs=card_msg)
+
+                # Publish
+                with gr.Tab("Publish"):
+                    with gr.Row():
+                        pub_dd  = gr.Dropdown(label="Export", choices=list_exports(),
+                                               allow_custom_value=True, scale=3)
+                        pub_ref = gr.Button("↺", size="sm", variant="secondary", scale=0)
+                    hf_repo = gr.Textbox(label="HuggingFace repo",
+                                          placeholder="mkd-hika/qwen2.5-7b-alpaca")
+                    gh_repo = gr.Textbox(label="GitHub repo  (optional)",
+                                          placeholder="mkd-hika/qwen2.5-7b-alpaca")
+                    gr.HTML("""
+                    <div style="background:#161b22;border:1px solid #30363d;border-radius:8px;
+                                padding:10px 16px;font-size:12px;color:#8b949e;margin-bottom:8px;">
+                      ℹ Publish will be blocked if MODEL_CARD.md has unfilled placeholders
+                      or contamination ratio &gt; 0.5%.
+                    </div>
+                    """)
+                    with gr.Row():
+                        pub_ack = gr.Checkbox(label="Acknowledge contamination")
+                        pub_lic = gr.Checkbox(label="Accept base model license")
+                    pub_btn = gr.Button(" Publish to HuggingFace", variant="primary")
+                    pub_out = gr.HTML(terminal_wrap(""))
+
+                    pub_ref.click(lambda: gr.Dropdown(choices=list_exports()), outputs=pub_dd)
+                    def do_publish(exp, hf, gh, ack, lic):
+                        args = ["publish", f"exports/{exp}", "--hf-repo", hf]
+                        if gh.strip(): args += ["--github-repo", gh]
+                        if ack: args.append("--acknowledge-contamination")
+                        if lic: args.append("--accept-base-license")
+                        yield from run_ft(args)
+
+                    pub_btn.click(do_publish, inputs=[pub_dd, hf_repo, gh_repo, pub_ack, pub_lic],
+                                  outputs=pub_out, show_progress=False)
+
+    # ── Footer ────────────────────────────────────────────────────────────────
+    gr.HTML("""
+    <div style="text-align:center;color:#484f58;font-size:12px;margin-top:24px;padding:16px;
+                border-top:1px solid #21262d;">
+      MKD Co., Ltd. · Fine-Tuning Platform · Built with Axolotl + Gradio
+    </div>
+    """)
+
+
+# ── Launch ────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port",  type=int, default=7860)
+    ap.add_argument("--host",  default="0.0.0.0")
+    ap.add_argument("--share", action="store_true")
+    args = ap.parse_args()
+
+    print(f"\n   MKD Fine-Tuning Platform")
+    print(f" Project : {ROOT}")
+    print(f" URL     : http://localhost:{args.port}\n")
+
+    theme = gr.themes.Base(
+        primary_hue=gr.themes.colors.blue,
+        neutral_hue=gr.themes.colors.slate,
+    ).set(
+        body_background_fill="#0d1117",
+        body_background_fill_dark="#0d1117",
+        block_background_fill="#161b22",
+        block_background_fill_dark="#161b22",
+        block_border_color="#30363d",
+        block_border_color_dark="#30363d",
+        input_background_fill="#161b22",
+        input_background_fill_dark="#161b22",
+        input_border_color="#30363d",
+        input_border_color_dark="#30363d",
+        body_text_color="#e6edf3",
+        body_text_color_dark="#e6edf3",
+        body_text_color_subdued="#8b949e",
+        body_text_color_subdued_dark="#8b949e",
+        input_placeholder_color="#6e7681",
+        input_placeholder_color_dark="#6e7681",
+        button_primary_background_fill="#238636",
+        button_primary_background_fill_dark="#238636",
+        button_primary_text_color="#ffffff",
+        button_primary_text_color_dark="#ffffff",
+        button_secondary_background_fill="#21262d",
+        button_secondary_background_fill_dark="#21262d",
+        button_secondary_text_color="#c9d1d9",
+        button_secondary_text_color_dark="#c9d1d9",
+    )
+
+    app.launch(
+        server_name=args.host,
+        server_port=args.port,
+        share=args.share,
+        theme=theme,
+        css=CSS,
+    )
