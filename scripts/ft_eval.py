@@ -45,14 +45,56 @@ def load_eval_suite(root: Path, suite_path: str) -> dict:
     }
 
 
-def run_lm_eval(model_path: str, tasks: list[str], num_fewshot: int,
-                output_dir: Path, name: str) -> dict | None:
+def resolve_model_args(ckpt_dir: Path, root: Path) -> str:
+    """Build the lm_eval --model_args string.
+
+    If the checkpoint is a LoRA adapter (has adapter_config.json but no
+    model.safetensors), we need to pass the base model + peft adapter path.
+    """
+    has_weights = any(ckpt_dir.glob("model*.safetensors")) or \
+                  any(ckpt_dir.glob("model*.bin")) or \
+                  any(ckpt_dir.glob("pytorch_model*.bin"))
+    is_adapter   = (ckpt_dir / "adapter_config.json").exists()
+
+    if has_weights:
+        # Full merged model — point directly at it
+        return f"pretrained={ckpt_dir}"
+
+    if is_adapter:
+        # LoRA adapter — find the base model from adapter_config.json
+        try:
+            cfg = json.loads((ckpt_dir / "adapter_config.json").read_text())
+            base = cfg.get("base_model_name_or_path", "")
+        except Exception:
+            base = ""
+
+        # Try local models/ directory first
+        if base:
+            safe_name = base.replace("/", "__").lower()
+            local = root / "models" / safe_name
+            if local.exists():
+                base = str(local)
+
+        if base:
+            info(f"  LoRA adapter detected. Base model: {base}")
+            return f"pretrained={base},peft={ckpt_dir},dtype=bfloat16"
+        else:
+            warn("  Could not determine base model from adapter_config.json")
+            return f"pretrained={ckpt_dir}"
+
+    # Fallback — try as-is
+    return f"pretrained={ckpt_dir}"
+
+
+def run_lm_eval(ckpt_dir: Path, tasks: list[str], num_fewshot: int,
+                output_dir: Path, name: str, root: Path) -> dict | None:
     """Run lm-evaluation-harness. Returns parsed results dict or None."""
     out_file = output_dir / f"{name}.json"
+    model_args = resolve_model_args(ckpt_dir, root)
     cmd = [
         sys.executable, "-m", "lm_eval",
         "--model", "hf",
-        "--model_args", f"pretrained={model_path}",
+        "--model_args", model_args,
         "--tasks", ",".join(tasks),
         "--num_fewshot", str(num_fewshot),
         "--output_path", str(out_file),
@@ -169,7 +211,7 @@ def main():
             name = s["name"]
             tasks = s["tasks"]
             few = s.get("num_fewshot", 0)
-            res = run_lm_eval(str(ckpt_dir), tasks, few, eval_out, name)
+            res = run_lm_eval(ckpt_dir, tasks, few, eval_out, name, root)
             all_results["harness"][name] = res
             if res:
                 ok(f"  {name}: done")

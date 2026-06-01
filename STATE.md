@@ -1,11 +1,11 @@
 # STATE
 
-**Updated:** 2026-05-29 06:29 UTC by ft-cli
-**Phase:** 5 / Training stopped
-**Status:** Training manually interrupted (Ctrl+C)
+**Updated:** 2026-06-01 02:49 UTC by ft-cli
+**Phase:** 6 / Evaluation complete
+**Status:** ✓ Evaluation complete: run_2026-05-29_0624
 
 ## Recent actions
-(none)
+- ✅ Evaluated checkpoint run_2026-05-29_0624
 
 ## Next action
-Resume: ft train configs/run_2026-05-27_0039.yaml  or  ft eval /home/mkd-s002/fine-tune/ft-platform/checkpoints/run_2026-05-27_0039
+Export: `ft export /home/mkd-s002/fine-tune/ft-platform/checkpoints/run_2026-05-29_0624`
