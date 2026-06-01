@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""
+ft — the unified CLI entry point for the MKD fine-tuning platform.
+
+Subcommands:
+    ft add-dataset     <url-or-path> [--name <n>]
+    ft clean-dataset   <name>
+    ft add-model       <hf-id-or-url> [--accept-license]
+    ft configure       --model <m> --dataset <d> [--quantize 4bit|8bit|none]
+    ft smoke-test      <recipe.yaml>
+    ft train           <recipe.yaml>
+    ft eval            <checkpoint-dir> [--base <hf-id>]
+    ft export          <checkpoint-dir> [--merge] [--quantize awq|gguf|none]
+    ft publish         <export-dir> --hf-repo mkd-hika/<name>
+    ft state           print STATE.md
+    ft help / --help   this message
+"""
+from __future__ import annotations
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SCRIPTS = HERE
+
+DISPATCH = {
+    "add-dataset":   "ft_add_dataset.py",
+    "clean-dataset": "ft_clean_dataset.py",
+    "add-model":     "ft_add_model.py",
+    "configure":     "ft_configure.py",
+    "smoke-test":    "ft_smoke_test.py",
+    "train":         "ft_train.py",
+    "watch":         "ft_watch.py",
+    "eval":          "ft_eval.py",
+    "export":        "ft_export.py",
+    "publish":       "ft_publish.py",
+}
+
+HELP = """\
+ft — guided fine-tuning CLI  (MKD Co., Ltd.)
+
+USAGE:
+    ft <command> [args...]
+
+CORE WORKFLOW — each command prints the next one to run:
+    ft add-dataset <url>                  Download & normalize to ChatML
+    ft clean-dataset <name>               Dedupe, PII scrub, train/val split
+    ft add-model <hf-id>                  Download model, verify chat template
+    ft configure --model M --dataset D    Generate configs/run_<ts>.yaml
+    ft smoke-test configs/run_<ts>.yaml   50-step dry-run (always before train)
+    ft train configs/run_<ts>.yaml        Full training run
+    ft watch <run-name>                   Live loss/GPU monitor while training
+    ft eval checkpoints/<run>             lm-eval-harness + contamination check
+    ft export checkpoints/<run>           Merge LoRA, quantize, MODEL_CARD.md
+    ft publish exports/<run> --hf-repo mkd-hika/<name>   Push to HF + GitHub
+
+UTILITIES:
+    ft ui        Launch the web UI (http://localhost:7860)
+    ft state     Print STATE.md (current phase, blockers, next action)
+    ft help      This message
+
+See guides/00_quickstart.md for the non-engineer walkthrough.
+"""
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(HELP)
+        return 0
+
+    cmd, *rest = sys.argv[1:]
+
+    if cmd == "state":
+        sys.path.insert(0, str(SCRIPTS))
+        from ft_common import project_root
+        p = project_root() / "STATE.md"
+        print(p.read_text() if p.exists() else "(no STATE.md found)")
+        return 0
+
+    if cmd == "ui":
+        app_path = HERE.parent / "app.py"
+        return subprocess.call([sys.executable, str(app_path), *rest])
+
+    if cmd not in DISPATCH:
+        print(f"Unknown command: {cmd!r}\n\n{HELP}", file=sys.stderr)
+        return 2
+
+    script = SCRIPTS / DISPATCH[cmd]
+    if not script.exists():
+        print(f"Script not found: {script}", file=sys.stderr)
+        return 1
+
+    return subprocess.call([sys.executable, str(script), *rest])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,33 @@
+# Large binary data — never committed
+datasets/*/raw/
+datasets/*/normalized.jsonl
+datasets/*/train.jsonl
+datasets/*/val.jsonl
+models/
+checkpoints/*/
+exports/
+
+# But keep the manifests / cards
+!data_cards/*.json
+!checkpoints/*/manifest.json
+
+# Environment
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.local
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Logs (kept locally for postmortems but not pushed)
+logs/*.log
+logs/*.ndjson
+!logs/.gitkeep
+
+# W&B
+wandb/
