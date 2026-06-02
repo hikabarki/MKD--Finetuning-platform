@@ -1,11 +1,11 @@
 # STATE
 
-**Updated:** 2026-06-01 02:49 UTC by ft-cli
-**Phase:** 6 / Evaluation complete
-**Status:** ✓ Evaluation complete: run_2026-05-29_0624
+**Updated:** 2026-06-01 09:05 UTC by ft-cli
+**Phase:** 3 / Data Pipeline (cleaned)
+**Status:** ✓ Dataset 'alpaca_guanaco-llama2-1k' cleaned. Train=50877, Val=513.
 
 ## Recent actions
-- ✅ Evaluated checkpoint run_2026-05-29_0624
+- ✅ Cleaned dataset 'alpaca_guanaco-llama2-1k'
 
 ## Next action
-Export: `ft export /home/mkd-s002/fine-tune/ft-platform/checkpoints/run_2026-05-29_0624`
+Eyeball datasets/alpaca_guanaco-llama2-1k/sample_100.jsonl, then add a base model: `ft add-model <hf-model-id>`

@@ -104,6 +104,8 @@ def main():
     ap.add_argument("--lr", type=float, default=None, help="Override learning rate")
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--seq-len", type=int, default=2048)
+    ap.add_argument("--wandb-project", default="", help="W&B project name (empty = disabled)")
+    ap.add_argument("--wandb-entity",  default="", help="W&B entity/username (empty = disabled)")
     args = ap.parse_args()
 
     root = project_root()
@@ -237,9 +239,9 @@ logging_steps: 10
 output_dir: checkpoints/run_{ts}
 
 # --- Logging -----------------------------------------------------------------
-wandb_project: ""
-wandb_entity: ""
-wandb_name: ""
+wandb_project: "{args.wandb_project}"
+wandb_entity: "{args.wandb_entity}"
+wandb_name: "{run_name if args.wandb_project else ''}"
 wandb_log_model: "false"
 
 # --- Stability ---------------------------------------------------------------

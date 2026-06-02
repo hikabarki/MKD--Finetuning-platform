@@ -209,6 +209,108 @@ def get_stats_html() -> str:
 </div>"""
 
 
+def get_guide_html() -> str:
+    """Step-by-step guide panel based on what's available on disk."""
+    steps = [
+        {
+            "num": 1, "label": "Add Dataset",
+            "done": bool(list_datasets()),
+            "tab": "1 · Dataset",
+            "action": 'Go to <b>1 · Dataset</b> → paste a HuggingFace ID (e.g. tatsu-lab/alpaca) → click <b>Download & Normalize</b>',
+        },
+        {
+            "num": 2, "label": "Clean Dataset",
+            "done": bool(list_cleaned_datasets()),
+            "tab": "2 · Clean",
+            "action": 'Go to <b>2 · Clean</b> → select your dataset → click <b>Clean</b>',
+        },
+        {
+            "num": 3, "label": "Add Model",
+            "done": bool(list_models()),
+            "tab": "3 · Model",
+            "action": 'Go to <b>3 · Model</b> → select from server or paste a HuggingFace model ID → click <b>Download Model</b>',
+        },
+        {
+            "num": 4, "label": "Configure",
+            "done": bool(list_configs()),
+            "tab": "4 · Configure",
+            "action": 'Go to <b>4 · Configure</b> → select model + dataset → click <b>Generate</b>',
+        },
+        {
+            "num": 5, "label": "Train",
+            "done": any(
+                any((ROOT/"checkpoints"/d).glob("checkpoint-*"))
+                for d in list_checkpoints()
+            ) if list_checkpoints() else False,
+            "tab": "5 · Train",
+            "action": 'Go to <b>5 · Train</b> → select recipe → click <b>Smoke Test</b> first, then <b>Start Full Training</b>',
+        },
+        {
+            "num": 6, "label": "Evaluate",
+            "done": any(
+                (ROOT/"eval_results"/d/"summary.md").exists()
+                for d in list_checkpoints()
+            ) if list_checkpoints() else False,
+            "tab": "6 · Eval",
+            "action": 'Go to <b>6 · Eval</b> → select checkpoint → uncheck "Skip harness evals" → click <b>Run Evaluation</b>',
+        },
+        {
+            "num": 7, "label": "Export",
+            "done": bool(list_exports()) and any(
+                any((ROOT/"exports"/d/"merged").glob("model*.safetensors"))
+                for d in list_exports()
+            ) if list_exports() else False,
+            "tab": "7 · Export & Publish",
+            "action": 'Go to <b>7 · Export & Publish</b> → Export tab → select checkpoint → set quantization to <b>none</b> → click <b>Export Model</b>',
+        },
+        {
+            "num": 8, "label": "Publish",
+            "done": False,  # can't auto-detect publish
+            "tab": "7 · Export & Publish",
+            "action": 'Go to <b>7 · Export & Publish</b> → Model Card tab → fill placeholders → Publish tab → enter HF repo → click <b>Publish to HuggingFace</b>',
+        },
+    ]
+
+    # Find current step (first not done)
+    current = next((s for s in steps if not s["done"]), steps[-1])
+
+    rows = ""
+    for s in steps:
+        if s["done"]:
+            icon  = '<span style="color:#3fb950;font-weight:700;">✓</span>'
+            color = "#3fb950"
+            text_color = "#8b949e"
+            bg = "transparent"
+        elif s["num"] == current["num"]:
+            icon  = f'<span style="background:#1f6feb;color:#fff;border-radius:50%;width:20px;height:20px;display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;">{s["num"]}</span>'
+            color = "#58a6ff"
+            text_color = "#e6edf3"
+            bg = "#0d1f3c"
+        else:
+            icon  = f'<span style="background:#21262d;color:#8b949e;border-radius:50%;width:20px;height:20px;display:inline-flex;align-items:center;justify-content:center;font-size:11px;">{s["num"]}</span>'
+            color = "#484f58"
+            text_color = "#484f58"
+            bg = "transparent"
+
+        rows += f"""
+<div style="display:flex;align-items:flex-start;gap:10px;padding:8px 10px;
+            border-radius:6px;background:{bg};margin-bottom:4px;">
+  <div style="margin-top:2px;min-width:20px;">{icon}</div>
+  <div style="flex:1;">
+    <div style="color:{color};font-size:13px;font-weight:600;">{s["label"]}</div>
+    {"<div style='color:#8b949e;font-size:12px;margin-top:2px;'>" + s["action"] + "</div>" if s["num"] == current["num"] else ""}
+  </div>
+</div>"""
+
+    return f"""
+<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px 20px;">
+  <div style="font-size:12px;color:#8b949e;font-weight:500;letter-spacing:0.05em;margin-bottom:12px;">
+    STEP-BY-STEP GUIDE
+  </div>
+  {rows}
+</div>"""
+
+
 def get_state_html() -> str:
     p = ROOT / "STATE.md"
     if not p.exists():
@@ -358,6 +460,92 @@ def get_loss_df(run_name: str) -> pd.DataFrame:
     return pd.DataFrame({"Step": steps, "Loss": losses})
 
 
+def get_metrics_html(run_name: str) -> str:
+    """Parse training log and return a live metrics panel."""
+    if not run_name:
+        return terminal_wrap("")
+    p = ROOT / "logs" / f"train_{run_name}.log"
+    if not p.exists():
+        return terminal_wrap('<span style="color:#d29922;">No log file yet — start training first.</span>')
+
+    lines = p.read_text().splitlines()
+
+    # Parse latest step metrics
+    step = grad = loss = lr = epoch = tok_s = None
+    for line in reversed(lines):
+        m = re.search(r"['\"]loss['\"]\s*[:=]\s*([\d.]+)", line)
+        if m and loss is None:
+            loss = float(m.group(1))
+        m = re.search(r"['\"]grad_norm['\"]\s*[:=]\s*([\d.]+)", line)
+        if m and grad is None:
+            grad = float(m.group(1))
+        m = re.search(r"['\"]step['\"]\s*[:=]\s*(\d+)", line)
+        if m and step is None:
+            step = int(m.group(1))
+        m = re.search(r"['\"]learning_rate['\"]\s*[:=]\s*([\d.e-]+)", line)
+        if m and lr is None:
+            lr = float(m.group(1))
+        m = re.search(r"['\"]epoch['\"]\s*[:=]\s*([\d.]+)", line)
+        if m and epoch is None:
+            epoch = float(m.group(1))
+        if all(v is not None for v in [step, loss, grad, lr, epoch]):
+            break
+
+    if step is None:
+        return terminal_wrap('<span style="color:#d29922;">Parsing log... no step data yet.</span>')
+
+    # Estimate ETA from first and last timestamped steps
+    eta_str = "—"
+    timestamps = re.findall(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", p.read_text())
+    if len(timestamps) >= 2:
+        try:
+            from datetime import datetime as _dt
+            t0 = _dt.strptime(timestamps[0],  "%Y-%m-%d %H:%M:%S")
+            t1 = _dt.strptime(timestamps[-1], "%Y-%m-%d %H:%M:%S")
+            elapsed = (t1 - t0).total_seconds()
+            if elapsed > 0 and step and step > 0:
+                sps = step / elapsed  # steps per second
+                # estimate total steps from log
+                total_m = re.search(r"(\d+)/(\d+)\s*\[", "\n".join(lines[-20:]))
+                if total_m:
+                    total = int(total_m.group(2))
+                    remaining = (total - step) / sps
+                    h, m_ = int(remaining // 3600), int((remaining % 3600) // 60)
+                    eta_str = f"~{h}h {m_}m"
+        except Exception:
+            pass
+
+    # Color for loss
+    loss_col = "#3fb950" if loss < 1.5 else ("#d29922" if loss < 3.0 else "#f85149")
+    grad_col = "#3fb950" if grad < 2.0 else ("#d29922" if grad < 5.0 else "#f85149")
+
+    def metric(label, value, color="#e6edf3", unit=""):
+        return f"""
+<div style="background:#0d1117;border:1px solid #21262d;border-radius:6px;
+            padding:10px 14px;flex:1;min-width:100px;">
+  <div style="color:#8b949e;font-size:11px;text-transform:uppercase;
+              letter-spacing:0.06em;margin-bottom:4px;">{label}</div>
+  <div style="color:{color};font-size:20px;font-weight:700;font-family:monospace;">
+    {value}<span style="font-size:12px;color:#8b949e;margin-left:3px;">{unit}</span>
+  </div>
+</div>"""
+
+    html = f"""
+<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;">
+  <div style="font-size:12px;color:#8b949e;letter-spacing:0.05em;
+              margin-bottom:12px;font-weight:500;">LIVE TRAINING METRICS — {run_name}</div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;">
+    {metric("Step",       step,                         "#58a6ff")}
+    {metric("Loss",       f"{loss:.4f}" if loss else "—", loss_col)}
+    {metric("Grad Norm",  f"{grad:.3f}" if grad else "—", grad_col)}
+    {metric("Epoch",      f"{epoch:.2f}" if epoch else "—", "#e6edf3")}
+    {metric("Learn Rate", f"{lr:.1e}" if lr else "—",   "#bc8cff")}
+    {metric("ETA",        eta_str,                       "#d29922")}
+  </div>
+</div>"""
+    return html
+
+
 def read_eval_summary(run_name: str) -> str:
     p = ROOT / "eval_results" / run_name / "summary.md"
     if not p.exists():
@@ -438,11 +626,34 @@ button.secondary:hover { background: #30363d !important; }
 .tab-nav button { color: #8b949e !important; background: transparent !important; }
 .tab-nav button.selected { color: #e6edf3 !important; border-bottom-color: #58a6ff !important; }
 
+/* Dropdown list options */
+ul[role="listbox"], ul.options, .dropdown-menu,
+[data-testid="dropdown-options"],
+.svelte-1occ011, li[role="option"] {
+  background: #161b22 !important;
+  color: #e6edf3 !important;
+}
+li[role="option"]:hover, li[role="option"].selected {
+  background: #21262d !important;
+  color: #e6edf3 !important;
+}
+li[role="option"] * { color: #e6edf3 !important; }
+
 /* Sliders */
 input[type=range]::-webkit-slider-thumb { background: #58a6ff !important; }
 
 /* Code */
 .cm-content, .cm-line { color: #e6edf3 !important; }
+
+/* Chat bubbles */
+.message-bubble-border { border-color: #30363d !important; }
+.bot, .bot * { background: #161b22 !important; color: #e6edf3 !important; }
+.user, .user * { background: #1f6feb !important; color: #ffffff !important; }
+[data-testid="bot"] { background: #161b22 !important; color: #e6edf3 !important; }
+[data-testid="user"] { background: #1f6feb !important; color: #ffffff !important; }
+.message { color: #e6edf3 !important; }
+.message p, .message span, .message div { color: #e6edf3 !important; }
+.prose p, .prose span { color: #e6edf3 !important; }
 """
 
 # ── App ───────────────────────────────────────────────────────────────────────
@@ -488,15 +699,22 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
         refresh_all_btn = gr.Button("↺  Refresh dashboard", size="sm",
                                     variant="secondary", scale=0)
 
-    # Auto-refresh every 10 seconds
     dash_timer = gr.Timer(value=10)
-    dash_timer.tick(
-        lambda: (get_gpu_html(), get_pipeline_html(), get_stats_html(), get_state_html()),
-        outputs=[gpu_html, pipeline_html, stats_html, state_html],
-    )
+    # Guide panel
+    with gr.Row():
+        guide_html = gr.HTML(get_guide_html())
+
     refresh_all_btn.click(
-        lambda: (get_pipeline_html(), get_stats_html(), get_state_html(), get_gpu_html()),
-        outputs=[pipeline_html, stats_html, state_html, gpu_html],
+        lambda: (get_pipeline_html(), get_stats_html(), get_state_html(),
+                 get_gpu_html(), get_guide_html()),
+        outputs=[pipeline_html, stats_html, state_html, gpu_html, guide_html],
+    )
+
+    # Auto-refresh guide too
+    dash_timer.tick(
+        lambda: (get_gpu_html(), get_pipeline_html(), get_stats_html(),
+                 get_state_html(), get_guide_html()),
+        outputs=[gpu_html, pipeline_html, stats_html, state_html, guide_html],
     )
 
     gr.HTML('<div style="border-top:1px solid #30363d;margin:8px 0 16px;"></div>')
@@ -535,15 +753,15 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                             add_ds_file_btn = gr.Button("Upload & Normalize", variant="primary")
 
                         with gr.Tab("Already on server"):
-                            gr.HTML('<p style="color:#8b949e;font-size:12px;margin:8px 0;">Datasets already downloaded on the server:</p>')
-                            existing_ds_dd = gr.Dropdown(
-                                label="Select dataset",
+                            gr.HTML('<p style="color:#8b949e;font-size:12px;margin:8px 0;">'
+                                    'Select one or multiple datasets. If you select more than one they will be merged.</p>')
+                            existing_ds_cb = gr.CheckboxGroup(
+                                label="Select datasets  (check one or more)",
                                 choices=list_datasets(),
-                                allow_custom_value=False,
                             )
                             with gr.Row():
                                 existing_ds_ref = gr.Button("↺ Refresh", size="sm", variant="secondary")
-                                existing_ds_use = gr.Button("Use this dataset", variant="primary")
+                                existing_ds_use = gr.Button("Use selected", variant="primary")
                             existing_ds_info = gr.HTML(terminal_wrap(""))
 
                 with gr.Column(scale=3):
@@ -565,27 +783,61 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                 derived = name.strip() or Path(file.name).stem.lower().replace(" ", "-")
                 yield from run_ft(["add-dataset", file.name, "--name", derived])
 
-            def show_existing_ds(name):
-                if not name:
+            def show_existing_ds(names):
+                if not names:
                     return terminal_wrap("")
-                card = read_data_card(name)
-                rows = len(list_datasets())
-                p = ROOT / "datasets" / name
-                files = [f.name for f in p.iterdir() if f.is_file()] if p.exists() else []
-                info_html = f'<span style="color:#3fb950;font-weight:600;">Dataset: {name}</span><br>'
-                info_html += f'Files: {", ".join(files)}<br><br>'
-                return terminal_wrap(info_html)
+                html = ""
+                for name in names:
+                    p = ROOT / "datasets" / name
+                    files = [f.name for f in p.iterdir() if f.is_file()] if p.exists() else []
+                    cleaned = (p / "train.jsonl").exists()
+                    status_col = "#3fb950" if cleaned else "#d29922"
+                    status_txt = "cleaned" if cleaned else "not cleaned yet"
+                    html += (f'<span style="color:{status_col};font-weight:600;">{name}</span> '
+                             f'<span style="color:#8b949e;font-size:11px;">({status_txt})</span><br>'
+                             f'<span style="color:#484f58;font-size:11px;">{", ".join(files[:4])}</span><br><br>')
+                return terminal_wrap(html)
+
+            def use_existing_ds(names):
+                if not names:
+                    return terminal_wrap('<span style="color:#f85149;">Select at least one dataset.</span>')
+                if len(names) == 1:
+                    cleaned = (ROOT / "datasets" / names[0] / "train.jsonl").exists()
+                    next_tab = "4 · Configure" if cleaned else "2 · Clean"
+                    return terminal_wrap(
+                        f'<span style="color:#3fb950;font-weight:600;">Ready: {names[0]}</span><br>'
+                        f'<span style="color:#8b949e;">Go to <strong>{next_tab}</strong>.</span>'
+                    )
+                # Multiple datasets — merge them
+                merged_name = "_".join(names)
+                merged_dir  = ROOT / "datasets" / merged_name
+                merged_dir.mkdir(parents=True, exist_ok=True)
+                import json as _j
+                rows = []
+                for name in names:
+                    for fname in ["train.jsonl", "normalized.jsonl"]:
+                        p = ROOT / "datasets" / name / fname
+                        if p.exists():
+                            rows += [_j.loads(l) for l in p.read_text().splitlines() if l.strip()]
+                            break
+                if not rows:
+                    return terminal_wrap('<span style="color:#f85149;">No cleaned data found. Clean each dataset first.</span>')
+                out = merged_dir / "normalized.jsonl"
+                with out.open("w") as f:
+                    for r in rows:
+                        f.write(_j.dumps(r, ensure_ascii=False) + "\n")
+                return terminal_wrap(
+                    f'<span style="color:#3fb950;font-weight:600;">Merged {len(names)} datasets → "{merged_name}"</span><br>'
+                    f'<span style="color:#8b949e;">{len(rows)} total rows. Go to <strong>2 · Clean</strong> to clean the merged dataset.</span>'
+                ) + next_step_card("add-dataset")
 
             add_ds_hf_btn.click(do_add_hf, inputs=[ds_src, ds_name_hf],
                                 outputs=add_ds_out, show_progress=False)
             add_ds_file_btn.click(do_upload, inputs=[ds_file, ds_name_file],
                                   outputs=add_ds_out, show_progress=False)
-            existing_ds_ref.click(lambda: gr.Dropdown(choices=list_datasets()), outputs=existing_ds_dd)
-            existing_ds_dd.change(show_existing_ds, inputs=existing_ds_dd, outputs=existing_ds_info)
-            existing_ds_use.click(
-                lambda n: terminal_wrap(f'<span style="color:#3fb950;font-weight:600;">Dataset "{n}" is ready.</span><br>Go to <strong>2 · Clean</strong> tab to clean it, or <strong>4 · Configure</strong> if already cleaned.'),
-                inputs=existing_ds_dd, outputs=existing_ds_info
-            )
+            existing_ds_ref.click(lambda: gr.CheckboxGroup(choices=list_datasets()), outputs=existing_ds_cb)
+            existing_ds_cb.change(show_existing_ds, inputs=existing_ds_cb, outputs=existing_ds_info)
+            existing_ds_use.click(use_existing_ds, inputs=existing_ds_cb, outputs=existing_ds_info)
 
         # ── 2 · Clean Dataset ─────────────────────────────────────────────────
         with gr.Tab("2 · Clean"):
@@ -723,25 +975,49 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                         cfg_lr     = gr.Number(value=2e-4, label="Learning rate", precision=6)
                         cfg_epochs = gr.Slider(1, 10, value=3, step=1, label="Epochs")
                     cfg_seq = gr.Slider(512, 8192, value=2048, step=512, label="Sequence length")
+
+                    gr.HTML('<div style="border-top:1px solid #30363d;margin:12px 0 8px;"></div>')
+                    cfg_wandb_enable = gr.Checkbox(
+                        label="Enable Weights & Biases logging",
+                        value=False,
+                    )
+                    with gr.Group(visible=False) as cfg_wandb_group:
+                        cfg_wandb_project = gr.Textbox(
+                            label="W&B Project", placeholder="mkd-finetuning")
+                        cfg_wandb_entity  = gr.Textbox(
+                            label="W&B Entity (username/team)", placeholder="mkd-hika")
+
+                    cfg_wandb_enable.change(
+                        lambda on: gr.Group(visible=on),
+                        inputs=cfg_wandb_enable, outputs=cfg_wandb_group)
+
                     with gr.Row():
                         gr.Button("↺ Refresh", size="sm", variant="secondary").click(
                             lambda: (gr.Dropdown(choices=list_models()),
                                      gr.Dropdown(choices=list_cleaned_datasets())),
                             outputs=[cfg_model, cfg_ds])
-                        cfg_btn = gr.Button(" Generate", variant="primary")
+                        cfg_btn = gr.Button("Generate", variant="primary")
+
                 with gr.Column(scale=2):
                     cfg_out  = gr.HTML(terminal_wrap(""))
                     cfg_yaml = gr.Code(label="Generated YAML", language="yaml",
                                        lines=22, interactive=False)
 
-            def do_configure(model, ds, quant, lr, epochs, seq):
+            def do_configure(model, ds, quant, lr, epochs, seq,
+                             wandb_on, wandb_project, wandb_entity):
                 q = quant.split(" ")[0]
-                output_html = terminal_wrap("")
-                for chunk in run_ft([
+                args = [
                     "configure", "--model", model, "--dataset", ds,
                     "--quantize", q, "--lr", str(lr),
                     "--epochs", str(int(epochs)), "--seq-len", str(int(seq)),
-                ]):
+                ]
+                if wandb_on and wandb_project.strip():
+                    args += ["--wandb-project", wandb_project.strip()]
+                if wandb_on and wandb_entity.strip():
+                    args += ["--wandb-entity", wandb_entity.strip()]
+
+                output_html = terminal_wrap("")
+                for chunk in run_ft(args):
                     output_html = chunk
                     yield output_html, ""
                 cfgs = list_configs()
@@ -749,7 +1025,8 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                 yield output_html, yaml_txt
 
             cfg_btn.click(do_configure,
-                          inputs=[cfg_model, cfg_ds, cfg_quant, cfg_lr, cfg_epochs, cfg_seq],
+                          inputs=[cfg_model, cfg_ds, cfg_quant, cfg_lr, cfg_epochs, cfg_seq,
+                                  cfg_wandb_enable, cfg_wandb_project, cfg_wandb_entity],
                           outputs=[cfg_out, cfg_yaml], show_progress=False)
 
         # ── 5 · Train ─────────────────────────────────────────────────────────
@@ -767,12 +1044,18 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
             <div style="background:#161b22;border:1px solid #d29922;border-radius:8px;
                         padding:10px 16px;margin-bottom:12px;font-size:13px;color:#d29922;">
               !  Always run <strong>Smoke Test</strong> before full training.
-              It takes 2 minutes and prevents wasting hours on a broken config.
+              It confirms memory, loss shape, and checkpoint save/load — takes ~2 min.
             </div>
             """)
+            smoke_steps = gr.Slider(
+                minimum=10, maximum=200, value=50, step=10,
+                label="Smoke test steps  (more steps = more confidence, longer wait)",
+            )
+            gr.HTML('<p style="color:#8b949e;font-size:12px;margin:-8px 0 12px;">'
+                    '10 steps ≈ 30 sec · 50 steps ≈ 2 min · 200 steps ≈ 8 min</p>')
             with gr.Row():
-                smoke_btn = gr.Button(" Smoke Test  (50 steps)", variant="secondary", scale=1)
-                train_btn = gr.Button(" Start Full Training", variant="primary", scale=1)
+                smoke_btn = gr.Button("Smoke Test", variant="secondary", scale=1)
+                train_btn = gr.Button("Start Full Training", variant="primary", scale=1)
 
             train_out = gr.HTML(terminal_wrap(""))
 
@@ -783,64 +1066,130 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                                        allow_custom_value=True, scale=3)
                 log_ref = gr.Button("↺ Refresh", size="sm", variant="secondary", scale=0)
 
-            with gr.Row():
-                with gr.Column(scale=2):
-                    log_out = gr.HTML(terminal_wrap(""))
-                with gr.Column(scale=3):
-                    loss_chart = gr.LinePlot(
-                        value=pd.DataFrame({"Step": [], "Loss": []}),
-                        x="Step", y="Loss",
-                        title="Training Loss",
-                        x_title="Step", y_title="Loss",
-                        height=300,
-                    )
+            metrics_out = gr.HTML("")
+            log_out = gr.HTML(terminal_wrap(""))
 
-            # Auto-refresh loss chart every 15s when a run is selected
-            loss_timer = gr.Timer(value=15)
-            loss_timer.tick(
-                lambda r: get_loss_df(r),
-                inputs=log_dd, outputs=loss_chart,
+            # Auto-refresh metrics every 10s when training is active
+            metrics_timer = gr.Timer(value=10)
+            metrics_timer.tick(
+                lambda r: (get_metrics_html(r), read_log(r)),
+                inputs=log_dd, outputs=[metrics_out, log_out],
             )
 
-            def do_smoke(c):
-                yield from run_ft(["smoke-test", f"configs/{c}"])
+            def do_smoke(c, steps):
+                yield from run_ft(["smoke-test", f"configs/{c}",
+                                   "--steps", str(int(steps))])
 
             def do_train(c):
                 yield from run_ft(["train", f"configs/{c}"])
 
-            smoke_btn.click(do_smoke, inputs=train_cfg_dd, outputs=train_out, show_progress=False)
+            smoke_btn.click(do_smoke, inputs=[train_cfg_dd, smoke_steps],
+                            outputs=train_out, show_progress=False)
             train_btn.click(do_train, inputs=train_cfg_dd, outputs=train_out, show_progress=False)
-            log_ref.click(lambda r: (read_log(r), get_loss_df(r)),
-                          inputs=log_dd, outputs=[log_out, loss_chart])
-            log_dd.change(lambda r: (read_log(r), get_loss_df(r)),
-                          inputs=log_dd, outputs=[log_out, loss_chart])
+            log_ref.click(lambda r: (get_metrics_html(r), read_log(r)),
+                          inputs=log_dd, outputs=[metrics_out, log_out])
+            log_dd.change(lambda r: (get_metrics_html(r), read_log(r)),
+                          inputs=log_dd, outputs=[metrics_out, log_out])
 
         # ── 6 · Eval ──────────────────────────────────────────────────────────
         with gr.Tab("6 · Eval"):
             gr.HTML('<h3 style="color:#e6edf3;margin:0 0 4px;">Evaluate the fine-tuned model</h3>'
                     '<p style="color:#8b949e;font-size:13px;margin:0 0 16px;">'
-                    'lm-eval-harness · contamination check · A/B vs base model</p>')
+                    'Standard benchmarks · compare vs base model · contamination check</p>')
             with gr.Row():
                 eval_dd  = gr.Dropdown(label="Checkpoint", choices=list_checkpoints(),
                                         allow_custom_value=True, scale=3)
                 eval_ref = gr.Button("↺", size="sm", variant="secondary", scale=0)
-            eval_skip = gr.Checkbox(
-                label="Skip harness evals  (contamination check only — much faster for testing)")
-            eval_btn = gr.Button(" Run Evaluation", variant="primary")
+            with gr.Row():
+                eval_skip    = gr.Checkbox(label="Skip harness evals  (contamination only — fast)")
+                eval_compare = gr.Checkbox(label="Compare vs base model", value=True)
+            eval_limit = gr.Slider(
+                minimum=50, maximum=1000, value=100, step=50,
+                label="Examples per benchmark  (lower = faster, less accurate · full dataset = 1000+)",
+            )
+            gr.HTML('<p style="color:#8b949e;font-size:12px;margin:-8px 0 12px;">'
+                    '100 examples ≈ 5 min · 500 examples ≈ 20 min · full dataset ≈ 60+ min</p>')
+            eval_btn = gr.Button("Run Evaluation", variant="primary")
             eval_out = gr.HTML(terminal_wrap(""))
-            gr.HTML('<h4 style="color:#c9d1d9;margin:12px 0 8px;">Results</h4>')
+
+            gr.HTML('<div style="border-top:1px solid #30363d;margin:16px 0;"></div>')
+            gr.HTML('<h4 style="color:#c9d1d9;margin:0 0 10px;">Benchmark comparison — Fine-tuned vs Base</h4>')
+
+            eval_chart = gr.BarPlot(
+                value=pd.DataFrame({"Benchmark": [], "Score": [], "Model": []}),
+                x="Benchmark", y="Score", color="Model",
+                title="Fine-tuned vs Base Model",
+                y_lim=[0, 1],
+                height=340,
+                color_map={"Fine-tuned": "#3fb950", "Base model": "#58a6ff"},
+            )
+
+            gr.HTML('<h4 style="color:#c9d1d9;margin:12px 0 8px;">Summary</h4>')
             eval_summary = gr.HTML(terminal_wrap(""))
 
-            def do_eval(ckpt, skip):
-                args = ["eval", f"checkpoints/{ckpt}"] + (["--skip-harness"] if skip else [])
+            def get_comparison_chart(run_id: str) -> pd.DataFrame:
+                """Build comparison DataFrame from saved eval results."""
+                result_dir = ROOT / "eval_results" / run_id
+                rows = []
+                for fname in result_dir.glob("*.json"):
+                    if "contamination" in fname.name or "env" in fname.name:
+                        continue
+                    try:
+                        data = json.loads(fname.read_text())
+                        results = data.get("results", {})
+                        for task, metrics in results.items():
+                            for key, val in metrics.items():
+                                if key in ("acc,none", "acc_norm,none", "exact_match,none"):
+                                    if isinstance(val, (int, float)):
+                                        label = fname.stem.replace("_", " ").title()
+                                        rows.append({
+                                            "Benchmark": task.replace("_", " ").upper()[:12],
+                                            "Score": round(float(val), 3),
+                                            "Model": "Fine-tuned",
+                                        })
+                    except Exception:
+                        pass
+
+                # Load base model results if available
+                base_file = result_dir / "base_model_results.json"
+                if base_file.exists():
+                    try:
+                        data = json.loads(base_file.read_text())
+                        for task, metrics in data.get("results", {}).items():
+                            for key, val in metrics.items():
+                                if key in ("acc,none", "acc_norm,none", "exact_match,none"):
+                                    if isinstance(val, (int, float)):
+                                        rows.append({
+                                            "Benchmark": task.replace("_", " ").upper()[:12],
+                                            "Score": round(float(val), 3),
+                                            "Model": "Base model",
+                                        })
+                    except Exception:
+                        pass
+
+                if not rows:
+                    return pd.DataFrame({"Benchmark": [], "Score": [], "Model": []})
+                return pd.DataFrame(rows)
+
+            def do_eval(ckpt, skip, compare, limit):
+                args = ["eval", f"checkpoints/{ckpt}", "--limit", str(int(limit))]
+                if skip:
+                    args.append("--skip-harness")
+                if compare:
+                    args.append("--compare-base")
                 for chunk in run_ft(args):
-                    yield chunk, terminal_wrap("")
-                yield chunk, read_eval_summary(ckpt)
+                    yield chunk, pd.DataFrame({"Benchmark": [], "Score": [], "Model": []}), terminal_wrap("")
+                chart_df = get_comparison_chart(ckpt)
+                summary  = read_eval_summary(ckpt)
+                yield chunk, chart_df, summary
 
             eval_ref.click(lambda: gr.Dropdown(choices=list_checkpoints()), outputs=eval_dd)
-            eval_btn.click(do_eval, inputs=[eval_dd, eval_skip],
-                           outputs=[eval_out, eval_summary], show_progress=False)
-            eval_dd.change(read_eval_summary, inputs=eval_dd, outputs=eval_summary)
+            eval_btn.click(do_eval, inputs=[eval_dd, eval_skip, eval_compare, eval_limit],
+                           outputs=[eval_out, eval_chart, eval_summary], show_progress=False)
+            eval_dd.change(
+                lambda ckpt: (get_comparison_chart(ckpt), read_eval_summary(ckpt)),
+                inputs=eval_dd, outputs=[eval_chart, eval_summary]
+            )
 
         # ── 7 · Export & Publish ──────────────────────────────────────────────
         with gr.Tab("7 · Export & Publish"):

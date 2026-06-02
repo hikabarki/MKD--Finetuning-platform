@@ -55,6 +55,12 @@ def resolve_model_args(ckpt_dir: Path, root: Path) -> tuple[str, str | None]:
     """
     run_id = ckpt_dir.name
 
+    # 0. Check if checkpoint directory has any content at all
+    if not ckpt_dir.exists() or not any(ckpt_dir.iterdir()):
+        err(f"Checkpoint directory is empty: {ckpt_dir}")
+        err("Training may not have saved any checkpoints. Try a checkpoint that has data.")
+        sys.exit(2)
+
     # 1. Prefer merged export (no peft path needed — avoids HF validator)
     merged = root / "exports" / run_id / "merged"
     if merged.exists() and any(merged.glob("model*.safetensors")):
@@ -87,7 +93,8 @@ def resolve_model_args(ckpt_dir: Path, root: Path) -> tuple[str, str | None]:
 
 
 def run_lm_eval(ckpt_dir: Path, tasks: list[str], num_fewshot: int,
-                output_dir: Path, name: str, root: Path) -> dict | None:
+                output_dir: Path, name: str, root: Path,
+                limit: int | None = None) -> dict | None:
     """Run lm-evaluation-harness. Returns parsed results dict or None."""
     out_file = output_dir / f"{name}.json"
     model_args, peft_path = resolve_model_args(ckpt_dir, root)
@@ -132,7 +139,10 @@ lm_eval.__main__.cli_evaluate()
             "--batch_size", "auto",
         ]
 
-    info(f"  Running lm_eval: {' '.join(tasks)} (few-shot={num_fewshot})")
+    if limit:
+        cmd += ["--limit", str(limit)]
+    info(f"  Running lm_eval: {' '.join(tasks)} (few-shot={num_fewshot}"
+         + (f", limit={limit}" if limit else "") + ")")
     try:
         result = subprocess.run(cmd, capture_output=True, text=True,
                                 timeout=3600, cwd=str(root))
@@ -216,11 +226,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("checkpoint_dir")
     ap.add_argument("--base", default=None,
-                    help="Base model HF ID for A/B comparison")
+                    help="Base model path/ID for comparison (auto-detected if not set)")
     ap.add_argument("--suite", default="configs/eval_default.json",
                     help="Path to eval suite config")
     ap.add_argument("--skip-harness", action="store_true",
                     help="Skip lm-eval-harness (faster, only contamination + summary)")
+    ap.add_argument("--compare-base", action="store_true",
+                    help="Also run evals on the base model for comparison chart")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="Max examples per benchmark task (e.g. 100 for fast testing)")
     args = ap.parse_args()
 
     root = project_root()
@@ -240,13 +254,14 @@ def main():
     suite = load_eval_suite(root, args.suite)
     all_results: dict = {"harness": {}, "contamination": {}}
 
-    # -- Harness evals --
+    # -- Harness evals on fine-tuned model --
     if not args.skip_harness:
         for s in suite.get("suites", []):
             name = s["name"]
             tasks = s["tasks"]
             few = s.get("num_fewshot", 0)
-            res = run_lm_eval(ckpt_dir, tasks, few, eval_out, name, root)
+            res = run_lm_eval(ckpt_dir, tasks, few, eval_out, name, root,
+                              limit=args.limit)
             all_results["harness"][name] = res
             if res:
                 ok(f"  {name}: done")
@@ -254,6 +269,60 @@ def main():
                 warn(f"  {name}: skipped/failed")
     else:
         warn("Harness evals skipped (--skip-harness)")
+
+    # -- Base model comparison --
+    if getattr(args, "compare_base", False) and not args.skip_harness:
+        info("Running same evals on base model for comparison...")
+        # Find base model from adapter config
+        base_path = None
+        adapter_cfg = ckpt_dir / "adapter_config.json"
+        if adapter_cfg.exists():
+            try:
+                cfg_data = json.loads(adapter_cfg.read_text())
+                stored = cfg_data.get("base_model_name_or_path", "")
+                safe = stored.replace("/", "__").lower()
+                local = root / "models" / safe
+                base_path = local if local.exists() else Path(stored)
+            except Exception:
+                pass
+        # Also check merged export's source
+        if base_path is None and args.base:
+            base_path = Path(args.base)
+
+        if base_path and base_path.exists():
+            base_out = eval_out / "base_model_results.json"
+            base_results = {}
+            for s in suite.get("suites", []):
+                name = s["name"]
+                tasks = s["tasks"]
+                few = s.get("num_fewshot", 0)
+                tmp_out = eval_out / f"base_{name}.json"
+                # Build model args for base (full model, no peft)
+                cmd = [
+                    sys.executable, "-m", "lm_eval",
+                    "--model", "hf",
+                    "--model_args", f"pretrained={base_path},dtype=bfloat16",
+                    "--tasks", ",".join(tasks),
+                    "--num_fewshot", str(few),
+                    "--output_path", str(tmp_out),
+                    "--batch_size", "auto",
+                ]
+                info(f"  Base model — {name} ...")
+                try:
+                    r = subprocess.run(cmd, capture_output=True, text=True,
+                                       timeout=3600, cwd=str(root))
+                    if r.returncode == 0 and tmp_out.exists():
+                        data = json.loads(tmp_out.read_text())
+                        base_results.update(data.get("results", {}))
+                        ok(f"  Base {name}: done")
+                    else:
+                        warn(f"  Base {name}: failed")
+                except Exception as e:
+                    warn(f"  Base {name}: {e}")
+            base_out.write_text(json.dumps({"results": base_results}, indent=2))
+            ok(f"Base model results saved to {base_out}")
+        else:
+            warn("Base model not found — skipping comparison. Pass --base <path> to specify.")
 
     # -- Contamination check --
     info("Running contamination check (13-gram overlap)...")

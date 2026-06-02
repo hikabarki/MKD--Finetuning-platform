@@ -184,16 +184,22 @@ def run_50_steps(root: Path, recipe: dict) -> dict | None:
         ok("  Shape check passed")
 
         # Simulate timing
+        import sys as _sys
+        n_steps = 50
+        for i, a in enumerate(_sys.argv):
+            if a == "--steps" and i + 1 < len(_sys.argv):
+                try: n_steps = int(_sys.argv[i + 1])
+                except ValueError: pass
         t0 = time.time()
-        for step in range(1, 51):
+        for step in range(1, n_steps + 1):
             time.sleep(0.01)
-            if step % 10 == 0:
-                simulated_loss = 2.5 - step * 0.02 + (step % 3) * 0.01
-                info(f"  step {step:3d}/50   loss={simulated_loss:.3f}   grad_norm=0.85")
+            if step % max(1, n_steps // 5) == 0:
+                simulated_loss = 2.5 - step * (2.0 / n_steps) + (step % 3) * 0.01
+                info(f"  step {step:3d}/{n_steps}   loss={simulated_loss:.3f}   grad_norm=0.85")
         elapsed = time.time() - t0
-        tok_s = (micro_batch * seq_len * 50) / elapsed
-        ok(f"  50 steps in {elapsed:.1f}s  (~{tok_s:.0f} tok/s simulated)")
-        return {"elapsed": elapsed, "tok_s": tok_s, "steps": 50}
+        tok_s = (micro_batch * seq_len * n_steps) / elapsed
+        ok(f"  {n_steps} steps in {elapsed:.1f}s  (~{tok_s:.0f} tok/s simulated)")
+        return {"elapsed": elapsed, "tok_s": tok_s, "steps": n_steps}
     except Exception as e:
         warn(f"  50-step simulation failed: {e}")
         return None
@@ -254,20 +260,22 @@ import json
 
 
 def main():
-    if len(sys.argv) < 2:
-        err("Usage: ft smoke-test <recipe.yaml>")
-        sys.exit(2)
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("recipe", help="Path to recipe YAML")
+    ap.add_argument("--steps", type=int, default=50,
+                    help="Number of training steps to simulate (default: 50)")
+    args = ap.parse_args()
 
-    recipe_path = Path(sys.argv[1])
+    recipe_path = Path(args.recipe)
     root = project_root()
-    # resolve relative paths against project root if not found in cwd
     if not recipe_path.exists() and not recipe_path.is_absolute():
         recipe_path = root / recipe_path
     if not recipe_path.exists():
         err(f"Recipe not found: {recipe_path}")
         sys.exit(2)
     recipe = load_yaml(recipe_path)
-    info(f"Smoke-testing: {recipe_path.name}")
+    info(f"Smoke-testing: {recipe_path.name}  ({args.steps} steps)")
 
     failures = []
 
