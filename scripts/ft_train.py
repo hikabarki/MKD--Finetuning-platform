@@ -233,7 +233,7 @@ def main():
 
     update_state(
         phase="5 / Training (running)",
-        status=f"🏃 Training started: {recipe_path.name}",
+        status=f"Training started: {recipe_path.name}",
         next_action=f"Monitor with: ft watch {output_dir.name}",
         done=[f"Started training with recipe {recipe_path.name}"],
     )

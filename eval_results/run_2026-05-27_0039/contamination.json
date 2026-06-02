@@ -1,0 +1,6 @@
+{
+  "alpaca": {
+    "train_ngrams_sampled": 468476,
+    "train_rows_sampled": 10000
+  }
+}
