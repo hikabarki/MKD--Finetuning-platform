@@ -640,6 +640,16 @@ li[role="option"]:hover, li[role="option"].selected {
 }
 li[role="option"] * { color: #e6edf3 !important; }
 
+/* Tab overflow (...) dropdown — nuke all white popups */
+[popover], [popover] *, [role="menu"], [role="menu"] *,
+[class*="overflow"], [class*="overflow"] *,
+div[style*="position: absolute"], div[style*="position:absolute"] {
+  background-color: #161b22 !important;
+  color: #e6edf3 !important;
+  border-color: #30363d !important;
+}
+button[aria-haspopup] { color: #8b949e !important; }
+
 /* Sliders */
 input[type=range]::-webkit-slider-thumb { background: #58a6ff !important; }
 
@@ -727,45 +737,47 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
         # Screen 1: Choose preset
         with gr.Group(visible=True) as user_screen1:
             gr.HTML("""
-            <div style="padding:20px 0 8px;">
-              <h2 style="color:#e6edf3;margin:0 0 6px;font-size:20px;">Choose how to fine-tune</h2>
-              <p style="color:#8b949e;font-size:13px;margin:0 0 24px;">
-                Pick a preset — all technical settings are pre-configured for you.
-              </p>
+            <div style="padding:32px 0 24px;text-align:center;">
+              <h2 style="color:#e6edf3;margin:0;font-size:24px;font-weight:700;">
+                How would you like to start?
+              </h2>
             </div>
             """)
             with gr.Row():
                 with gr.Column(scale=1):
                     gr.HTML("""
-                    <div style="background:#161b22;border:1px solid #30363d;border-radius:10px;
-                                padding:24px;margin-bottom:8px;">
-                      <h3 style="color:#e6edf3;margin:0 0 8px;">Quick Start</h3>
-                      <p style="color:#8b949e;font-size:13px;margin:0 0 16px;">
-                        One model, your dataset, everything pre-set.<br>
-                        Best for: first-time users, fast experiments.
-                      </p>
-                      <div style="color:#8b949e;font-size:12px;">
-                        Model: Qwen2.5-7B &nbsp;|&nbsp; 3 epochs &nbsp;|&nbsp; ~3-6h
+                    <div style="background:#0d2a1a;border:2px solid #238636;border-radius:12px;
+                                padding:28px 28px 16px;position:relative;margin-bottom:8px;">
+                      <div style="position:absolute;top:14px;right:14px;background:#238636;
+                                  color:#fff;font-size:10px;font-weight:700;padding:3px 10px;
+                                  border-radius:20px;letter-spacing:0.06em;">RECOMMENDED</div>
+                      <div style="font-size:28px;margin-bottom:12px;">&#9889;</div>
+                      <div style="color:#e6edf3;font-size:18px;font-weight:700;margin-bottom:8px;">Quick Start</div>
+                      <div style="color:#8b949e;font-size:14px;line-height:1.6;margin-bottom:16px;">
+                        Upload your data.<br>We handle everything else.
+                      </div>
+                      <div style="color:#3fb950;font-size:12px;">
+                        &#8987; Test run ~1 min &nbsp;·&nbsp; Full run ~3–6h
                       </div>
                     </div>
                     """)
-                    user_qs_btn = gr.Button("Use Quick Start", variant="primary")
+                    user_qs_btn = gr.Button("Select Quick Start  →", variant="primary")
 
                 with gr.Column(scale=1):
                     gr.HTML("""
-                    <div style="background:#161b22;border:1px solid #30363d;border-radius:10px;
-                                padding:24px;margin-bottom:8px;">
-                      <h3 style="color:#e6edf3;margin:0 0 8px;">Custom Mix</h3>
-                      <p style="color:#8b949e;font-size:13px;margin:0 0 16px;">
-                        Choose your model and dataset from a list.<br>
-                        Best for: comparing models, domain-specific data.
-                      </p>
+                    <div style="background:#161b22;border:2px solid #30363d;border-radius:12px;
+                                padding:28px 28px 16px;margin-bottom:8px;">
+                      <div style="font-size:28px;margin-bottom:12px;">&#9881;</div>
+                      <div style="color:#e6edf3;font-size:18px;font-weight:700;margin-bottom:8px;">Custom Mix</div>
+                      <div style="color:#8b949e;font-size:14px;line-height:1.6;margin-bottom:16px;">
+                        Pick your model and dataset<br>from what's on the server.
+                      </div>
                       <div style="color:#8b949e;font-size:12px;">
-                        3 models &nbsp;|&nbsp; multiple datasets &nbsp;|&nbsp; params locked
+                        All downloaded models &nbsp;·&nbsp; All datasets
                       </div>
                     </div>
                     """)
-                    user_cm_btn = gr.Button("Use Custom Mix", variant="secondary")
+                    user_cm_btn = gr.Button("Select Custom Mix  →", variant="secondary")
 
         # Screen 2a: Quick Start config
         with gr.Group(visible=False) as user_screen2a:
@@ -816,44 +828,80 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                 user_qs_back_btn = gr.Button("← Back", variant="secondary", size="sm")
                 user_qs_out = gr.HTML("", visible=False)
 
-        # Screen 2b: Custom Mix config
-        with gr.Group(visible=False) as user_screen2b:
-            gr.HTML('<h3 style="color:#e6edf3;margin:0 0 16px;">Custom Mix — Choose your model and data</h3>')
-            with gr.Row():
-                with gr.Column(scale=1):
-                    user_cm_model = gr.Radio(
-                        choices=[
-                            "Qwen2.5-7B-Instruct  (7B, best quality)",
-                            "Phi-3.5-mini-instruct  (3.8B, faster)",
-                            "Qwen2.5-3B-Instruct  (3B, lightest)",
-                        ],
-                        value="Qwen2.5-7B-Instruct  (7B, best quality)",
-                        label="Choose base model",
-                    )
-                    user_cm_dataset = gr.CheckboxGroup(
-                        choices=["alpaca  (52k instruction examples)",
-                                 "guanaco-llama2-1k  (1k conversation examples)",
-                                 "Upload my own"],
-                        label="Choose dataset(s)  — select one or more",
-                    )
-                    user_cm_file = gr.File(
-                        label="Upload your dataset (if selected above)",
-                        file_types=[".jsonl", ".json", ".csv"],
-                        visible=False,
-                    )
-                    gr.HTML("""
-                    <div style="background:#161b22;border:1px solid #30363d;border-radius:6px;
-                                padding:10px 14px;font-size:12px;color:#8b949e;margin:8px 0;">
-                      Settings locked: 3 epochs · QLoRA 4-bit · LR 2e-4 · seq 2048
-                    </div>
-                    """)
-                    user_cm_name = gr.Textbox(label="Model name (for saving)", placeholder="my-fine-tuned-model")
-                    with gr.Row():
-                        user_cm_back_btn  = gr.Button("← Back", variant="secondary")
-                        user_cm_start_btn = gr.Button("Start Fine-Tuning", variant="primary")
+        # Screen 2b: Custom Mix config — fully dynamic from server
+        def get_model_choices():
+            choices = []
+            for m in list_models():
+                info_f = ROOT / "models" / m / "MODEL_INFO.json"
+                try:
+                    info = json.loads(info_f.read_text())
+                    hf_id  = info.get("model_id", m)
+                    params = f'{info.get("params_billion", "?")}B'
+                    label  = hf_id.split("/")[-1].replace("-Instruct","").replace("-instruct","")
+                    choices.append(f"{label}  ({params})")
+                except Exception:
+                    choices.append(m)
+            return choices or ["Qwen2.5-7B-Instruct  (7B)"]
 
-                with gr.Column(scale=2):
-                    user_cm_out = gr.HTML(terminal_wrap(""))
+        def get_cm_dataset_choices():
+            choices = []
+            for d in list_cleaned_datasets():
+                card_f = ROOT / "data_cards" / f"{d}.json"
+                try:
+                    card = json.loads(card_f.read_text())
+                    rows = card.get("train_rows", "?")
+                    choices.append(f"{d}  ({rows:,} examples)" if isinstance(rows, int) else d)
+                except Exception:
+                    choices.append(d)
+            choices.append("Upload my own data")
+            return choices
+
+        with gr.Group(visible=False) as user_screen2b:
+            gr.HTML("""
+            <h2 style="color:#e6edf3;margin:0 0 6px;font-size:22px;">Custom Mix</h2>
+            <p style="color:#8b949e;font-size:14px;margin:0 0 20px;">
+              Choose the AI model and data. Everything else is set up automatically.
+            </p>
+            """)
+            with gr.Row():
+                user_cm_model = gr.Radio(
+                    choices=get_model_choices(),
+                    value=get_model_choices()[0],
+                    label="Which AI model do you want to fine-tune?",
+                    scale=3,
+                )
+                cm_model_refresh = gr.Button("↺", size="sm", variant="secondary", scale=0)
+
+            gr.HTML('<div style="height:8px;"></div>')
+
+            with gr.Row():
+                user_cm_dataset = gr.CheckboxGroup(
+                    choices=get_cm_dataset_choices(),
+                    label="What data do you want to train on?  (select one or more)",
+                    scale=3,
+                )
+                cm_ds_refresh = gr.Button("↺", size="sm", variant="secondary", scale=0)
+
+            user_cm_file = gr.File(
+                label="Upload your data file  (.jsonl, .json or .csv)",
+                file_types=[".jsonl", ".json", ".csv"],
+                visible=False,
+            )
+
+            gr.HTML('<div style="height:8px;"></div>')
+            user_cm_name = gr.Textbox(
+                label="What should we call your model?",
+                placeholder="e.g.  my-assistant  or  support-bot")
+
+            gr.HTML('<div style="height:16px;"></div>')
+            with gr.Row():
+                user_cm_back_btn  = gr.Button("← Back",        variant="secondary", scale=1)
+                user_cm_start_btn = gr.Button("Start Training", variant="primary",   scale=2)
+
+            user_cm_out = gr.HTML("", visible=False)
+
+            cm_model_refresh.click(lambda: gr.Radio(choices=get_model_choices()),       outputs=user_cm_model)
+            cm_ds_refresh.click(lambda: gr.CheckboxGroup(choices=get_cm_dataset_choices()), outputs=user_cm_dataset)
 
         # Screen 3: Progress
         with gr.Group(visible=False) as user_screen3:
@@ -1082,14 +1130,21 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
 
 
     def run_user_custommix(models_sel, datasets_sel, upload_file, model_name):
-        model_map = {"Qwen2.5-7B-Instruct": "qwen__qwen2.5-7b-instruct",
-                     "Phi-3.5-mini-instruct": "phi-3.5-mini-instruct",
-                     "Qwen2.5-3B-Instruct":  "qwen__qwen2.5-3b-instruct"}
-        model   = model_map.get(models_sel.split("  ")[0], "qwen__qwen2.5-7b-instruct")
+        # Resolve model: match display label back to folder name
+        model = "qwen__qwen2.5-7b-instruct"  # default
+        label = (models_sel or "").split("  ")[0].strip().lower().replace("-", "").replace(".", "")
+        for m in list_models():
+            if label in m.lower().replace("-", "").replace(".", "").replace("_", ""):
+                model = m
+                break
+
+        # Resolve dataset: extract name before the row-count suffix
         dataset = "alpaca"
         for d in (datasets_sel or []):
-            if "alpaca" in d: dataset = "alpaca"; break
-            elif "guanaco" in d: dataset = "guanaco-llama2-1k"; break
+            ds_name = d.split("  ")[0].strip()
+            if ds_name and ds_name != "Upload my own data":
+                dataset = ds_name
+                break
 
         yield build_progress_html("configure"), terminal_wrap("Generating recipe...")
         cfg_args = ["configure", f"--model={model}", f"--dataset={dataset}",
@@ -1368,46 +1423,77 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
             with gr.Tab("1 · Dataset"):
                 gr.HTML('<h3 style="color:#e6edf3;margin:0 0 4px;">Add a dataset</h3>'
                         '<p style="color:#8b949e;font-size:13px;margin:0 0 16px;">'
-                        'Choose one source: HuggingFace / URL, or upload a file from your computer. '
-                        'Auto-detects: Alpaca · ShareGPT · OpenAI · ChatML · DPO</p>')
+                        'Select a source below.</p>')
+                # Source selector — radio avoids tab overflow
+                ds_source_radio = gr.Radio(
+                    choices=["HuggingFace", "Upload file", "Already on server", "AI Hub Korea"],
+                    value="HuggingFace",
+                    label="Where is your dataset?",
+                    interactive=True,
+                )
+
                 with gr.Row():
                     with gr.Column(scale=2):
-                        with gr.Tabs():
-                            with gr.Tab("HuggingFace / URL"):
-                                ds_src = gr.Textbox(
-                                    label="HuggingFace dataset ID or URL",
-                                    placeholder="tatsu-lab/alpaca",
-                                )
-                                ds_name_hf = gr.Textbox(
-                                    label="Local name  (optional)",
-                                    placeholder="alpaca")
-                                add_ds_hf_btn = gr.Button("Download & Normalize", variant="primary")
-    
-                            with gr.Tab("Upload from computer"):
-                                ds_file = gr.File(
-                                    label="Select a file from your computer",
-                                    file_types=[".jsonl", ".json", ".csv", ".parquet"],
-                                    file_count="single",
-                                )
-                                ds_name_file = gr.Textbox(
-                                    label="Local name  (optional — defaults to filename)",
-                                    placeholder="leave blank to use filename")
-                                add_ds_file_btn = gr.Button("Upload & Normalize", variant="primary")
-    
-                            with gr.Tab("Already on server"):
-                                gr.HTML('<p style="color:#8b949e;font-size:12px;margin:8px 0;">'
-                                        'Select one or multiple datasets. If you select more than one they will be merged.</p>')
-                                existing_ds_cb = gr.CheckboxGroup(
-                                    label="Select datasets  (check one or more)",
-                                    choices=list_datasets(),
-                                )
-                                with gr.Row():
-                                    existing_ds_ref = gr.Button("↺ Refresh", size="sm", variant="secondary")
-                                    existing_ds_use = gr.Button("Use selected", variant="primary")
-                                existing_ds_info = gr.HTML(terminal_wrap(""))
-    
+                        # HuggingFace panel
+                        with gr.Group(visible=True) as ds_panel_hf:
+                            ds_src = gr.Textbox(label="HuggingFace dataset ID or URL",
+                                                placeholder="tatsu-lab/alpaca")
+                            ds_name_hf = gr.Textbox(label="Local name  (optional)", placeholder="alpaca")
+                            add_ds_hf_btn = gr.Button("Download & Normalize", variant="primary")
+
+                        # Upload panel
+                        with gr.Group(visible=False) as ds_panel_upload:
+                            ds_file = gr.File(label="Select a file",
+                                              file_types=[".jsonl", ".json", ".csv", ".parquet"],
+                                              file_count="single")
+                            ds_name_file = gr.Textbox(label="Local name  (optional — defaults to filename)",
+                                                       placeholder="leave blank to use filename")
+                            add_ds_file_btn = gr.Button("Upload & Normalize", variant="primary")
+
+                        # Server panel
+                        with gr.Group(visible=False) as ds_panel_server:
+                            existing_ds_cb = gr.CheckboxGroup(
+                                label="Select datasets  (check one or more — multiple will be merged)",
+                                choices=list_datasets())
+                            with gr.Row():
+                                existing_ds_ref = gr.Button("↺ Refresh", size="sm", variant="secondary")
+                                existing_ds_use = gr.Button("Use selected", variant="primary")
+                            existing_ds_info = gr.HTML(terminal_wrap(""))
+
+                        # AI Hub panel
+                        with gr.Group(visible=False) as ds_panel_aihub:
+                            gr.HTML("""
+                            <div style="background:#1a1a2e;border:1px solid #3d3d8f;border-radius:8px;
+                                        padding:12px 16px;margin-bottom:12px;font-size:13px;">
+                              <span style="color:#7b7bff;font-weight:600;">AI Hub Korea</span>
+                              <span style="color:#484f58;font-size:12px;display:block;margin-top:4px;">
+                                Get API key: aihub.or.kr → 마이페이지 → API 키 발급
+                              </span>
+                            </div>""")
+                            aihub_id   = gr.Textbox(label="Dataset ID", placeholder="e.g. 71875")
+                            aihub_key  = gr.Textbox(label="API Key", placeholder="Your AI Hub API key",
+                                                     type="password")
+                            aihub_name = gr.Textbox(label="Local name  (optional)",
+                                                     placeholder="e.g. medical-knowledge")
+                            aihub_btn  = gr.Button("Download from AI Hub", variant="primary")
+
                     with gr.Column(scale=3):
-                        add_ds_out = gr.HTML(terminal_wrap(""))
+                        add_ds_out = gr.HTML(terminal_wrap(""), visible=True)
+
+                # Show/hide panels + output panel based on radio selection
+                def switch_ds_panel(choice):
+                    show_output = choice in ("HuggingFace", "Upload file", "AI Hub Korea")
+                    return (
+                        gr.Group(visible=choice == "HuggingFace"),
+                        gr.Group(visible=choice == "Upload file"),
+                        gr.Group(visible=choice == "Already on server"),
+                        gr.Group(visible=choice == "AI Hub Korea"),
+                        gr.HTML(visible=show_output),
+                    )
+                ds_source_radio.change(
+                    switch_ds_panel, inputs=ds_source_radio,
+                    outputs=[ds_panel_hf, ds_panel_upload, ds_panel_server, ds_panel_aihub, add_ds_out]
+                )
     
                 def do_add_hf(src, name):
                     src = src.strip()
@@ -1442,14 +1528,32 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
     
                 def use_existing_ds(names):
                     if not names:
-                        return terminal_wrap('<span style="color:#f85149;">Select at least one dataset.</span>')
+                        msg = terminal_wrap('<span style="color:#f85149;">Select at least one dataset.</span>')
+                        return msg, terminal_wrap("")
                     if len(names) == 1:
-                        cleaned = (ROOT / "datasets" / names[0] / "train.jsonl").exists()
+                        name = names[0]
+                        cleaned = (ROOT / "datasets" / name / "train.jsonl").exists()
                         next_tab = "4 · Configure" if cleaned else "2 · Clean"
-                        return terminal_wrap(
-                            f'<span style="color:#3fb950;font-weight:600;">Ready: {names[0]}</span><br>'
-                            f'<span style="color:#8b949e;">Go to <strong>{next_tab}</strong>.</span>'
-                        )
+                        # Get row count from data card
+                        rows_info = ""
+                        try:
+                            card = json.loads((ROOT / "data_cards" / f"{name}.json").read_text())
+                            train = card.get("train_rows", "")
+                            val   = card.get("val_rows", "")
+                            if train:
+                                rows_info = f'{train:,} train · {val:,} val rows'
+                        except Exception:
+                            pass
+                        status_col = "#3fb950" if cleaned else "#d29922"
+                        status_txt = "Cleaned and ready" if cleaned else "Not cleaned yet — go to 2 · Clean first"
+                        info_card = f"""
+<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px 20px;">
+  <div style="font-size:16px;font-weight:700;color:#e6edf3;margin-bottom:8px;">{name}</div>
+  <div style="color:{status_col};font-size:13px;margin-bottom:4px;">{status_txt}</div>
+  {"<div style='color:#8b949e;font-size:12px;margin-bottom:12px;'>" + rows_info + "</div>" if rows_info else ""}
+  <div style="color:#58a6ff;font-size:13px;font-weight:600;">Next step: go to <strong>{next_tab}</strong></div>
+</div>"""
+                        return info_card, terminal_wrap("")
                     # Multiple datasets — merge them
                     merged_name = "_".join(names)
                     merged_dir  = ROOT / "datasets" / merged_name
@@ -1468,18 +1572,143 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                     with out.open("w") as f:
                         for r in rows:
                             f.write(_j.dumps(r, ensure_ascii=False) + "\n")
-                    return terminal_wrap(
-                        f'<span style="color:#3fb950;font-weight:600;">Merged {len(names)} datasets → "{merged_name}"</span><br>'
-                        f'<span style="color:#8b949e;">{len(rows)} total rows. Go to <strong>2 · Clean</strong> to clean the merged dataset.</span>'
-                    ) + next_step_card("add-dataset")
+                    info_card = f"""
+<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px 20px;">
+  <div style="font-size:16px;font-weight:700;color:#e6edf3;margin-bottom:8px;">{merged_name}</div>
+  <div style="color:#3fb950;font-size:13px;margin-bottom:4px;">Merged {len(names)} datasets</div>
+  <div style="color:#8b949e;font-size:12px;margin-bottom:12px;">{len(rows):,} total rows</div>
+  <div style="color:#58a6ff;font-size:13px;font-weight:600;">Next step: go to <strong>2 · Clean</strong></div>
+</div>"""
+                    return info_card, terminal_wrap("")
     
+                def do_aihub_download(dataset_id, api_key, ds_name):
+                    """Download from AI Hub Korea, unzip, convert to ChatML."""
+                    import zipfile, tempfile, subprocess as _sp
+
+                    dataset_id = dataset_id.strip()
+                    api_key    = api_key.strip()
+                    ds_name    = ds_name.strip() or f"aihub-{dataset_id}"
+
+                    if not dataset_id:
+                        yield terminal_wrap('<span style="color:#f85149;">Enter a dataset ID.</span>')
+                        return
+                    if not api_key:
+                        yield terminal_wrap('<span style="color:#f85149;">Enter your AI Hub API key.</span>')
+                        return
+
+                    yield terminal_wrap(f'<span style="color:#58a6ff;">Downloading dataset {dataset_id} from AI Hub...</span>')
+
+                    # Download zip
+                    raw_dir = ROOT / "datasets" / ds_name / "raw"
+                    raw_dir.mkdir(parents=True, exist_ok=True)
+                    zip_path = raw_dir / f"{dataset_id}.zip"
+
+                    dl_url = f"https://api.aihub.or.kr/down/0.5/{dataset_id}.do"
+                    try:
+                        import requests
+                        r = requests.get(dl_url, headers={"apikey": api_key},
+                                         stream=True, timeout=300)
+                        if r.status_code != 200:
+                            yield terminal_wrap(
+                                f'<span style="color:#f85149;">Download failed: HTTP {r.status_code}<br>'
+                                f'Check your API key and dataset ID.<br>'
+                                f'Make sure you have access approved on aihub.or.kr</span>')
+                            return
+
+                        total = int(r.headers.get("content-length", 0))
+                        downloaded = 0
+                        with zip_path.open("wb") as f:
+                            for chunk in r.iter_content(1024 * 1024):
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                if total:
+                                    pct = int(downloaded / total * 100)
+                                    yield terminal_wrap(
+                                        f'<span style="color:#58a6ff;">Downloading... {pct}% ({downloaded//1024//1024} MB)</span>')
+                    except Exception as e:
+                        yield terminal_wrap(f'<span style="color:#f85149;">Download error: {e}</span>')
+                        return
+
+                    yield terminal_wrap(f'<span style="color:#3fb950;">Download complete. Extracting...</span>')
+
+                    # Extract zip
+                    extract_dir = raw_dir / "extracted"
+                    extract_dir.mkdir(exist_ok=True)
+                    try:
+                        with zipfile.ZipFile(zip_path, "r") as zf:
+                            zf.extractall(extract_dir)
+                    except Exception as e:
+                        yield terminal_wrap(f'<span style="color:#f85149;">Extraction failed: {e}</span>')
+                        return
+
+                    yield terminal_wrap('<span style="color:#3fb950;">Extracted. Converting to ChatML format...</span>')
+
+                    # Find JSON files and convert AI Hub format → ChatML
+                    import glob as _glob
+                    json_files = list(extract_dir.rglob("*.json"))
+                    if not json_files:
+                        yield terminal_wrap('<span style="color:#f85149;">No JSON files found in zip.</span>')
+                        return
+
+                    rows = []
+                    for jf in json_files:
+                        try:
+                            data = json.loads(jf.read_text(encoding="utf-8"))
+                            # AI Hub medical Q&A formats
+                            items = (data.get("데이터") or data.get("data") or
+                                     data.get("지식베이스") or data.get("QA") or
+                                     (data if isinstance(data, list) else []))
+                            for item in items:
+                                q = (item.get("질문") or item.get("question") or
+                                     item.get("Q") or item.get("질의") or "")
+                                a = (item.get("답변") or item.get("answer") or
+                                     item.get("A") or item.get("응답") or "")
+                                if q and a:
+                                    rows.append({"messages": [
+                                        {"role": "user",      "content": str(q)},
+                                        {"role": "assistant", "content": str(a)},
+                                    ]})
+                        except Exception:
+                            continue
+
+                    if not rows:
+                        yield terminal_wrap(
+                            f'<span style="color:#d29922;">Converted 0 rows — AI Hub format may differ.<br>'
+                            f'Files found: {[f.name for f in json_files[:3]]}<br>'
+                            f'Use "Upload from computer" to manually process.</span>')
+                        return
+
+                    # Save normalized
+                    out_dir = ROOT / "datasets" / ds_name
+                    out_dir.mkdir(exist_ok=True)
+                    norm = out_dir / "normalized.jsonl"
+                    with norm.open("w", encoding="utf-8") as f:
+                        for r in rows:
+                            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+                    # Write data card
+                    card = {"name": ds_name, "source": f"aihub:{dataset_id}",
+                            "rows_raw": len(rows), "detected_format": "aihub_medical"}
+                    (ROOT / "data_cards").mkdir(exist_ok=True)
+                    (ROOT / "data_cards" / f"{ds_name}.json").write_text(
+                        json.dumps(card, indent=2))
+
+                    yield terminal_wrap(
+                        f'<span style="color:#3fb950;font-weight:bold;">Done! {len(rows):,} Q&A pairs converted.</span><br>'
+                        f'<span style="color:#8b949e;">Dataset saved as "{ds_name}". Go to <strong>2 · Clean</strong> to prepare it.</span>'
+                    ) + next_step_card("add-dataset")
+
                 add_ds_hf_btn.click(do_add_hf, inputs=[ds_src, ds_name_hf],
                                     outputs=add_ds_out, show_progress=False)
                 add_ds_file_btn.click(do_upload, inputs=[ds_file, ds_name_file],
                                       outputs=add_ds_out, show_progress=False)
                 existing_ds_ref.click(lambda: gr.CheckboxGroup(choices=list_datasets()), outputs=existing_ds_cb)
                 existing_ds_cb.change(show_existing_ds, inputs=existing_ds_cb, outputs=existing_ds_info)
-                existing_ds_use.click(use_existing_ds, inputs=existing_ds_cb, outputs=existing_ds_info)
+                existing_ds_use.click(use_existing_ds, inputs=existing_ds_cb,
+                                      outputs=[existing_ds_info, add_ds_out])
+                aihub_btn.click(do_aihub_download,
+                                inputs=[aihub_id, aihub_key, aihub_name],
+                                outputs=add_ds_out, show_progress=False)
     
             # ── 2 · Clean Dataset ─────────────────────────────────────────────────
             with gr.Tab("2 · Clean"):
@@ -1537,7 +1766,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                 with gr.Row():
                     with gr.Column(scale=1):
                         with gr.Tabs():
-                            with gr.Tab("Already on server"):
+                            with gr.Tab("Server"):
                                 gr.HTML('<p style="color:#8b949e;font-size:12px;margin:8px 0;">Models already downloaded on this server:</p>')
                                 existing_model_dd = gr.Dropdown(
                                     label="Select model",
