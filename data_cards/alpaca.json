@@ -15,8 +15,8 @@
   "rows_after_dedup": 51909,
   "rows_after_decontam": 51909,
   "decontamination_note": "13-gram overlap check deferred to `ft eval` (see 06_eval_plan.md)",
-  "train_rows": 51131,
-  "val_rows": 778,
-  "sha256_train": "a6a4edab07d99b4e772f7f85628ac919f3658e11c560a2c14a2aee3e0ae99365",
-  "sha256_val": "180aa3bc832f054b2d194af1192332d5f193e5829ac877685ffb5f1a524b2641"
+  "train_rows": 51390,
+  "val_rows": 519,
+  "sha256_train": "f91ea6b1c0c651cb0e792a3e68342b525ef4c37edf521be37f272c16ff06ee68",
+  "sha256_val": "7f4edf43d18705c453eb9e1464cc35a424f14582f7e0095b2cb2389a34fae9a4"
 }

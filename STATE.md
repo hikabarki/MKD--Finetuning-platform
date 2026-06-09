@@ -1,11 +1,11 @@
 # STATE
 
-**Updated:** 2026-06-09 01:17 UTC by ft-cli
-**Phase:** 5 / Training (running)
-**Status:** Training started: run_2026-06-09_0055.yaml
+**Updated:** 2026-06-09 02:33 UTC by ft-cli
+**Phase:** 3 / Data Pipeline (cleaned)
+**Status:** ✓ Dataset 'alpaca' cleaned. Train=51390, Val=519.
 
 ## Recent actions
-- ✅ Started training with recipe run_2026-06-09_0055.yaml
+- ✅ Cleaned dataset 'alpaca'
 
 ## Next action
-Monitor with: ft watch run_2026-06-09_0055
+Eyeball datasets/alpaca/sample_100.jsonl, then add a base model: `ft add-model <hf-model-id>`
