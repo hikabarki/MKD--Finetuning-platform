@@ -407,12 +407,51 @@ def read_data_card(name: str) -> str:
         return terminal_wrap('<span style="color:#d29922;">No data card found</span>')
     try:
         card = json.loads(p.read_text())
-        html = ""
-        highlight = {"train_rows", "val_rows", "rows_raw", "license", "detected_format"}
-        for k, v in card.items():
-            col = "#58a6ff" if k in highlight else "#8b949e"
-            html += f'<span style="color:{col};">{k}</span>: <span style="color:#e6edf3;">{v}</span><br>'
-        return terminal_wrap(html, height=280)
+
+        # Only show meaningful fields — skip hashes, internal paths, redundant IDs
+        SKIP = {"sha256", "sha256_normalized", "normalized_path", "source_id",
+                "rows_after_schema", "rows_after_length", "rows_after_pii"}
+        SHOW = [
+            ("name",            "Dataset"),
+            ("source",          "Source"),
+            ("detected_format", "Format"),
+            ("rows_raw",        "Raw rows"),
+            ("train_rows",      "Train rows"),
+            ("val_rows",        "Val rows"),
+            ("license",         "License"),
+        ]
+
+        rows_html = ""
+        for key, label in SHOW:
+            val = card.get(key)
+            if val is None:
+                continue
+            # Clean up the "UNKNOWN — fill in before cleaning" noise
+            val_str = str(val)
+            if "fill in before" in val_str.lower():
+                val_str = "UNKNOWN"
+            # Format numbers with commas
+            if isinstance(val, int):
+                val_str = f"{val:,}"
+            col = "#3fb950" if key in ("train_rows", "val_rows") else "#e6edf3"
+            rows_html += (
+                f'<div style="display:flex;justify-content:space-between;'
+                f'padding:7px 0;border-bottom:1px solid #21262d;">'
+                f'<span style="color:#8b949e;font-size:12px;">{label}</span>'
+                f'<span style="color:{col};font-size:12px;font-weight:500;'
+                f'max-width:60%;text-align:right;word-break:break-all;">{val_str}</span>'
+                f'</div>'
+            )
+
+        html = (
+            f'<div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;'
+            f'padding:14px 18px;">'
+            f'<div style="color:#8b949e;font-size:10px;font-weight:600;letter-spacing:0.06em;'
+            f'margin-bottom:10px;">DATA CARD</div>'
+            f'{rows_html}'
+            f'</div>'
+        )
+        return html
     except Exception:
         return terminal_wrap(p.read_text())
 
@@ -426,8 +465,68 @@ def read_log(run_name: str) -> str:
     p = ROOT / "logs" / f"train_{run_name}.log"
     if not p.exists():
         return terminal_wrap('<span style="color:#d29922;">No log file yet</span>')
-    lines = p.read_text().splitlines()[-60:]
-    return terminal_wrap(ansi_to_html("\n".join(lines)), height=420)
+
+    important = []
+    for raw in p.read_text().splitlines():
+        line = raw.strip()
+        # skip pure tqdm progress bars  (e.g. "  1%|████  | 100/9492 ...")
+        if re.match(r"^\s*\d+%\|", line):
+            continue
+        # skip blank lines and pure separator lines
+        if not line or set(line) <= {"-", "=", " "}:
+            continue
+        # skip verbose axolotl config dump lines (long JSON-like blocks)
+        if re.match(r"^\s{2,}\"[a-z_]+\":", line):
+            continue
+        # keep: metric JSON lines, ERROR/WARNING, ✓/✗ markers, eval lines
+        if any(x in line for x in (
+            "'loss'", "'eval_loss'", "ERROR", "WARNING", "ABORT",
+            "✓", "✗", "Training complete", "Evaluating", "Saving",
+            "epoch", "steps_per_second",
+        )):
+            important.append(line)
+
+    if not important:
+        return terminal_wrap('<span style="color:#8b949e;">No log events yet.</span>',
+                             height=220)
+
+    # show last 25 important lines
+    shown = important[-25:]
+    colored = []
+    for line in shown:
+        if "'loss'" in line and "'eval_loss'" not in line:
+            try:
+                d = ast.literal_eval(line)
+                step_n = len([l for l in important if "'loss'" in l and "'eval_loss'" not in l])
+                loss_v = float(d.get("loss", 0))
+                ppl_v  = float(d.get("ppl", 0))
+                epoch_v= float(d.get("epoch", 0))
+                lc = "32" if loss_v < 1.5 else ("33" if loss_v < 3.0 else "31")
+                colored.append(
+                    f'\033[2mstep {step_n:>4}\033[0m  '
+                    f'loss \033[{lc}m{loss_v:.4f}\033[0m  '
+                    f'ppl \033[36m{ppl_v:.3f}\033[0m  '
+                    f'epoch \033[2m{epoch_v:.3f}\033[0m'
+                )
+                continue
+            except Exception:
+                pass
+        if "'eval_loss'" in line:
+            try:
+                d = ast.literal_eval(line)
+                el = float(d.get("eval_loss", 0))
+                ep = float(d.get("eval_ppl", 0))
+                colored.append(
+                    f'\033[35m[EVAL]\033[0m  '
+                    f'eval_loss \033[32m{el:.4f}\033[0m  '
+                    f'eval_ppl \033[36m{ep:.3f}\033[0m'
+                )
+                continue
+            except Exception:
+                pass
+        colored.append(line)
+
+    return terminal_wrap(ansi_to_html("\n".join(colored)), height=260)
 
 
 def get_loss_df(run_name: str) -> pd.DataFrame:
@@ -454,89 +553,110 @@ def get_loss_df(run_name: str) -> pd.DataFrame:
 
 
 def get_metrics_html(run_name: str) -> str:
-    """Parse training log and return a live metrics panel."""
+    """Parse training log → compact live metrics panel with ETA."""
     if not run_name:
-        return terminal_wrap("")
+        return ""
     p = ROOT / "logs" / f"train_{run_name}.log"
     if not p.exists():
-        return terminal_wrap('<span style="color:#d29922;">No log file yet — start training first.</span>')
+        return ""
 
-    lines = p.read_text().splitlines()
+    text  = p.read_text()
+    lines = text.splitlines()
 
-    # Parse latest step metrics
-    step = grad = loss = lr = epoch = tok_s = None
-    for line in reversed(lines):
-        m = re.search(r"['\"]loss['\"]\s*[:=]\s*([\d.]+)", line)
-        if m and loss is None:
-            loss = float(m.group(1))
-        m = re.search(r"['\"]grad_norm['\"]\s*[:=]\s*([\d.]+)", line)
-        if m and grad is None:
-            grad = float(m.group(1))
-        m = re.search(r"['\"]step['\"]\s*[:=]\s*(\d+)", line)
-        if m and step is None:
-            step = int(m.group(1))
-        m = re.search(r"['\"]learning_rate['\"]\s*[:=]\s*([\d.e-]+)", line)
-        if m and lr is None:
-            lr = float(m.group(1))
-        m = re.search(r"['\"]epoch['\"]\s*[:=]\s*([\d.]+)", line)
-        if m and epoch is None:
-            epoch = float(m.group(1))
-        if all(v is not None for v in [step, loss, grad, lr, epoch]):
-            break
+    # ── Parse latest training-step JSON line ────────────────────────────────
+    loss = grad = lr = epoch = ppl = None
+    step = 0
+    for line in lines:
+        if "'loss'" in line and "'eval_loss'" not in line:
+            step += 1
+            try:
+                d = ast.literal_eval(line.strip())
+                loss  = float(d.get("loss",          loss  or 0)) or loss
+                grad  = float(d.get("grad_norm",     grad  or 0)) or grad
+                lr    = float(d.get("learning_rate", lr    or 0)) or lr
+                epoch = float(d.get("epoch",         epoch or 0)) or epoch
+                ppl   = float(d.get("ppl",           ppl   or 0)) or ppl
+            except Exception:
+                pass
 
-    if step is None:
-        return terminal_wrap('<span style="color:#d29922;">Parsing log... no step data yet.</span>')
+    if not step:
+        return (
+            '<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;'
+            'padding:14px 18px;color:#d29922;font-size:13px;">'
+            '⏳ Waiting for first training step…</div>'
+        )
 
-    # Estimate ETA from first and last timestamped steps
-    eta_str = "—"
-    timestamps = re.findall(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", p.read_text())
-    if len(timestamps) >= 2:
-        try:
-            from datetime import datetime as _dt
-            t0 = _dt.strptime(timestamps[0],  "%Y-%m-%d %H:%M:%S")
-            t1 = _dt.strptime(timestamps[-1], "%Y-%m-%d %H:%M:%S")
-            elapsed = (t1 - t0).total_seconds()
-            if elapsed > 0 and step and step > 0:
-                sps = step / elapsed  # steps per second
-                # estimate total steps from log
-                total_m = re.search(r"(\d+)/(\d+)\s*\[", "\n".join(lines[-20:]))
-                if total_m:
-                    total = int(total_m.group(2))
-                    remaining = (total - step) / sps
-                    h, m_ = int(remaining // 3600), int((remaining % 3600) // 60)
-                    eta_str = f"~{h}h {m_}m"
-        except Exception:
-            pass
+    # ── ETA from tqdm lines: "100/9492 [00:10<24:57:50" ────────────────────
+    eta_str = elapsed_str = "—"
+    total_steps = step
+    tqdm_m = re.search(
+        r"(\d+)/(\d+)\s*\[(\d+:\d+(?::\d+)?)<(\d+:\d+(?::\d+)?)", text
+    )
+    if tqdm_m:
+        cur, total_steps = int(tqdm_m.group(1)), int(tqdm_m.group(2))
 
-    # Color for loss
-    loss_col = "#3fb950" if loss < 1.5 else ("#d29922" if loss < 3.0 else "#f85149")
-    grad_col = "#3fb950" if grad < 2.0 else ("#d29922" if grad < 5.0 else "#f85149")
+        def _secs(s: str) -> int:
+            parts = list(map(int, s.split(":")))
+            return parts[0]*3600 + parts[1]*60 + (parts[2] if len(parts)==3 else 0)
 
-    def metric(label, value, color="#e6edf3", unit=""):
-        return f"""
-<div style="background:#0d1117;border:1px solid #21262d;border-radius:6px;
-            padding:10px 14px;flex:1;min-width:100px;">
-  <div style="color:#8b949e;font-size:11px;text-transform:uppercase;
-              letter-spacing:0.06em;margin-bottom:4px;">{label}</div>
-  <div style="color:{color};font-size:20px;font-weight:700;font-family:monospace;">
-    {value}<span style="font-size:12px;color:#8b949e;margin-left:3px;">{unit}</span>
+        elapsed_s  = _secs(tqdm_m.group(3))
+        remaining_s = _secs(tqdm_m.group(4))
+        eh, em = elapsed_s // 3600, (elapsed_s % 3600) // 60
+        rh, rm = remaining_s // 3600, (remaining_s % 3600) // 60
+        elapsed_str = f"{eh}h {em}m" if eh else f"{em}m"
+        eta_str     = f"~{rh}h {rm}m" if rh else (f"~{rm}m" if rm else "< 1m")
+
+    pct = round(step / total_steps * 100) if total_steps else 0
+
+    # ── Color helpers ────────────────────────────────────────────────────────
+    lc = "#3fb950" if (loss or 9) < 1.5 else ("#d29922" if (loss or 9) < 3.0 else "#f85149")
+    gc = "#3fb950" if (grad or 9) < 2.0 else ("#d29922" if (grad or 9) < 5.0 else "#f85149")
+
+    def card(label, val, color="#e6edf3"):
+        return (
+            f'<div style="background:#0d1117;border:1px solid #21262d;border-radius:8px;'
+            f'padding:12px 16px;flex:1;min-width:110px;">'
+            f'<div style="color:#6e7681;font-size:10px;font-weight:600;'
+            f'text-transform:uppercase;letter-spacing:0.07em;margin-bottom:6px;">{label}</div>'
+            f'<div style="color:{color};font-size:22px;font-weight:700;'
+            f'font-family:\'SF Mono\',monospace;line-height:1;">{val}</div>'
+            f'</div>'
+        )
+
+    bar_w = f"{pct}%"
+    bar_c = "#3fb950" if pct > 80 else ("#58a6ff" if pct > 20 else "#d29922")
+
+    return f"""
+<div style="background:#161b22;border:1px solid #30363d;border-radius:10px;padding:18px 20px;">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+    <span style="color:#8b949e;font-size:11px;font-weight:600;letter-spacing:0.06em;">
+      LIVE METRICS
+    </span>
+    <span style="color:#8b949e;font-size:11px;">{run_name}</span>
   </div>
-</div>"""
 
-    html = f"""
-<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;">
-  <div style="font-size:12px;color:#8b949e;letter-spacing:0.05em;
-              margin-bottom:12px;font-weight:500;">LIVE TRAINING METRICS — {run_name}</div>
+  <!-- progress bar -->
+  <div style="background:#21262d;border-radius:4px;height:6px;margin-bottom:16px;">
+    <div style="background:{bar_c};width:{bar_w};height:6px;border-radius:4px;
+                transition:width 0.3s;"></div>
+  </div>
+  <div style="display:flex;justify-content:space-between;margin-bottom:16px;
+              font-size:11px;color:#8b949e;">
+    <span>Step <b style="color:#c9d1d9;">{step}</b> / {total_steps}</span>
+    <span>{pct}% complete</span>
+    <span>Elapsed <b style="color:#c9d1d9;">{elapsed_str}</b></span>
+    <span>ETA <b style="color:#d29922;">{eta_str}</b></span>
+  </div>
+
+  <!-- metric cards -->
   <div style="display:flex;gap:8px;flex-wrap:wrap;">
-    {metric("Step",       step,                         "#58a6ff")}
-    {metric("Loss",       f"{loss:.4f}" if loss else "—", loss_col)}
-    {metric("Grad Norm",  f"{grad:.3f}" if grad else "—", grad_col)}
-    {metric("Epoch",      f"{epoch:.2f}" if epoch else "—", "#e6edf3")}
-    {metric("Learn Rate", f"{lr:.1e}" if lr else "—",   "#bc8cff")}
-    {metric("ETA",        eta_str,                       "#d29922")}
+    {card("Loss",      f"{loss:.4f}" if loss else "—",  lc)}
+    {card("Perplexity",f"{ppl:.3f}"  if ppl  else "—",  "#39c5cf")}
+    {card("Grad Norm", f"{grad:.3f}" if grad else "—",  gc)}
+    {card("Epoch",     f"{epoch:.3f}" if epoch else "—", "#e6edf3")}
+    {card("Learn Rate",f"{lr:.2e}"   if lr   else "—",  "#bc8cff")}
   </div>
 </div>"""
-    return html
 
 
 def read_eval_summary(run_name: str) -> str:
@@ -603,114 +723,166 @@ def parse_training_log(run_name: str) -> dict:
     )
 
 
-_PLOT_BG   = "#0d1117"
-_GRID_COL  = "#21262d"
-_TEXT_COL  = "#8b949e"
+# ── Chart palette ─────────────────────────────────────────────────────────────
+_FIG_BG    = "#0d1117"
+_AXES_BG   = "#161b22"
+_GRID_COL  = "#30363d"
+_TICK_COL  = "#c9d1d9"
+_LABEL_COL = "#8b949e"
+_TITLE_COL = "#e6edf3"
 _PURPLE    = "#a371f7"
 _CYAN      = "#39c5cf"
-_GREEN     = "#3fb950"
-_GREY      = "#484f58"
+_GREY_LINE = "#6e7681"
+_GREY_BAR  = "#484f58"
+_CHART_W   = 4.8   # identical width for all 3 charts
+_CHART_H   = 3.6   # identical height for all 3 charts
+_DPI       = 100   # 480×360px — fits cleanly in a 3-column Gradio row
 
 
-def _apply_dark_style(ax, title: str, xlabel: str, ylabel: str):
-    ax.set_facecolor(_PLOT_BG)
-    ax.figure.patch.set_facecolor(_PLOT_BG)
-    ax.set_title(title, color="#e6edf3", fontsize=13, pad=10)
-    ax.set_xlabel(xlabel, color=_TEXT_COL, fontsize=10)
-    ax.set_ylabel(ylabel, color=_TEXT_COL, fontsize=10)
-    ax.tick_params(colors=_TEXT_COL, labelsize=9)
+def _new_fig():
+    fig, ax = plt.subplots(figsize=(_CHART_W, _CHART_H), dpi=_DPI)
+    fig.patch.set_facecolor(_FIG_BG)
+    ax.set_facecolor(_AXES_BG)
+    return fig, ax
+
+
+def _style_ax(ax, title: str, xlabel: str, ylabel: str, legend: bool = True):
+    ax.set_title(title, color=_TITLE_COL, fontsize=11, fontweight="bold",
+                 pad=10, loc="left")
+    if xlabel:
+        ax.set_xlabel(xlabel, color=_LABEL_COL, fontsize=9.5, labelpad=6)
+    if ylabel:
+        ax.set_ylabel(ylabel, color=_LABEL_COL, fontsize=9.5, labelpad=6)
+    ax.tick_params(axis="both", which="both",
+                   colors=_TICK_COL, labelcolor=_TICK_COL,
+                   labelsize=8.5, length=3, width=0.7)
     for spine in ax.spines.values():
         spine.set_edgecolor(_GRID_COL)
+        spine.set_linewidth(0.7)
+    ax.grid(axis="both", color=_GRID_COL, linestyle="--",
+            linewidth=0.5, alpha=0.7, zorder=0)
+    ax.set_axisbelow(True)
     ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.2f"))
-    ax.grid(color=_GRID_COL, linestyle="--", linewidth=0.6, alpha=0.8)
-    ax.legend(facecolor="#161b22", edgecolor=_GRID_COL,
-              labelcolor="#e6edf3", fontsize=9)
+    if legend:
+        leg = ax.legend(facecolor="#21262d", edgecolor=_GRID_COL,
+                        fontsize=8.5, framealpha=0.95, loc="upper right",
+                        handlelength=1.6)
+        for t in leg.get_texts():
+            t.set_color(_TITLE_COL)
+
+
+def _annotate_endpoints(ax, steps, vals, color):
+    """Put value labels at first and last point."""
+    ax.annotate(f"{vals[0]:.3f}",
+                xy=(steps[0], vals[0]), xytext=(5, 5),
+                textcoords="offset points",
+                color=_TICK_COL, fontsize=7.5, ha="left")
+    ax.annotate(f"{vals[-1]:.3f}",
+                xy=(steps[-1], vals[-1]), xytext=(-5, 5),
+                textcoords="offset points",
+                color=color, fontsize=7.5, fontweight="bold", ha="right")
 
 
 def build_loss_chart(data: dict):
-    fig, ax = plt.subplots(figsize=(6, 3.4))
+    fig, ax = _new_fig()
     if data.get("train_steps"):
-        ax.plot(data["train_steps"], data["train_loss"],
-                color=_PURPLE, linewidth=1.8, label="Fine-tuned model")
-        if len(data["train_loss"]) > 1:
-            base_val = data["train_loss"][0]
-            ax.axhline(base_val, color=_GREY, linestyle="--",
-                       linewidth=1.2, label="Base model (no training)")
+        steps, loss = data["train_steps"], data["train_loss"]
+        ax.plot(steps, loss, color=_PURPLE, linewidth=2.0,
+                marker="o", markersize=3, zorder=3, label="Fine-tuned model")
+        ax.axhline(loss[0], color=_GREY_LINE, linestyle="--",
+                   linewidth=1.2, zorder=2, label="Base model")
+        ax.fill_between(steps, loss, loss[0],
+                        where=[v < loss[0] for v in loss],
+                        color=_PURPLE, alpha=0.10, zorder=1)
+        _annotate_endpoints(ax, steps, loss, _PURPLE)
     else:
         ax.text(0.5, 0.5, "No training data yet", ha="center", va="center",
-                color=_TEXT_COL, transform=ax.transAxes, fontsize=11)
-    _apply_dark_style(ax, "Training Loss", "Training steps", "Loss")
-    fig.tight_layout()
+                color=_LABEL_COL, transform=ax.transAxes, fontsize=11)
+    _style_ax(ax, "Training Loss", "Training Steps", "Loss")
+    fig.tight_layout(pad=1.4)
     return fig
 
 
 def build_ppl_chart(data: dict):
-    fig, ax = plt.subplots(figsize=(6, 3.4))
+    fig, ax = _new_fig()
     if data.get("train_steps"):
-        ax.plot(data["train_steps"], data["train_ppl"],
-                color=_CYAN, linewidth=1.8, label="Fine-tuned model")
-        if len(data["train_ppl"]) > 1:
-            ax.axhline(data["train_ppl"][0], color=_GREY, linestyle="--",
-                       linewidth=1.2, label="Base model")
+        steps, ppl = data["train_steps"], data["train_ppl"]
+        ax.plot(steps, ppl, color=_CYAN, linewidth=2.0,
+                marker="o", markersize=3, zorder=3, label="Fine-tuned model")
+        ax.axhline(ppl[0], color=_GREY_LINE, linestyle="--",
+                   linewidth=1.2, zorder=2, label="Base model")
+        ax.fill_between(steps, ppl, ppl[0],
+                        where=[v < ppl[0] for v in ppl],
+                        color=_CYAN, alpha=0.10, zorder=1)
+        _annotate_endpoints(ax, steps, ppl, _CYAN)
     else:
         ax.text(0.5, 0.5, "No training data yet", ha="center", va="center",
-                color=_TEXT_COL, transform=ax.transAxes, fontsize=11)
-    _apply_dark_style(ax, "Perplexity", "Training steps", "Perplexity")
-    fig.tight_layout()
+                color=_LABEL_COL, transform=ax.transAxes, fontsize=11)
+    _style_ax(ax, "Perplexity", "Training Steps", "Perplexity")
+    fig.tight_layout(pad=1.4)
     return fig
 
 
 def build_summary_chart(data: dict):
-    fig, ax = plt.subplots(figsize=(5, 3.4))
+    fig, ax = _new_fig()
     if data.get("train_loss"):
-        before_loss = data["train_loss"][0]
-        after_loss  = data["train_loss"][-1]
-        before_ppl  = data["train_ppl"][0]
-        after_ppl   = data["train_ppl"][-1]
-        labels  = ["Loss", "Perplexity"]
-        befores = [before_loss, before_ppl]
-        afters  = [after_loss,  after_ppl]
-        x = range(len(labels))
-        w = 0.32
-        b1 = ax.bar([i - w/2 for i in x], befores, w, color=_GREY,   label="Before fine-tuning")
-        b2 = ax.bar([i + w/2 for i in x], afters,  w, color=_PURPLE, label="After fine-tuning")
+        bl = data["train_loss"][0];  al = data["train_loss"][-1]
+        bp = data["train_ppl"][0];   ap = data["train_ppl"][-1]
+        if data.get("eval_loss") and len(data["eval_loss"]) >= 2:
+            al = data["eval_loss"][-1]
+        if data.get("eval_ppl") and len(data["eval_ppl"]) >= 2:
+            ap = data["eval_ppl"][-1]
+        x, w = [0, 1], 0.30
+        b1 = ax.bar([i - w/2 for i in x], [bl, bp], w,
+                    color=_GREY_BAR, label="Before", zorder=3,
+                    edgecolor=_GRID_COL, linewidth=0.5)
+        b2 = ax.bar([i + w/2 for i in x], [al, ap], w,
+                    color=_PURPLE,   label="After",  zorder=3,
+                    edgecolor=_GRID_COL, linewidth=0.5)
+        max_y = max(bl, bp)
         for bar in list(b1) + list(b2):
-            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
-                    f"{bar.get_height():.2f}", ha="center", va="bottom",
-                    color="#e6edf3", fontsize=8)
-        ax.set_xticks(list(x))
-        ax.set_xticklabels(labels)
+            h = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    h + max_y * 0.015, f"{h:.2f}",
+                    ha="center", va="bottom",
+                    color=_TITLE_COL, fontsize=8, fontweight="bold")
+        ax.set_xticks(x)
+        ax.set_xticklabels(["Loss", "Perplexity"],
+                           color=_TICK_COL, fontsize=9.5)
+        ax.set_ylim(0, max_y * 1.28)
     else:
         ax.text(0.5, 0.5, "No data yet", ha="center", va="center",
-                color=_TEXT_COL, transform=ax.transAxes, fontsize=11)
-    _apply_dark_style(ax, "Before vs After — Key Metrics", "", "Score / Value")
-    fig.tight_layout()
+                color=_LABEL_COL, transform=ax.transAxes, fontsize=11)
+    _style_ax(ax, "Before vs After", "", "Value")
+    fig.tight_layout(pad=1.4)
     return fig
 
 
 def build_metrics_df(data: dict) -> pd.DataFrame:
+    cols = ["Metric", "Before fine-tuning", "After fine-tuning", "Change"]
     if not data.get("train_loss"):
-        return pd.DataFrame(columns=["Metric", "Before fine-tuning", "After fine-tuning", "Change"])
+        return pd.DataFrame(columns=cols)
     bl = data["train_loss"][0];  al = data["train_loss"][-1]
     bp = data["train_ppl"][0];   ap = data["train_ppl"][-1]
     rows = [
-        ("Loss",       f"{bl:.3f}", f"{al:.3f}", f"{(al-bl)/bl*100:+.0f}%"),
-        ("Perplexity", f"{bp:.2f}", f"{ap:.2f}", f"{(ap-bp)/bp*100:+.0f}%"),
+        ("Train Loss",       f"{bl:.4f}", f"{al:.4f}", f"{(al-bl)/bl*100:+.1f}%"),
+        ("Train Perplexity", f"{bp:.3f}", f"{ap:.3f}", f"{(ap-bp)/bp*100:+.1f}%"),
     ]
-    if data.get("eval_loss"):
+    if data.get("eval_loss") and len(data["eval_loss"]) >= 2:
         el_b = data["eval_loss"][0]; el_a = data["eval_loss"][-1]
-        rows.append(("Eval Loss", f"{el_b:.3f}", f"{el_a:.3f}",
-                     f"{(el_a-el_b)/el_b*100:+.0f}%"))
-    if data.get("eval_ppl"):
+        rows.append(("Eval Loss", f"{el_b:.4f}", f"{el_a:.4f}",
+                     f"{(el_a-el_b)/el_b*100:+.1f}%"))
+    if data.get("eval_ppl") and len(data["eval_ppl"]) >= 2:
         ep_b = data["eval_ppl"][0]; ep_a = data["eval_ppl"][-1]
-        rows.append(("Eval Perplexity", f"{ep_b:.2f}", f"{ep_a:.2f}",
-                     f"{(ep_a-ep_b)/ep_b*100:+.0f}%"))
-    return pd.DataFrame(rows, columns=["Metric", "Before fine-tuning", "After fine-tuning", "Change"])
+        rows.append(("Eval Perplexity", f"{ep_b:.3f}", f"{ep_a:.3f}",
+                     f"{(ep_a-ep_b)/ep_b*100:+.1f}%"))
+    return pd.DataFrame(rows, columns=cols)
 
 
 def load_eval_run(run_name: str):
+    empty = pd.DataFrame(columns=["Metric", "Before fine-tuning",
+                                   "After fine-tuning", "Change"])
     if not run_name:
-        empty = pd.DataFrame(columns=["Metric", "Before fine-tuning", "After fine-tuning", "Change"])
         return build_loss_chart({}), build_ppl_chart({}), build_summary_chart({}), empty
     data = parse_training_log(run_name)
     return (build_loss_chart(data), build_ppl_chart(data),
@@ -720,102 +892,225 @@ def load_eval_run(run_name: str):
 # ── CSS ───────────────────────────────────────────────────────────────────────
 CSS = """
 footer { display:none !important; }
-
-
-/* Force all text inputs to be visible on dark background */
 * { box-sizing: border-box; }
 
-input:not([type=range]),
-textarea {
-  color: #e6edf3 !important;
-  background-color: #161b22 !important;
-  border-color: #30363d !important;
-  caret-color: #e6edf3 !important;
+/* ── Typography ───────────────────────────────────────────────────────────── */
+body, .gradio-container, .gradio-container * {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+               sans-serif !important;
+  -webkit-font-smoothing: antialiased !important;
 }
 
-input:not([type=range])::placeholder,
-textarea::placeholder {
+/* ── Inputs & Textareas ───────────────────────────────────────────────────── */
+input:not([type=range]):not([type=checkbox]):not([type=radio]),
+textarea, select {
+  color: #e6edf3 !important;
+  background-color: #161b22 !important;
+  border: 1px solid #30363d !important;
+  border-radius: 6px !important;
+  caret-color: #e6edf3 !important;
+  font-size: 13px !important;
+}
+input:not([type=range])::placeholder, textarea::placeholder {
   color: #6e7681 !important;
   opacity: 1 !important;
 }
-
-/* Gradio 6 specific selectors */
-.svelte-1f354aw,
-[class*="svelte"] input,
+input:not([type=range]):focus, textarea:focus {
+  border-color: #58a6ff !important;
+  outline: none !important;
+  box-shadow: 0 0 0 3px rgba(88,166,255,0.12) !important;
+}
+/* Gradio svelte wrappers */
+[class*="svelte"] input:not([type=range]):not([type=checkbox]):not([type=radio]),
 [class*="svelte"] textarea,
-.block input,
-.block textarea,
-.form input,
+.block input:not([type=range]):not([type=checkbox]):not([type=radio]),
+.block textarea, .form input:not([type=range]):not([type=checkbox]):not([type=radio]),
 .form textarea {
   color: #e6edf3 !important;
   background-color: #161b22 !important;
 }
 
-/* Labels */
-.block label span,
-.block > label,
-.form > label,
-span.text-sm {
+/* ── Labels ───────────────────────────────────────────────────────────────── */
+.block label span, .block > label, .form > label,
+span.text-sm, label > span, .label-wrap span,
+.block label > span:first-child {
   color: #c9d1d9 !important;
+  font-size: 13px !important;
+  font-weight: 500 !important;
 }
+.block .info, .block span.text-xs { color: #8b949e !important; font-size: 11.5px !important; }
 
-/* Buttons */
-button.primary {
-  background: #238636 !important;
-  border-color: #238636 !important;
-  color: #fff !important;
-  font-weight: 600 !important;
+/* ── Buttons ──────────────────────────────────────────────────────────────── */
+button { border-radius: 6px !important; font-weight: 500 !important;
+         transition: background 0.15s, border-color 0.15s !important; }
+button.primary, button[data-testid="primary"] {
+  background: #238636 !important; border: 1px solid #238636 !important;
+  color: #ffffff !important; font-weight: 600 !important;
 }
-button.primary:hover { background: #2ea043 !important; }
-button.secondary {
-  background: #21262d !important;
-  border-color: #30363d !important;
+button.primary:hover { background: #2ea043 !important; border-color: #2ea043 !important; }
+button.secondary, button[data-testid="secondary"] {
+  background: #21262d !important; border: 1px solid #30363d !important;
   color: #c9d1d9 !important;
 }
 button.secondary:hover { background: #30363d !important; }
+button.stop, button[data-testid="stop"] {
+  background: #3d1a1a !important; border: 1px solid #f85149 !important;
+  color: #f85149 !important;
+}
 
-/* Tabs */
-.tab-nav button { color: #8b949e !important; background: transparent !important; }
-.tab-nav button.selected { color: #e6edf3 !important; border-bottom-color: #58a6ff !important; }
+/* ── Tabs ─────────────────────────────────────────────────────────────────── */
+.tab-nav { border-bottom: 1px solid #30363d !important; }
+.tab-nav button {
+  color: #8b949e !important; background: transparent !important;
+  border-bottom: 2px solid transparent !important;
+  font-size: 13px !important; padding: 8px 16px !important;
+}
+.tab-nav button.selected {
+  color: #e6edf3 !important; border-bottom-color: #58a6ff !important;
+  background: transparent !important; font-weight: 600 !important;
+}
+.tab-nav button:hover { color: #c9d1d9 !important; }
 
-/* Dropdown list options */
+/* ── Dropdowns ────────────────────────────────────────────────────────────── */
 ul[role="listbox"], ul.options, .dropdown-menu,
-[data-testid="dropdown-options"],
-.svelte-1occ011, li[role="option"] {
-  background: #161b22 !important;
-  color: #e6edf3 !important;
+[data-testid="dropdown-options"], li[role="option"] {
+  background: #1c2128 !important; color: #e6edf3 !important;
+  border: 1px solid #30363d !important;
+}
+li[role="option"] {
+  padding: 8px 14px !important; font-size: 13px !important;
 }
 li[role="option"]:hover, li[role="option"].selected {
-  background: #21262d !important;
-  color: #e6edf3 !important;
+  background: #2d333b !important; color: #e6edf3 !important;
 }
 li[role="option"] * { color: #e6edf3 !important; }
+select option { background: #1c2128 !important; color: #e6edf3 !important; }
 
-/* Tab overflow (...) dropdown — nuke all white popups */
+/* ── Popovers / Overflow menus ────────────────────────────────────────────── */
 [popover], [popover] *, [role="menu"], [role="menu"] *,
-[class*="overflow"], [class*="overflow"] *,
-div[style*="position: absolute"], div[style*="position:absolute"] {
-  background-color: #161b22 !important;
-  color: #e6edf3 !important;
-  border-color: #30363d !important;
+[class*="overflow"], div[style*="position: absolute"],
+div[style*="position:absolute"] {
+  background-color: #1c2128 !important;
+  color: #e6edf3 !important; border-color: #30363d !important;
 }
 button[aria-haspopup] { color: #8b949e !important; }
 
-/* Sliders */
-input[type=range]::-webkit-slider-thumb { background: #58a6ff !important; }
+/* ── DataFrame / Table ────────────────────────────────────────────────────── */
+.dataframe, .table-wrap, [data-testid="dataframe"] {
+  background: #0d1117 !important;
+  border: 1px solid #30363d !important;
+  border-radius: 8px !important;
+  overflow: hidden !important;
+}
+table { border-collapse: collapse !important; width: 100% !important; }
+thead tr { background: #1c2128 !important; }
+thead tr th {
+  color: #c9d1d9 !important;
+  font-size: 11.5px !important;
+  font-weight: 600 !important;
+  text-transform: uppercase !important;
+  letter-spacing: 0.06em !important;
+  padding: 11px 16px !important;
+  border-bottom: 2px solid #30363d !important;
+  background: #1c2128 !important;
+  white-space: nowrap !important;
+}
+tbody tr td {
+  color: #e6edf3 !important;
+  font-size: 13px !important;
+  padding: 10px 16px !important;
+  border-bottom: 1px solid #21262d !important;
+  background: transparent !important;
+}
+tbody tr:nth-child(even) td { background: rgba(22,27,34,0.6) !important; }
+tbody tr:hover td { background: #21262d !important; }
 
-/* Code */
+/* ── Checkboxes & Radios ──────────────────────────────────────────────────── */
+input[type=checkbox], input[type=radio] {
+  accent-color: #238636 !important;
+  width: 15px !important; height: 15px !important;
+}
+.block label:has(input[type=checkbox]) span,
+.block label:has(input[type=radio]) span {
+  color: #c9d1d9 !important;
+}
+
+/* ── Sliders ──────────────────────────────────────────────────────────────── */
+input[type=range] { accent-color: #58a6ff !important; }
+input[type=range]::-webkit-slider-thumb {
+  background: #58a6ff !important; width: 16px !important; height: 16px !important;
+}
+input[type=range]::-webkit-slider-runnable-track {
+  background: #30363d !important; height: 4px !important; border-radius: 2px !important;
+}
+
+/* ── Number & Password inputs (explicit overrides) ────────────────────────── */
+input[type=number], input[type=password] {
+  color: #e6edf3 !important;
+  background-color: #161b22 !important;
+  border: 1px solid #30363d !important;
+  -webkit-text-fill-color: #e6edf3 !important;
+}
+input[type=password]::-webkit-credentials-auto-fill-button { display: none !important; }
+/* Catch Gradio theme overriding password on focus/autofill */
+input[type=password]:-webkit-autofill,
+input[type=password]:-webkit-autofill:focus {
+  -webkit-box-shadow: 0 0 0 1000px #161b22 inset !important;
+  -webkit-text-fill-color: #e6edf3 !important;
+}
+
+/* ── Plot / Chart containers ─────────────────────────────────────────────── */
+.gradio-plot, .plot-container, [data-testid="plot"],
+.block:has(.gradio-plot), .block:has(canvas) {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+}
+.gradio-plot img, .plot-container img, [data-testid="plot"] img,
+.gradio-plot canvas, .plot-container canvas {
+  max-width: 100% !important;
+  width: 100% !important;
+  height: auto !important;
+  display: block !important;
+  border-radius: 8px !important;
+}
+
+/* ── Blocks ───────────────────────────────────────────────────────────────── */
+.block { border-color: #30363d !important; border-radius: 8px !important; }
+
+/* ── Scrollbars ───────────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #0d1117; }
+::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #484f58; }
+
+/* ── Code ─────────────────────────────────────────────────────────────────── */
 .cm-content, .cm-line { color: #e6edf3 !important; }
+pre, code {
+  background: #161b22 !important; color: #e6edf3 !important;
+  border-radius: 4px !important; border: 1px solid #30363d !important;
+}
 
-/* Chat bubbles */
+/* ── Chat bubbles ─────────────────────────────────────────────────────────── */
 .message-bubble-border { border-color: #30363d !important; }
 .bot, .bot * { background: #161b22 !important; color: #e6edf3 !important; }
 .user, .user * { background: #1f6feb !important; color: #ffffff !important; }
 [data-testid="bot"] { background: #161b22 !important; color: #e6edf3 !important; }
 [data-testid="user"] { background: #1f6feb !important; color: #ffffff !important; }
 .message { color: #e6edf3 !important; }
-.message p, .message span, .message div { color: #e6edf3 !important; }
-.prose p, .prose span { color: #e6edf3 !important; }
+.message p, .message span, .message div,
+.prose p, .prose span, .prose li { color: #e6edf3 !important; }
+
+/* ── Accordion ────────────────────────────────────────────────────────────── */
+.accordion-header { color: #c9d1d9 !important; background: #161b22 !important;
+                    border-color: #30363d !important; }
+
+/* ── File upload ──────────────────────────────────────────────────────────── */
+.upload-container, [data-testid="upload"] {
+  border: 2px dashed #30363d !important; background: #161b22 !important;
+  border-radius: 8px !important;
+}
+[data-testid="upload"]:hover { border-color: #58a6ff !important; }
 """
 
 # ── Developer credentials (change these) ─────────────────────────────────────
@@ -1242,37 +1537,50 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
             gr.HTML('<span style="color:#8b949e;font-size:12px;padding:4px 0;">Evaluation</span>')
             back_eval_btn = gr.Button("← Home", size="sm", variant="secondary", scale=0)
 
-        gr.HTML('<h2 style="color:#e6edf3;margin:16px 0 4px;">Model Evaluation Dashboard</h2>'
-                '<p style="color:#8b949e;font-size:13px;margin:0 0 20px;">'
-                'Compare your fine-tuned model against the base model across key performance metrics.</p>')
+        gr.HTML("""
+        <div style="border-bottom:1px solid #30363d;padding-bottom:16px;margin-bottom:20px;">
+          <h2 style="color:#e6edf3;margin:16px 0 6px;font-size:22px;font-weight:700;">
+            Model Evaluation Dashboard
+          </h2>
+          <p style="color:#8b949e;font-size:13px;margin:0;">
+            Compare your fine-tuned model against the base model across key performance metrics.
+          </p>
+        </div>
+        """)
 
         with gr.Row():
             eval_run_dd  = gr.Dropdown(
-                label="Select training run",
+                label="Training run",
                 choices=list_eval_runs(),
                 value=(list_eval_runs() or [None])[0],
-                scale=4,
+                scale=5,
             )
             eval_ref_btn = gr.Button("↺ Refresh", size="sm", variant="secondary", scale=0)
 
         eval_no_data = gr.HTML(
-            '<div style="text-align:center;color:#8b949e;padding:40px 0;font-size:14px;">'
-            'No completed training runs found.<br>'
-            '<span style="font-size:12px;">Run a training job first, then come back here.</span></div>',
+            '<div style="text-align:center;color:#8b949e;padding:60px 0;font-size:14px;">'
+            '📊 No completed training runs found.<br>'
+            '<span style="font-size:12px;margin-top:6px;display:block;">'
+            'Complete a training job first, then return here to view results.</span></div>',
             visible=not bool(list_eval_runs()),
         )
 
         with gr.Group(visible=bool(list_eval_runs())) as eval_charts_group:
-            with gr.Row():
-                eval_loss_plot    = gr.Plot(label="Training Loss")
-                eval_ppl_plot     = gr.Plot(label="Perplexity")
-                eval_summary_plot = gr.Plot(label="Before vs After — Key Metrics")
+            gr.HTML('<p style="color:#8b949e;font-size:11px;font-weight:600;'
+                    'letter-spacing:0.06em;margin:4px 0 14px;">PERFORMANCE METRICS</p>')
+            with gr.Row(equal_height=False):
+                eval_loss_plot    = gr.Plot(show_label=False, scale=1)
+                eval_ppl_plot     = gr.Plot(show_label=False, scale=1)
+                eval_summary_plot = gr.Plot(show_label=False, scale=1)
 
-            gr.HTML('<h3 style="color:#e6edf3;margin:20px 0 8px;font-size:15px;">Performance Metrics</h3>')
+            gr.HTML('<p style="color:#8b949e;font-size:11px;font-weight:600;'
+                    'letter-spacing:0.06em;margin:22px 0 10px;">SUMMARY TABLE</p>')
             eval_table = gr.DataFrame(
                 headers=["Metric", "Before fine-tuning", "After fine-tuning", "Change"],
                 datatype=["str", "str", "str", "str"],
                 interactive=False,
+                wrap=False,
+                row_count=(4, "fixed"),
             )
 
         def _load_eval(run_name):
@@ -1918,12 +2226,11 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                 def use_existing_ds(names):
                     if not names:
                         msg = terminal_wrap('<span style="color:#f85149;">Select at least one dataset.</span>')
-                        return msg, terminal_wrap("")
+                        return msg, terminal_wrap(""), gr.Dropdown()
                     if len(names) == 1:
                         name = names[0]
                         cleaned = (ROOT / "datasets" / name / "train.jsonl").exists()
                         next_tab = "4 · Configure" if cleaned else "2 · Clean"
-                        # Get row count from data card
                         rows_info = ""
                         try:
                             card = json.loads((ROOT / "data_cards" / f"{name}.json").read_text())
@@ -1942,7 +2249,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
   {"<div style='color:#8b949e;font-size:12px;margin-bottom:12px;'>" + rows_info + "</div>" if rows_info else ""}
   <div style="color:#58a6ff;font-size:13px;font-weight:600;">Next step: go to <strong>{next_tab}</strong></div>
 </div>"""
-                        return info_card, terminal_wrap("")
+                        return info_card, terminal_wrap(""), gr.Dropdown(value=name)
                     # Multiple datasets — merge them
                     merged_name = "_".join(names)
                     merged_dir  = ROOT / "datasets" / merged_name
@@ -1956,7 +2263,8 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                                 rows += [_j.loads(l) for l in p.read_text().splitlines() if l.strip()]
                                 break
                     if not rows:
-                        return terminal_wrap('<span style="color:#f85149;">No cleaned data found. Clean each dataset first.</span>')
+                        return (terminal_wrap('<span style="color:#f85149;">No cleaned data found. Clean each dataset first.</span>'),
+                                terminal_wrap(""), gr.Dropdown())
                     out = merged_dir / "normalized.jsonl"
                     with out.open("w") as f:
                         for r in rows:
@@ -1968,7 +2276,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
   <div style="color:#8b949e;font-size:12px;margin-bottom:12px;">{len(rows):,} total rows</div>
   <div style="color:#58a6ff;font-size:13px;font-weight:600;">Next step: go to <strong>2 · Clean</strong></div>
 </div>"""
-                    return info_card, terminal_wrap("")
+                    return info_card, terminal_wrap(""), gr.Dropdown(value=merged_name)
     
                 def do_aihub_download(dataset_id, api_key, ds_name):
                     """Download from AI Hub Korea, unzip, convert to ChatML."""
@@ -2093,8 +2401,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                                       outputs=add_ds_out, show_progress=False)
                 existing_ds_ref.click(lambda: gr.CheckboxGroup(choices=list_datasets()), outputs=existing_ds_cb)
                 existing_ds_cb.change(show_existing_ds, inputs=existing_ds_cb, outputs=existing_ds_info)
-                existing_ds_use.click(use_existing_ds, inputs=existing_ds_cb,
-                                      outputs=[existing_ds_info, add_ds_out])
+                # existing_ds_use.click wired below after clean_dd is defined
                 aihub_btn.click(do_aihub_download,
                                 inputs=[aihub_id, aihub_key, aihub_name],
                                 outputs=add_ds_out, show_progress=False)
@@ -2120,33 +2427,40 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                         clean_out = gr.HTML(terminal_wrap(""))
     
                 gr.HTML('<div style="border-top:1px solid #30363d;margin:16px 0;"></div>')
-                gr.HTML('<h4 style="color:#c9d1d9;margin:0 0 10px;">Sample preview & data card</h4>')
+                gr.HTML('<div style="border-top:1px solid #30363d;margin:16px 0 12px;"></div>')
+                gr.HTML('<p style="color:#8b949e;font-size:11px;font-weight:600;'
+                        'letter-spacing:0.06em;margin:0 0 10px;">DATA PREVIEW — auto-loads after cleaning</p>')
                 with gr.Row():
-                    with gr.Column(scale=1):
-                        sample_dd = gr.Dropdown(label="Dataset to preview",
-                                                 choices=list_cleaned_datasets(),
-                                                 allow_custom_value=True)
-                        gr.Button("↺ Refresh", size="sm", variant="secondary").click(
-                            lambda: gr.Dropdown(choices=list_cleaned_datasets()), outputs=sample_dd)
                     with gr.Column(scale=2):
                         sample_out = gr.HTML(terminal_wrap(""))
                     with gr.Column(scale=2):
                         card_out = gr.HTML(terminal_wrap(""))
-    
+
                 def do_clean(n, mc, vr, nopii):
                     args = ["clean-dataset", n, "--max-chars", str(int(mc)), "--val-ratio", str(vr)]
                     if nopii: args.append("--no-pii")
                     yield from run_ft(args)
-    
+
+                def do_clean_and_preview(n, mc, vr, nopii):
+                    # Stream cleaning output, then auto-load preview + data card
+                    last = ""
+                    for chunk in do_clean(n, mc, vr, nopii):
+                        last = chunk
+                        yield last, terminal_wrap(""), terminal_wrap("")
+                    yield last, read_sample(n), read_data_card(n)
+
                 clean_ref_btn.click(lambda: gr.Dropdown(choices=list_datasets()), outputs=clean_dd)
                 clean_btn.click(
-                    do_clean,
+                    do_clean_and_preview,
                     inputs=[clean_dd, clean_max, clean_val, clean_nopii],
-                    outputs=clean_out, show_progress=False,
+                    outputs=[clean_out, sample_out, card_out],
+                    show_progress=False,
                 )
-                sample_dd.change(read_sample,    inputs=sample_dd, outputs=sample_out)
-                sample_dd.change(read_data_card, inputs=sample_dd, outputs=card_out)
-    
+
+                # Wire here so clean_dd is in scope — auto-fills Tab 2 when dataset selected in Tab 1
+                existing_ds_use.click(use_existing_ds, inputs=existing_ds_cb,
+                                      outputs=[existing_ds_info, add_ds_out, clean_dd])
+
             # ── 3 · Add Model ─────────────────────────────────────────────────────
             with gr.Tab("3 · Model"):
                 gr.HTML('<h3 style="color:#e6edf3;margin:0 0 4px;">Select a base model</h3>'
@@ -2202,11 +2516,14 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
     
                 def use_server_model(name):
                     if not name:
-                        return terminal_wrap('<span style="color:#f85149;">Select a model first.</span>')
-                    return terminal_wrap(
-                        f'<span style="color:#3fb950;font-weight:bold;">Model "{name}" selected.</span><br>'
-                        f'<span style="color:#8b949e;">Go to <strong>4 · Configure</strong> and select this model.</span>'
-                    ) + next_step_card("add-model")
+                        return terminal_wrap('<span style="color:#f85149;">Select a model first.</span>'), gr.Dropdown()
+                    return (
+                        terminal_wrap(
+                            f'<span style="color:#3fb950;font-weight:bold;">Model "{name}" selected.</span><br>'
+                            f'<span style="color:#8b949e;">Auto-filled in 4 · Configure.</span>'
+                        ) + next_step_card("add-model"),
+                        gr.Dropdown(value=name),
+                    )
     
                 def do_add_model(s, a):
                     s = s.strip()
@@ -2214,7 +2531,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
     
                 model_server_ref.click(lambda: gr.Dropdown(choices=list_models()), outputs=existing_model_dd)
                 existing_model_dd.change(show_model_info, inputs=existing_model_dd, outputs=model_server_info)
-                model_server_use.click(use_server_model, inputs=existing_model_dd, outputs=model_server_info)
+                # model_server_use.click wired below after cfg_model is defined
                 add_model_btn.click(do_add_model, inputs=[model_src, model_lic],
                                     outputs=add_model_out, show_progress=False)
     
@@ -2288,7 +2605,18 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                               inputs=[cfg_model, cfg_ds, cfg_quant, cfg_lr, cfg_epochs, cfg_seq,
                                       cfg_wandb_enable, cfg_wandb_project, cfg_wandb_entity],
                               outputs=[cfg_out, cfg_yaml], show_progress=False)
-    
+
+                # Cross-tab: Tab 3 "Use this model" → auto-fill cfg_model in Tab 4
+                model_server_use.click(use_server_model,
+                                       inputs=existing_model_dd,
+                                       outputs=[model_server_info, cfg_model])
+
+                # Cross-tab: Tab 2 "Clean" done → auto-fill cfg_ds in Tab 4
+                clean_btn.click(
+                    lambda ds: gr.Dropdown(value=ds),
+                    inputs=clean_dd, outputs=cfg_ds,
+                )
+
             # ── 5 · Train ─────────────────────────────────────────────────────────
             with gr.Tab("5 · Train"):
                 gr.HTML('<h3 style="color:#e6edf3;margin:0 0 4px;">Smoke test → Full training</h3>'

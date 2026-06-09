@@ -1,0 +1,14 @@
+{
+  "name": "alpaca_guanaco-llama2-1k_alpaca_tiny",
+  "rows_raw": 50977,
+  "rows_after_schema": 50977,
+  "rows_after_length": 50977,
+  "rows_after_pii": 50977,
+  "rows_after_dedup": 50879,
+  "rows_after_decontam": 50879,
+  "decontamination_note": "13-gram overlap check deferred to `ft eval` (see 06_eval_plan.md)",
+  "train_rows": 50371,
+  "val_rows": 508,
+  "sha256_train": "5535fb31dd20a6d7374ee0d4a4591c248badd4369dd3f4c3b6164a6989a0a800",
+  "sha256_val": "f6b1c6bdd4566eb160edc6ec95fbb15137fda04e7a13b3ffa1d318ad856f0b6d"
+}
