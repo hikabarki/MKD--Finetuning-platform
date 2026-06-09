@@ -14,7 +14,13 @@ import sys
 import time
 from pathlib import Path
 
+import ast
+
 import gradio as gr
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import pandas as pd
 
 # ── Chat model state (loaded lazily) ─────────────────────────────────────────
@@ -216,25 +222,25 @@ def get_guide_html() -> str:
             "num": 1, "label": "Add Dataset",
             "done": bool(list_datasets()),
             "tab": "1 · Dataset",
-            "action": 'Go to <b>1 · Dataset</b> → paste a HuggingFace ID (e.g. tatsu-lab/alpaca) → click <b>Download & Normalize</b>',
+            "action": 'Open <b>1 · Dataset</b> and download a dataset.',
         },
         {
             "num": 2, "label": "Clean Dataset",
             "done": bool(list_cleaned_datasets()),
             "tab": "2 · Clean",
-            "action": 'Go to <b>2 · Clean</b> → select your dataset → click <b>Clean</b>',
+            "action": 'Open <b>2 · Clean</b> and clean your dataset.',
         },
         {
             "num": 3, "label": "Add Model",
             "done": bool(list_models()),
             "tab": "3 · Model",
-            "action": 'Go to <b>3 · Model</b> → select from server or paste a HuggingFace model ID → click <b>Download Model</b>',
+            "action": 'Open <b>3 · Model</b> and download a base model.',
         },
         {
             "num": 4, "label": "Configure",
             "done": bool(list_configs()),
             "tab": "4 · Configure",
-            "action": 'Go to <b>4 · Configure</b> → select model + dataset → click <b>Generate</b>',
+            "action": 'Open <b>4 · Configure</b> and generate a recipe.',
         },
         {
             "num": 5, "label": "Train",
@@ -243,7 +249,7 @@ def get_guide_html() -> str:
                 for d in list_checkpoints()
             ) if list_checkpoints() else False,
             "tab": "5 · Train",
-            "action": 'Go to <b>5 · Train</b> → select recipe → click <b>Smoke Test</b> first, then <b>Start Full Training</b>',
+            "action": 'Open <b>5 · Train</b> — run Smoke Test, then Start Training.',
         },
         {
             "num": 6, "label": "Evaluate",
@@ -252,7 +258,7 @@ def get_guide_html() -> str:
                 for d in list_checkpoints()
             ) if list_checkpoints() else False,
             "tab": "6 · Eval",
-            "action": 'Go to <b>6 · Eval</b> → select checkpoint → uncheck "Skip harness evals" → click <b>Run Evaluation</b>',
+            "action": 'Open <b>6 · Eval</b> and run evaluation.',
         },
         {
             "num": 7, "label": "Export",
@@ -261,13 +267,13 @@ def get_guide_html() -> str:
                 for d in list_exports()
             ) if list_exports() else False,
             "tab": "7 · Export & Publish",
-            "action": 'Go to <b>7 · Export & Publish</b> → Export tab → select checkpoint → set quantization to <b>none</b> → click <b>Export Model</b>',
+            "action": 'Open <b>7 · Export &amp; Publish</b> and export your model.',
         },
         {
             "num": 8, "label": "Publish",
-            "done": False,  # can't auto-detect publish
+            "done": False,
             "tab": "7 · Export & Publish",
-            "action": 'Go to <b>7 · Export & Publish</b> → Model Card tab → fill placeholders → Publish tab → enter HF repo → click <b>Publish to HuggingFace</b>',
+            "action": 'Open <b>7 · Export &amp; Publish</b> and publish to HuggingFace.',
         },
     ]
 
@@ -293,12 +299,12 @@ def get_guide_html() -> str:
             bg = "transparent"
 
         rows += f"""
-<div style="display:flex;align-items:flex-start;gap:10px;padding:8px 10px;
-            border-radius:6px;background:{bg};margin-bottom:4px;">
-  <div style="margin-top:2px;min-width:20px;">{icon}</div>
-  <div style="flex:1;">
-    <div style="color:{color};font-size:13px;font-weight:600;">{s["label"]}</div>
-    {"<div style='color:#8b949e;font-size:12px;margin-top:2px;'>" + s["action"] + "</div>" if s["num"] == current["num"] else ""}
+<div style="display:flex;align-items:center;gap:10px;padding:6px 10px;
+            border-radius:6px;background:{bg};margin-bottom:2px;">
+  <div style="min-width:20px;">{icon}</div>
+  <div style="flex:1;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;">
+    <span style="color:{color};font-size:13px;font-weight:600;">{s["label"]}</span>
+    {"<span style='color:#8b949e;font-size:12px;'>" + s["action"] + "</span>" if s["num"] == current["num"] else ""}
   </div>
 </div>"""
 
@@ -316,30 +322,17 @@ def get_state_html() -> str:
     if not p.exists():
         return '<div style="color:#8b949e;padding:8px;">STATE.md not found.</div>'
     raw = p.read_text()
-    # Extract key fields
     phase  = re.search(r"\*\*Phase:\*\*\s*(.+)", raw)
     status = re.search(r"\*\*Status:\*\*\s*(.+)", raw)
-    nxt    = re.search(r"## Next action\n(.+)", raw)
     phase_txt  = phase.group(1).strip()  if phase  else "—"
     status_txt = status.group(1).strip() if status else "—"
-    next_txt   = nxt.group(1).strip()   if nxt    else "—"
     color = "#3fb950" if "✓" in status_txt or "complete" in status_txt.lower() else \
             "#d29922" if "running" in status_txt.lower() else "#58a6ff"
     return f"""
-<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px 20px;">
-  <div style="font-size:12px;color:#8b949e;font-weight:500;letter-spacing:0.05em;margin-bottom:10px;">CURRENT STATE</div>
-  <div style="margin-bottom:8px;">
-    <span style="color:#8b949e;font-size:12px;">Phase</span><br>
-    <span style="color:#e6edf3;font-size:14px;font-weight:600;">{phase_txt}</span>
-  </div>
-  <div style="margin-bottom:8px;">
-    <span style="color:#8b949e;font-size:12px;">Status</span><br>
-    <span style="color:{color};font-size:13px;">{status_txt}</span>
-  </div>
-  <div>
-    <span style="color:#8b949e;font-size:12px;">Next action</span><br>
-    <span style="color:#e6edf3;font-size:13px;font-family:monospace;">{next_txt}</span>
-  </div>
+<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px 18px;">
+  <div style="font-size:11px;color:#8b949e;font-weight:500;letter-spacing:0.05em;margin-bottom:8px;">STATUS</div>
+  <div style="color:#8b949e;font-size:11px;margin-bottom:2px;">{phase_txt}</div>
+  <div style="color:{color};font-size:13px;font-weight:600;">{status_txt}</div>
 </div>"""
 
 
@@ -566,6 +559,164 @@ def save_model_card(name: str, content: str) -> str:
     return "✓ Saved"
 
 
+# ── Evaluation helpers ────────────────────────────────────────────────────────
+
+def list_eval_runs() -> list[str]:
+    log_dir = ROOT / "logs"
+    if not log_dir.exists():
+        return []
+    names = sorted(
+        [p.stem.replace("train_", "") for p in log_dir.glob("train_run_*.log")],
+        reverse=True,
+    )
+    return names
+
+
+def parse_training_log(run_name: str) -> dict:
+    """Return lists of (step, loss, ppl) for train and eval points."""
+    log_path = ROOT / "logs" / f"train_{run_name}.log"
+    if not log_path.exists():
+        return {}
+    train_steps, train_loss, train_ppl = [], [], []
+    eval_steps,  eval_loss,  eval_ppl  = [], [], []
+    step = 0
+    for line in log_path.read_text().splitlines():
+        line = line.strip()
+        if not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            d = ast.literal_eval(line)
+        except Exception:
+            continue
+        if "loss" in d and "eval_loss" not in d:
+            step += 1
+            train_steps.append(step)
+            train_loss.append(float(d["loss"]))
+            train_ppl.append(float(d.get("ppl", 0)) or float(d["loss"]) ** 2.718)
+        elif "eval_loss" in d:
+            eval_steps.append(step)
+            eval_loss.append(float(d["eval_loss"]))
+            eval_ppl.append(float(d.get("eval_ppl", 0)) or float(d["eval_loss"]) ** 2.718)
+    return dict(
+        train_steps=train_steps, train_loss=train_loss, train_ppl=train_ppl,
+        eval_steps=eval_steps,   eval_loss=eval_loss,   eval_ppl=eval_ppl,
+    )
+
+
+_PLOT_BG   = "#0d1117"
+_GRID_COL  = "#21262d"
+_TEXT_COL  = "#8b949e"
+_PURPLE    = "#a371f7"
+_CYAN      = "#39c5cf"
+_GREEN     = "#3fb950"
+_GREY      = "#484f58"
+
+
+def _apply_dark_style(ax, title: str, xlabel: str, ylabel: str):
+    ax.set_facecolor(_PLOT_BG)
+    ax.figure.patch.set_facecolor(_PLOT_BG)
+    ax.set_title(title, color="#e6edf3", fontsize=13, pad=10)
+    ax.set_xlabel(xlabel, color=_TEXT_COL, fontsize=10)
+    ax.set_ylabel(ylabel, color=_TEXT_COL, fontsize=10)
+    ax.tick_params(colors=_TEXT_COL, labelsize=9)
+    for spine in ax.spines.values():
+        spine.set_edgecolor(_GRID_COL)
+    ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.2f"))
+    ax.grid(color=_GRID_COL, linestyle="--", linewidth=0.6, alpha=0.8)
+    ax.legend(facecolor="#161b22", edgecolor=_GRID_COL,
+              labelcolor="#e6edf3", fontsize=9)
+
+
+def build_loss_chart(data: dict):
+    fig, ax = plt.subplots(figsize=(6, 3.4))
+    if data.get("train_steps"):
+        ax.plot(data["train_steps"], data["train_loss"],
+                color=_PURPLE, linewidth=1.8, label="Fine-tuned model")
+        if len(data["train_loss"]) > 1:
+            base_val = data["train_loss"][0]
+            ax.axhline(base_val, color=_GREY, linestyle="--",
+                       linewidth=1.2, label="Base model (no training)")
+    else:
+        ax.text(0.5, 0.5, "No training data yet", ha="center", va="center",
+                color=_TEXT_COL, transform=ax.transAxes, fontsize=11)
+    _apply_dark_style(ax, "Training Loss", "Training steps", "Loss")
+    fig.tight_layout()
+    return fig
+
+
+def build_ppl_chart(data: dict):
+    fig, ax = plt.subplots(figsize=(6, 3.4))
+    if data.get("train_steps"):
+        ax.plot(data["train_steps"], data["train_ppl"],
+                color=_CYAN, linewidth=1.8, label="Fine-tuned model")
+        if len(data["train_ppl"]) > 1:
+            ax.axhline(data["train_ppl"][0], color=_GREY, linestyle="--",
+                       linewidth=1.2, label="Base model")
+    else:
+        ax.text(0.5, 0.5, "No training data yet", ha="center", va="center",
+                color=_TEXT_COL, transform=ax.transAxes, fontsize=11)
+    _apply_dark_style(ax, "Perplexity", "Training steps", "Perplexity")
+    fig.tight_layout()
+    return fig
+
+
+def build_summary_chart(data: dict):
+    fig, ax = plt.subplots(figsize=(5, 3.4))
+    if data.get("train_loss"):
+        before_loss = data["train_loss"][0]
+        after_loss  = data["train_loss"][-1]
+        before_ppl  = data["train_ppl"][0]
+        after_ppl   = data["train_ppl"][-1]
+        labels  = ["Loss", "Perplexity"]
+        befores = [before_loss, before_ppl]
+        afters  = [after_loss,  after_ppl]
+        x = range(len(labels))
+        w = 0.32
+        b1 = ax.bar([i - w/2 for i in x], befores, w, color=_GREY,   label="Before fine-tuning")
+        b2 = ax.bar([i + w/2 for i in x], afters,  w, color=_PURPLE, label="After fine-tuning")
+        for bar in list(b1) + list(b2):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+                    f"{bar.get_height():.2f}", ha="center", va="bottom",
+                    color="#e6edf3", fontsize=8)
+        ax.set_xticks(list(x))
+        ax.set_xticklabels(labels)
+    else:
+        ax.text(0.5, 0.5, "No data yet", ha="center", va="center",
+                color=_TEXT_COL, transform=ax.transAxes, fontsize=11)
+    _apply_dark_style(ax, "Before vs After — Key Metrics", "", "Score / Value")
+    fig.tight_layout()
+    return fig
+
+
+def build_metrics_df(data: dict) -> pd.DataFrame:
+    if not data.get("train_loss"):
+        return pd.DataFrame(columns=["Metric", "Before fine-tuning", "After fine-tuning", "Change"])
+    bl = data["train_loss"][0];  al = data["train_loss"][-1]
+    bp = data["train_ppl"][0];   ap = data["train_ppl"][-1]
+    rows = [
+        ("Loss",       f"{bl:.3f}", f"{al:.3f}", f"{(al-bl)/bl*100:+.0f}%"),
+        ("Perplexity", f"{bp:.2f}", f"{ap:.2f}", f"{(ap-bp)/bp*100:+.0f}%"),
+    ]
+    if data.get("eval_loss"):
+        el_b = data["eval_loss"][0]; el_a = data["eval_loss"][-1]
+        rows.append(("Eval Loss", f"{el_b:.3f}", f"{el_a:.3f}",
+                     f"{(el_a-el_b)/el_b*100:+.0f}%"))
+    if data.get("eval_ppl"):
+        ep_b = data["eval_ppl"][0]; ep_a = data["eval_ppl"][-1]
+        rows.append(("Eval Perplexity", f"{ep_b:.2f}", f"{ep_a:.2f}",
+                     f"{(ep_a-ep_b)/ep_b*100:+.0f}%"))
+    return pd.DataFrame(rows, columns=["Metric", "Before fine-tuning", "After fine-tuning", "Change"])
+
+
+def load_eval_run(run_name: str):
+    if not run_name:
+        empty = pd.DataFrame(columns=["Metric", "Before fine-tuning", "After fine-tuning", "Change"])
+        return build_loss_chart({}), build_ppl_chart({}), build_summary_chart({}), empty
+    data = parse_training_log(run_name)
+    return (build_loss_chart(data), build_ppl_chart(data),
+            build_summary_chart(data), build_metrics_df(data))
+
+
 # ── CSS ───────────────────────────────────────────────────────────────────────
 CSS = """
 footer { display:none !important; }
@@ -667,6 +818,10 @@ input[type=range]::-webkit-slider-thumb { background: #58a6ff !important; }
 .prose p, .prose span { color: #e6edf3 !important; }
 """
 
+# ── Developer credentials (change these) ─────────────────────────────────────
+DEV_USERNAME = os.environ.get("DEV_USERNAME", "mkd-dev")
+DEV_PASSWORD = os.environ.get("DEV_PASSWORD", "mkd2026!")
+
 # ── App ───────────────────────────────────────────────────────────────────────
 with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
 
@@ -713,12 +868,49 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
               </div>
             </div>
 
+            <div style="flex:1;min-width:280px;background:#0d1b2a;border:1px solid #1f6feb;
+                        border-radius:12px;padding:32px;text-align:left;">
+              <div style="font-size:24px;margin-bottom:10px;">&#128202;</div>
+              <h2 style="margin:0 0 8px;color:#e6edf3;font-size:20px;">Evaluation</h2>
+              <p style="color:#8b949e;font-size:14px;line-height:1.6;margin:0 0 20px;">
+                Compare your fine-tuned model vs the base model —
+                loss curves, perplexity, and before/after metrics table.
+              </p>
+              <div style="padding:6px 12px;background:#0d1b2a;border:1px solid #1f6feb;
+                          border-radius:6px;display:inline-block;color:#58a6ff;font-size:12px;">
+                View results after training
+              </div>
+            </div>
+
           </div>
         </div>
         """)
         with gr.Row():
             land_dev_btn  = gr.Button("Enter as Developer",    variant="secondary", scale=1)
             land_user_btn = gr.Button("Enter as General User", variant="primary",   scale=1)
+            land_eval_btn = gr.Button("View Evaluation",       variant="secondary", scale=1)
+
+    # ── Developer login screen ────────────────────────────────────────────────
+    with gr.Group(visible=False) as dev_login_group:
+        gr.HTML("""
+        <div style="max-width:380px;margin:60px auto;padding:0 20px;text-align:center;">
+          <div style="width:48px;height:48px;background:#1f6feb;border-radius:10px;
+                      display:inline-flex;align-items:center;justify-content:center;
+                      font-size:18px;font-weight:700;color:#fff;margin-bottom:20px;">MKD</div>
+          <h2 style="color:#e6edf3;margin:0 0 6px;font-size:22px;">Developer Access</h2>
+          <p style="color:#8b949e;font-size:14px;margin:0 0 28px;">
+            Enter your credentials to continue
+          </p>
+        </div>
+        """)
+        with gr.Column(elem_id="login-box"):
+            dev_login_user = gr.Textbox(label="Username", placeholder="username")
+            dev_login_pass = gr.Textbox(label="Password", placeholder="password",
+                                        type="password")
+            dev_login_err  = gr.HTML("")
+            with gr.Row():
+                dev_login_back_btn = gr.Button("← Back",  variant="secondary", scale=1)
+                dev_login_btn      = gr.Button("Login",    variant="primary",   scale=2)
 
     # ── Developer mode ────────────────────────────────────────────────────────
     dev_content_group = gr.Group(visible=False)
@@ -738,93 +930,122 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
         with gr.Group(visible=True) as user_screen1:
             gr.HTML("""
             <div style="padding:32px 0 24px;text-align:center;">
-              <h2 style="color:#e6edf3;margin:0;font-size:24px;font-weight:700;">
+              <h2 style="color:#e6edf3;margin:0 0 8px;font-size:24px;font-weight:700;">
                 How would you like to start?
               </h2>
+              <p style="color:#8b949e;font-size:14px;margin:0;">
+                Choose a path below. Both will guide you step by step.
+              </p>
             </div>
             """)
             with gr.Row():
                 with gr.Column(scale=1):
                     gr.HTML("""
                     <div style="background:#0d2a1a;border:2px solid #238636;border-radius:12px;
-                                padding:28px 28px 16px;position:relative;margin-bottom:8px;">
+                                padding:28px 28px 20px;position:relative;margin-bottom:8px;min-height:160px;">
                       <div style="position:absolute;top:14px;right:14px;background:#238636;
                                   color:#fff;font-size:10px;font-weight:700;padding:3px 10px;
                                   border-radius:20px;letter-spacing:0.06em;">RECOMMENDED</div>
-                      <div style="font-size:28px;margin-bottom:12px;">&#9889;</div>
-                      <div style="color:#e6edf3;font-size:18px;font-weight:700;margin-bottom:8px;">Quick Start</div>
-                      <div style="color:#8b949e;font-size:14px;line-height:1.6;margin-bottom:16px;">
-                        Upload your data.<br>We handle everything else.
+                      <div style="color:#e6edf3;font-size:18px;font-weight:700;margin-bottom:10px;">Quick Start</div>
+                      <div style="color:#8b949e;font-size:14px;line-height:1.7;margin-bottom:14px;">
+                        Upload your data and give it a name.<br>
+                        We handle everything else automatically.
                       </div>
-                      <div style="color:#3fb950;font-size:12px;">
-                        &#8987; Test run ~1 min &nbsp;·&nbsp; Full run ~3–6h
+                      <div style="color:#3fb950;font-size:12px;font-weight:500;">
+                        Test run: ~1 min &nbsp;&nbsp;|&nbsp;&nbsp; Full run: 3–6 h
                       </div>
                     </div>
                     """)
-                    user_qs_btn = gr.Button("Select Quick Start  →", variant="primary")
+                    user_qs_btn = gr.Button("Start with Quick Start", variant="primary")
 
                 with gr.Column(scale=1):
                     gr.HTML("""
                     <div style="background:#161b22;border:2px solid #30363d;border-radius:12px;
-                                padding:28px 28px 16px;margin-bottom:8px;">
-                      <div style="font-size:28px;margin-bottom:12px;">&#9881;</div>
-                      <div style="color:#e6edf3;font-size:18px;font-weight:700;margin-bottom:8px;">Custom Mix</div>
-                      <div style="color:#8b949e;font-size:14px;line-height:1.6;margin-bottom:16px;">
-                        Pick your model and dataset<br>from what's on the server.
+                                padding:28px 28px 20px;margin-bottom:8px;min-height:160px;">
+                      <div style="color:#e6edf3;font-size:18px;font-weight:700;margin-bottom:10px;">Choose model &amp; data</div>
+                      <div style="color:#8b949e;font-size:14px;line-height:1.7;margin-bottom:14px;">
+                        Pick which AI model and which dataset<br>
+                        to use from what is already on the server.
                       </div>
-                      <div style="color:#8b949e;font-size:12px;">
-                        All downloaded models &nbsp;·&nbsp; All datasets
+                      <div style="color:#8b949e;font-size:12px;font-weight:500;">
+                        All downloaded models &nbsp;&nbsp;|&nbsp;&nbsp; All datasets
                       </div>
                     </div>
                     """)
-                    user_cm_btn = gr.Button("Select Custom Mix  →", variant="secondary")
+                    user_cm_btn = gr.Button("Choose model & data", variant="secondary")
 
         # Screen 2a: Quick Start config
         with gr.Group(visible=False) as user_screen2a:
             gr.HTML("""
-            <div style="max-width:520px;margin:20px auto;text-align:center;padding:0 20px;">
-              <h2 style="color:#e6edf3;margin:0 0 8px;font-size:26px;">
-                Let's train your AI model!
+            <div style="padding:8px 0 4px;">
+              <div style="display:flex;align-items:center;gap:0;margin-bottom:24px;">
+                <div style="flex:1;text-align:center;">
+                  <div style="display:inline-block;width:28px;height:28px;line-height:28px;
+                              border-radius:50%;background:#238636;color:#fff;font-size:13px;
+                              font-weight:700;">1</div>
+                  <div style="color:#3fb950;font-size:12px;margin-top:4px;font-weight:600;">Setup</div>
+                </div>
+                <div style="flex:2;height:2px;background:#30363d;margin-bottom:16px;"></div>
+                <div style="flex:1;text-align:center;">
+                  <div style="display:inline-block;width:28px;height:28px;line-height:28px;
+                              border-radius:50%;background:#21262d;border:2px solid #30363d;
+                              color:#8b949e;font-size:13px;font-weight:700;">2</div>
+                  <div style="color:#8b949e;font-size:12px;margin-top:4px;">Training</div>
+                </div>
+                <div style="flex:2;height:2px;background:#30363d;margin-bottom:16px;"></div>
+                <div style="flex:1;text-align:center;">
+                  <div style="display:inline-block;width:28px;height:28px;line-height:28px;
+                              border-radius:50%;background:#21262d;border:2px solid #30363d;
+                              color:#8b949e;font-size:13px;font-weight:700;">3</div>
+                  <div style="color:#8b949e;font-size:12px;margin-top:4px;">Chat</div>
+                </div>
+              </div>
+              <h2 style="color:#e6edf3;margin:0 0 6px;font-size:22px;font-weight:700;">
+                Set up your model
               </h2>
-              <p style="color:#8b949e;font-size:15px;margin:0 0 32px;line-height:1.6;">
-                Just give it a name and press Start.<br>
-                We'll take care of everything else.
+              <p style="color:#8b949e;font-size:14px;margin:0 0 24px;line-height:1.6;">
+                Give your model a name, choose your training data, then press Start.
               </p>
             </div>
             """)
 
             with gr.Column(elem_id="qs-center"):
                 user_qs_name = gr.Textbox(
-                    label="Give your model a name",
+                    label="Model name",
                     placeholder="e.g.  my-assistant  or  customer-support-bot",
                     max_lines=1,
+                    info="A short, lowercase name with no spaces. Used to identify your model.",
                 )
 
-                gr.HTML('<div style="height:16px;"></div>')
+                gr.HTML('<div style="height:4px;"></div>')
+
+                user_qs_dataset = gr.Radio(
+                    ["Use the built-in example dataset",
+                     "Upload my own data file"],
+                    value="Use the built-in example dataset",
+                    label="Training data",
+                    info="The built-in dataset is good for a quick test. Upload your own data for real results.",
+                )
+                user_qs_file = gr.File(
+                    label="Your data file  (.jsonl, .json or .csv)",
+                    file_types=[".jsonl", ".json", ".csv"],
+                    visible=False,
+                )
+
+                gr.HTML('<div style="height:4px;"></div>')
+
+                user_qs_test_mode = gr.Checkbox(
+                    label="Do a quick test run first (10 steps, about 1 minute)",
+                    value=True,
+                    info="Recommended — confirms everything works before the full training run.",
+                )
+
+                gr.HTML('<div style="height:20px;"></div>')
 
                 user_qs_start_btn = gr.Button(
-                    "Start Training  →", variant="primary", size="lg")
+                    "Start Training", variant="primary", size="lg")
 
-                gr.HTML('<div style="height:24px;"></div>')
-
-                with gr.Accordion("Advanced options", open=False):
-                    user_qs_test_mode = gr.Checkbox(
-                        label="Quick test run  (10 steps, ~1 min — recommended before full training)",
-                        value=True,
-                    )
-                    user_qs_dataset = gr.Radio(
-                        ["Use the built-in example dataset",
-                         "Use my own data  (upload a file)"],
-                        value="Use the built-in example dataset",
-                        label="Training data",
-                    )
-                    user_qs_file = gr.File(
-                        label="Upload your data file  (.jsonl, .json or .csv)",
-                        file_types=[".jsonl", ".json", ".csv"],
-                        visible=False,
-                    )
-
-                gr.HTML('<div style="height:16px;"></div>')
+                gr.HTML('<div style="height:12px;"></div>')
                 user_qs_back_btn = gr.Button("← Back", variant="secondary", size="sm")
                 user_qs_out = gr.HTML("", visible=False)
 
@@ -841,7 +1062,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                     choices.append(f"{label}  ({params})")
                 except Exception:
                     choices.append(m)
-            return choices or ["Qwen2.5-7B-Instruct  (7B)"]
+            return choices or ["Phi-3.5-mini-instruct  (3.8B)"]
 
         def get_cm_dataset_choices():
             choices = []
@@ -858,10 +1079,34 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
 
         with gr.Group(visible=False) as user_screen2b:
             gr.HTML("""
-            <h2 style="color:#e6edf3;margin:0 0 6px;font-size:22px;">Custom Mix</h2>
-            <p style="color:#8b949e;font-size:14px;margin:0 0 20px;">
-              Choose the AI model and data. Everything else is set up automatically.
-            </p>
+            <div style="padding:8px 0 4px;">
+              <div style="display:flex;align-items:center;gap:0;margin-bottom:24px;">
+                <div style="flex:1;text-align:center;">
+                  <div style="display:inline-block;width:28px;height:28px;line-height:28px;
+                              border-radius:50%;background:#238636;color:#fff;font-size:13px;
+                              font-weight:700;">1</div>
+                  <div style="color:#3fb950;font-size:12px;margin-top:4px;font-weight:600;">Setup</div>
+                </div>
+                <div style="flex:2;height:2px;background:#30363d;margin-bottom:16px;"></div>
+                <div style="flex:1;text-align:center;">
+                  <div style="display:inline-block;width:28px;height:28px;line-height:28px;
+                              border-radius:50%;background:#21262d;border:2px solid #30363d;
+                              color:#8b949e;font-size:13px;font-weight:700;">2</div>
+                  <div style="color:#8b949e;font-size:12px;margin-top:4px;">Training</div>
+                </div>
+                <div style="flex:2;height:2px;background:#30363d;margin-bottom:16px;"></div>
+                <div style="flex:1;text-align:center;">
+                  <div style="display:inline-block;width:28px;height:28px;line-height:28px;
+                              border-radius:50%;background:#21262d;border:2px solid #30363d;
+                              color:#8b949e;font-size:13px;font-weight:700;">3</div>
+                  <div style="color:#8b949e;font-size:12px;margin-top:4px;">Chat</div>
+                </div>
+              </div>
+              <h2 style="color:#e6edf3;margin:0 0 6px;font-size:22px;font-weight:700;">Choose model &amp; data</h2>
+              <p style="color:#8b949e;font-size:14px;margin:0 0 20px;">
+                Select a model and dataset from the server. Everything else is handled automatically.
+              </p>
+            </div>
             """)
             with gr.Row():
                 user_cm_model = gr.Radio(
@@ -905,19 +1150,69 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
 
         # Screen 3: Progress
         with gr.Group(visible=False) as user_screen3:
+            gr.HTML("""
+            <div style="padding:8px 0 4px;">
+              <div style="display:flex;align-items:center;gap:0;margin-bottom:24px;">
+                <div style="flex:1;text-align:center;">
+                  <div style="display:inline-block;width:28px;height:28px;line-height:28px;
+                              border-radius:50%;background:#238636;color:#fff;font-size:13px;
+                              font-weight:700;">&#10003;</div>
+                  <div style="color:#3fb950;font-size:12px;margin-top:4px;font-weight:600;">Setup</div>
+                </div>
+                <div style="flex:2;height:2px;background:#238636;margin-bottom:16px;"></div>
+                <div style="flex:1;text-align:center;">
+                  <div style="display:inline-block;width:28px;height:28px;line-height:28px;
+                              border-radius:50%;background:#1f6feb;color:#fff;font-size:13px;
+                              font-weight:700;">2</div>
+                  <div style="color:#58a6ff;font-size:12px;margin-top:4px;font-weight:600;">Training</div>
+                </div>
+                <div style="flex:2;height:2px;background:#30363d;margin-bottom:16px;"></div>
+                <div style="flex:1;text-align:center;">
+                  <div style="display:inline-block;width:28px;height:28px;line-height:28px;
+                              border-radius:50%;background:#21262d;border:2px solid #30363d;
+                              color:#8b949e;font-size:13px;font-weight:700;">3</div>
+                  <div style="color:#8b949e;font-size:12px;margin-top:4px;">Chat</div>
+                </div>
+              </div>
+            </div>
+            """)
             user_progress_html = gr.HTML("")
             user_progress_out  = gr.HTML("", visible=False)
 
         # Screen 4: Inline chat
         with gr.Group(visible=False) as user_screen4:
             gr.HTML("""
-            <div style="background:#0d2a1a;border:1px solid #238636;border-radius:10px;
-                        padding:20px 24px;margin-bottom:16px;">
-              <div style="font-size:20px;font-weight:700;color:#3fb950;margin-bottom:4px;">
-                Your model is ready!
+            <div style="padding:8px 0 4px;">
+              <div style="display:flex;align-items:center;gap:0;margin-bottom:20px;">
+                <div style="flex:1;text-align:center;">
+                  <div style="display:inline-block;width:28px;height:28px;line-height:28px;
+                              border-radius:50%;background:#238636;color:#fff;font-size:13px;
+                              font-weight:700;">&#10003;</div>
+                  <div style="color:#3fb950;font-size:12px;margin-top:4px;font-weight:600;">Setup</div>
+                </div>
+                <div style="flex:2;height:2px;background:#238636;margin-bottom:16px;"></div>
+                <div style="flex:1;text-align:center;">
+                  <div style="display:inline-block;width:28px;height:28px;line-height:28px;
+                              border-radius:50%;background:#238636;color:#fff;font-size:13px;
+                              font-weight:700;">&#10003;</div>
+                  <div style="color:#3fb950;font-size:12px;margin-top:4px;font-weight:600;">Training</div>
+                </div>
+                <div style="flex:2;height:2px;background:#238636;margin-bottom:16px;"></div>
+                <div style="flex:1;text-align:center;">
+                  <div style="display:inline-block;width:28px;height:28px;line-height:28px;
+                              border-radius:50%;background:#1f6feb;color:#fff;font-size:13px;
+                              font-weight:700;">3</div>
+                  <div style="color:#58a6ff;font-size:12px;margin-top:4px;font-weight:600;">Chat</div>
+                </div>
               </div>
-              <div style="color:#8b949e;font-size:14px;">
-                Chat with it below to test how it responds.
+            </div>
+            <div style="background:#0d2a1a;border:1px solid #238636;border-radius:10px;
+                        padding:16px 20px;margin-bottom:16px;">
+              <div style="font-size:17px;font-weight:700;color:#3fb950;margin-bottom:4px;">
+                Your model is ready
+              </div>
+              <div style="color:#8b949e;font-size:13px;">
+                Type a message below to test how your fine-tuned model responds.
               </div>
             </div>
             """)
@@ -941,28 +1236,128 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
             )
             user_publish_out = gr.HTML("")
 
+    # ── Evaluation screen ─────────────────────────────────────────────────────
+    with gr.Group(visible=False) as eval_group:
+        with gr.Row():
+            gr.HTML('<span style="color:#8b949e;font-size:12px;padding:4px 0;">Evaluation</span>')
+            back_eval_btn = gr.Button("← Home", size="sm", variant="secondary", scale=0)
+
+        gr.HTML('<h2 style="color:#e6edf3;margin:16px 0 4px;">Model Evaluation Dashboard</h2>'
+                '<p style="color:#8b949e;font-size:13px;margin:0 0 20px;">'
+                'Compare your fine-tuned model against the base model across key performance metrics.</p>')
+
+        with gr.Row():
+            eval_run_dd  = gr.Dropdown(
+                label="Select training run",
+                choices=list_eval_runs(),
+                value=(list_eval_runs() or [None])[0],
+                scale=4,
+            )
+            eval_ref_btn = gr.Button("↺ Refresh", size="sm", variant="secondary", scale=0)
+
+        eval_no_data = gr.HTML(
+            '<div style="text-align:center;color:#8b949e;padding:40px 0;font-size:14px;">'
+            'No completed training runs found.<br>'
+            '<span style="font-size:12px;">Run a training job first, then come back here.</span></div>',
+            visible=not bool(list_eval_runs()),
+        )
+
+        with gr.Group(visible=bool(list_eval_runs())) as eval_charts_group:
+            with gr.Row():
+                eval_loss_plot    = gr.Plot(label="Training Loss")
+                eval_ppl_plot     = gr.Plot(label="Perplexity")
+                eval_summary_plot = gr.Plot(label="Before vs After — Key Metrics")
+
+            gr.HTML('<h3 style="color:#e6edf3;margin:20px 0 8px;font-size:15px;">Performance Metrics</h3>')
+            eval_table = gr.DataFrame(
+                headers=["Metric", "Before fine-tuning", "After fine-tuning", "Change"],
+                datatype=["str", "str", "str", "str"],
+                interactive=False,
+            )
+
+        def _load_eval(run_name):
+            runs = list_eval_runs()
+            has_data = bool(runs and run_name)
+            loss_fig, ppl_fig, summary_fig, df = load_eval_run(run_name)
+            return (
+                loss_fig, ppl_fig, summary_fig, df,
+                gr.HTML(visible=not has_data),
+                gr.Group(visible=has_data),
+            )
+
+        eval_run_dd.change(
+            _load_eval,
+            inputs=eval_run_dd,
+            outputs=[eval_loss_plot, eval_ppl_plot, eval_summary_plot,
+                     eval_table, eval_no_data, eval_charts_group],
+        )
+        eval_ref_btn.click(
+            lambda: gr.Dropdown(choices=list_eval_runs(),
+                                value=(list_eval_runs() or [None])[0]),
+            outputs=eval_run_dd,
+        )
+
     # ── Landing buttons ───────────────────────────────────────────────────────
     # dev_group is empty — developer content lives outside (always rendered).
     # Hiding landing_group reveals the developer dashboard underneath.
     # user_group shows the simplified interface on top.
 
-    def go_developer():
-        return (gr.Group(visible=False), gr.Group(visible=True),
-                gr.Group(visible=False), gr.Group(visible=True))
+    # All group outputs: landing, dev_login, dev_group, user_group, dev_content, eval_group
+    _outs = [landing_group, dev_login_group, dev_group, user_group, dev_content_group, eval_group]
+
+    def _g(v): return gr.Group(visible=v)
+
+    def go_to_login():
+        return _g(False), _g(True),  _g(False), _g(False), _g(False), _g(False)
+
+    def do_dev_login(username, password):
+        if username.strip() == DEV_USERNAME and password.strip() == DEV_PASSWORD:
+            return (_g(False), _g(False), _g(True),  _g(False), _g(True),  _g(False),
+                    gr.HTML(""))
+        else:
+            return (_g(False), _g(True),  _g(False), _g(False), _g(False), _g(False),
+                    gr.HTML('<div style="color:#f85149;font-size:13px;padding:8px 0;">Incorrect username or password.</div>'))
 
     def go_user():
-        return (gr.Group(visible=False), gr.Group(visible=False),
-                gr.Group(visible=True),  gr.Group(visible=False))
+        return _g(False), _g(False), _g(False), _g(True),  _g(False), _g(False)
 
     def go_home():
-        return (gr.Group(visible=True),  gr.Group(visible=False),
-                gr.Group(visible=False), gr.Group(visible=False))
+        return _g(True),  _g(False), _g(False), _g(False), _g(False), _g(False)
 
-    _outs = [landing_group, dev_group, user_group, dev_content_group]
-    land_dev_btn.click(go_developer, outputs=_outs)
-    land_user_btn.click(go_user,     outputs=_outs)
-    back_dev_btn.click(go_home,      outputs=_outs)
-    back_user_btn.click(go_home,     outputs=_outs)
+    def go_eval():
+        runs = list_eval_runs()
+        default = (runs or [None])[0]
+        loss_fig, ppl_fig, summary_fig, df = load_eval_run(default)
+        has_data = bool(default)
+        return (
+            _g(False), _g(False), _g(False), _g(False), _g(False), _g(True),
+            gr.Dropdown(choices=runs, value=default),
+            loss_fig, ppl_fig, summary_fig, df,
+            gr.HTML(visible=not has_data),
+            gr.Group(visible=has_data),
+        )
+
+    land_dev_btn.click(go_to_login, outputs=_outs)
+    land_user_btn.click(go_user,    outputs=_outs)
+    land_eval_btn.click(go_eval,    outputs=_outs + [
+        eval_run_dd, eval_loss_plot, eval_ppl_plot, eval_summary_plot,
+        eval_table, eval_no_data, eval_charts_group,
+    ])
+
+    dev_login_btn.click(do_dev_login,
+                        inputs=[dev_login_user, dev_login_pass],
+                        outputs=_outs + [dev_login_err])
+    dev_login_user.submit(do_dev_login,
+                          inputs=[dev_login_user, dev_login_pass],
+                          outputs=_outs + [dev_login_err])
+    dev_login_pass.submit(do_dev_login,
+                          inputs=[dev_login_user, dev_login_pass],
+                          outputs=_outs + [dev_login_err])
+
+    dev_login_back_btn.click(go_home, outputs=_outs)
+    back_dev_btn.click(go_home,       outputs=_outs)
+    back_user_btn.click(go_home,      outputs=_outs)
+    back_eval_btn.click(go_home,      outputs=_outs)
 
     # ── User mode screen navigation ───────────────────────────────────────────
     def show_screen(s1, s2a, s2b, s3):
@@ -1067,7 +1462,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
 
     def run_user_quickstart(dataset_choice, upload_file, model_name, test_mode=True):
         dataset = "alpaca"
-        model   = "qwen__qwen2.5-7b-instruct"
+        model   = "microsoft__phi-3.5-mini-instruct"
 
         # For test mode: create a tiny 100-row dataset to skip preprocessing wait
         if test_mode:
@@ -1131,7 +1526,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
 
     def run_user_custommix(models_sel, datasets_sel, upload_file, model_name):
         # Resolve model: match display label back to folder name
-        model = "qwen__qwen2.5-7b-instruct"  # default
+        model = "microsoft__phi-3.5-mini-instruct"  # default
         label = (models_sel or "").split("  ")[0].strip().lower().replace("-", "").replace(".", "")
         for m in list_models():
             if label in m.lower().replace("-", "").replace(".", "").replace("_", ""):
@@ -1397,21 +1792,15 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                                         variant="secondary", scale=0)
     
         dash_timer = gr.Timer(value=10)
-        # Guide panel
-        with gr.Row():
-            guide_html = gr.HTML(get_guide_html())
-    
+
         refresh_all_btn.click(
-            lambda: (get_pipeline_html(), get_stats_html(), get_state_html(),
-                     get_gpu_html(), get_guide_html()),
-            outputs=[pipeline_html, stats_html, state_html, gpu_html, guide_html],
+            lambda: (get_pipeline_html(), get_stats_html(), get_state_html(), get_gpu_html()),
+            outputs=[pipeline_html, stats_html, state_html, gpu_html],
         )
-    
-        # Auto-refresh guide too
+
         dash_timer.tick(
-            lambda: (get_gpu_html(), get_pipeline_html(), get_stats_html(),
-                     get_state_html(), get_guide_html()),
-            outputs=[gpu_html, pipeline_html, stats_html, state_html, guide_html],
+            lambda: (get_gpu_html(), get_pipeline_html(), get_stats_html(), get_state_html()),
+            outputs=[gpu_html, pipeline_html, stats_html, state_html],
         )
     
         gr.HTML('<div style="border-top:1px solid #30363d;margin:8px 0 16px;"></div>')
@@ -1925,9 +2314,16 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                 gr.HTML('<p style="color:#8b949e;font-size:12px;margin:-8px 0 12px;">'
                         '10 steps ≈ 30 sec · 50 steps ≈ 2 min · 200 steps ≈ 8 min</p>')
                 with gr.Row():
-                    smoke_btn = gr.Button("Smoke Test", variant="secondary", scale=1)
-                    train_btn = gr.Button("Start Full Training", variant="primary", scale=1)
-    
+                    smoke_btn  = gr.Button("Smoke Test",         variant="secondary", scale=1)
+                    train_btn  = gr.Button("Start Full Training", variant="primary",   scale=2)
+
+                with gr.Row():
+                    train_max_steps = gr.Number(
+                        label="Max steps  (leave 0 for full run based on epochs)",
+                        value=0, precision=0, minimum=0, scale=2,
+                        info="e.g. 200 for a quick test · 0 = run all epochs",
+                    )
+
                 train_out = gr.HTML(terminal_wrap(""))
     
                 gr.HTML('<div style="border-top:1px solid #30363d;margin:16px 0;"></div>')
@@ -1951,12 +2347,16 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                     yield from run_ft(["smoke-test", f"configs/{c}",
                                        "--steps", str(int(steps))])
     
-                def do_train(c):
-                    yield from run_ft(["train", f"configs/{c}"])
-    
+                def do_train(c, max_steps):
+                    cmd = ["train", f"configs/{c}"]
+                    if int(max_steps or 0) > 0:
+                        cmd += ["--max-steps", str(int(max_steps))]
+                    yield from run_ft(cmd)
+
                 smoke_btn.click(do_smoke, inputs=[train_cfg_dd, smoke_steps],
                                 outputs=train_out, show_progress=False)
-                train_btn.click(do_train, inputs=train_cfg_dd, outputs=train_out, show_progress=False)
+                train_btn.click(do_train, inputs=[train_cfg_dd, train_max_steps],
+                                outputs=train_out, show_progress=False)
                 log_ref.click(lambda r: (get_metrics_html(r), read_log(r)),
                               inputs=log_dd, outputs=[metrics_out, log_out])
                 log_dd.change(lambda r: (get_metrics_html(r), read_log(r)),
@@ -2373,10 +2773,12 @@ if __name__ == "__main__":
         button_secondary_text_color_dark="#c9d1d9",
     )
 
+    app.queue(max_size=20)
     app.launch(
         server_name=args.host,
         server_port=args.port,
         share=args.share,
         theme=theme,
         css=CSS,
+        max_threads=10,
     )

@@ -197,17 +197,34 @@ def tail_and_watch(proc: subprocess.Popen, output_dir: Path, root: Path) -> int:
 
 
 def main():
-    if len(sys.argv) < 2:
-        err("Usage: ft train <recipe.yaml>")
-        sys.exit(2)
+    import argparse
+    parser = argparse.ArgumentParser(prog="ft train", add_help=False)
+    parser.add_argument("recipe")
+    parser.add_argument("--max-steps", type=int, default=0,
+                        help="Cap training at N steps (0 = run all epochs)")
+    parsed, _ = parser.parse_known_args()
 
-    recipe_path = Path(sys.argv[1])
+    recipe_path = Path(parsed.recipe)
     root = project_root()
     if not recipe_path.exists() and not recipe_path.is_absolute():
         recipe_path = root / recipe_path
     if not recipe_path.exists():
         err(f"Recipe not found: {recipe_path}")
         sys.exit(2)
+
+    # If --max-steps given, write a patched copy of the YAML
+    if parsed.max_steps > 0:
+        import re as _re, tempfile, shutil as _sh
+        txt = recipe_path.read_text()
+        if "max_steps:" not in txt:
+            txt = _re.sub(r'^(num_epochs:)', r'max_steps: ' + str(parsed.max_steps) + r'\n\1',
+                          txt, flags=_re.MULTILINE)
+        else:
+            txt = _re.sub(r'^max_steps:.*', f'max_steps: {parsed.max_steps}', txt, flags=_re.MULTILINE)
+        tmp = Path(tempfile.mktemp(suffix=".yaml", prefix="ft_train_"))
+        tmp.write_text(txt)
+        info(f"max_steps={parsed.max_steps} → using patched config {tmp.name}")
+        recipe_path = tmp
 
     recipe = load_yaml(recipe_path)
     output_dir = root / recipe.get("output_dir", "checkpoints/run")
