@@ -4,12 +4,28 @@ ft_add_dataset.py — download a dataset from anywhere and normalize to ChatML.
 
 Usage:
     python ft_add_dataset.py <url-or-path> [--name <local-name>]
+                             [--instruction-col <col>] [--response-col <col>]
+                             [--chunk-size <chars>]
 
 Supports:
     - HuggingFace dataset IDs:    https://huggingface.co/datasets/tatsu-lab/alpaca
                                   tatsu-lab/alpaca
     - Direct file URLs:           https://example.com/data.jsonl
     - Local paths:                ./mydata.jsonl  /abs/path/to/file.parquet
+                                  ./corpus.txt
+
+Detected formats (in priority order):
+    chatml        messages list
+    dpo           prompt + chosen + rejected
+    alpaca        instruction + output (+ optional input/system)
+    sharegpt      conversations list
+    openai_pc     prompt + completion
+    qa            question/query + answer/response (many column-name variants)
+    summarization document/article/text + summary/abstract
+    function_call messages with tool_calls / function_call
+    aihub         Korean AI Hub JSON structure (info + data)
+    plain_text    raw .txt — split into overlapping chunks
+    custom        user-specified --instruction-col / --response-col
 
 Output:
     datasets/<name>/raw/              ← exact downloaded files
@@ -59,7 +75,8 @@ def classify_source(src: str) -> tuple[str, str]:
 
 # ---- Format detection & conversion -----------------------------------------
 
-def to_chatml_rows(rows: list[dict]) -> tuple[list[dict], str]:
+def to_chatml_rows(rows: list[dict], instruction_col: str = "",
+                   response_col: str = "") -> tuple[list[dict], str]:
     """Detect schema and convert to ChatML.
 
     Returns (chatml_rows, detected_format).
@@ -106,16 +123,17 @@ def to_chatml_rows(rows: list[dict]) -> tuple[list[dict], str]:
     if "conversations" in keys and isinstance(sample["conversations"], list):
         role_map = {"human": "user", "user": "user",
                     "gpt": "assistant", "assistant": "assistant",
-                    "system": "system"}
+                    "system": "system", "bot": "assistant"}
         out = []
         for r in rows:
             msgs = []
             for turn in r["conversations"]:
-                msgs.append({
-                    "role": role_map.get(turn.get("from", "user"), "user"),
-                    "content": turn.get("value", ""),
-                })
-            out.append({"messages": msgs})
+                role = role_map.get(turn.get("from", "").lower(), "user")
+                content = turn.get("value", turn.get("content", ""))
+                if content:
+                    msgs.append({"role": role, "content": content})
+            if len(msgs) >= 2:
+                out.append({"messages": msgs})
         return out, "sharegpt"
 
     # 5. OpenAI prompt/completion
@@ -125,8 +143,136 @@ def to_chatml_rows(rows: list[dict]) -> tuple[list[dict], str]:
             {"role": "assistant", "content": r["completion"]},
         ]} for r in rows], "openai_pc"
 
-    err(f"Unrecognized schema. Columns: {sorted(keys)}")
-    err("Supported: messages | conversations | instruction+output | prompt+completion | prompt+chosen+rejected")
+    # 6. QA format — many column-name variants
+    QA_PAIRS = [
+        ("question", "answer"), ("question", "answers"),
+        ("query", "response"), ("query", "answer"),
+        ("input", "output"), ("input", "target"),
+        ("q", "a"), ("问题", "答案"), ("질문", "답변"),
+    ]
+    for q_col, a_col in QA_PAIRS:
+        if q_col in keys and a_col in keys:
+            out = []
+            for r in rows:
+                ans = r[a_col]
+                # Some QA datasets store answers as a list (SQuAD-style)
+                if isinstance(ans, dict) and "text" in ans:
+                    ans = ans["text"][0] if isinstance(ans["text"], list) else ans["text"]
+                elif isinstance(ans, list):
+                    ans = ans[0] if ans else ""
+                ans = str(ans).strip()
+                question = str(r[q_col]).strip()
+                ctx = r.get("context", r.get("passage", r.get("paragraph", "")))
+                if ctx:
+                    question = f"{question}\n\nContext:\n{ctx}"
+                if question and ans:
+                    out.append({"messages": [
+                        {"role": "user", "content": question},
+                        {"role": "assistant", "content": ans},
+                    ]})
+            if out:
+                return out, f"qa ({q_col}/{a_col})"
+
+    # 7. Summarization format
+    DOC_COLS  = ["document", "article", "text", "content", "body", "passage",
+                 "source", "본문", "기사"]
+    SUM_COLS  = ["summary", "abstract", "highlights", "tldr", "title",
+                 "요약", "제목"]
+    doc_col  = next((c for c in DOC_COLS if c in keys), None)
+    sum_col  = next((c for c in SUM_COLS if c in keys), None)
+    if doc_col and sum_col:
+        out = []
+        for r in rows:
+            doc = str(r[doc_col]).strip()
+            summ = str(r[sum_col]).strip()
+            if doc and summ:
+                out.append({"messages": [
+                    {"role": "user",
+                     "content": f"Summarize the following:\n\n{doc}"},
+                    {"role": "assistant", "content": summ},
+                ]})
+        if out:
+            return out, f"summarization ({doc_col}/{sum_col})"
+
+    # 8. Function calling — messages list with tool_calls or function_call
+    if "messages" in keys:
+        # Already handled above, but tool-call rows may have non-list content
+        pass
+    if any("tool_calls" in str(r) or "function_call" in str(r) for r in rows[:20]):
+        out = []
+        for r in rows:
+            msgs = r.get("messages", [])
+            if msgs and isinstance(msgs, list):
+                cleaned = []
+                for m in msgs:
+                    role = m.get("role", "user")
+                    content = m.get("content") or ""
+                    tool_calls = m.get("tool_calls")
+                    if tool_calls:
+                        content = content or json.dumps(tool_calls, ensure_ascii=False)
+                    if content:
+                        cleaned.append({"role": role, "content": str(content)})
+                if len(cleaned) >= 2:
+                    out.append({"messages": cleaned})
+        if out:
+            return out, "function_call"
+
+    # 9. AI Hub (Korean government) format
+    # Structure: {"info": {...}, "data": [{"header": {...}, "utterances": [...]}]}
+    # or list of {"utterances": [...]} or {"dialogues": [...]}
+    if isinstance(rows[0], dict):
+        # Unwrap top-level info/data wrapper
+        if "data" in keys and isinstance(rows[0]["data"], list):
+            rows = rows[0]["data"]
+            keys = set(rows[0].keys()) if rows else keys
+        if "dialogues" in keys or "utterances" in keys or "dialog" in keys:
+            dial_key = next((k for k in ("dialogues", "utterances", "dialog") if k in keys), None)
+            out = []
+            for r in rows:
+                turns = r.get(dial_key, [])
+                if not isinstance(turns, list):
+                    continue
+                msgs = []
+                for t in turns:
+                    role_raw = (t.get("role") or t.get("speaker") or
+                                t.get("participantID") or "user")
+                    role = "assistant" if str(role_raw).lower() in (
+                        "sys", "system", "agent", "bot", "assistant", "ai", "2") else "user"
+                    content = (t.get("text") or t.get("utterance") or
+                               t.get("content") or "")
+                    if content:
+                        msgs.append({"role": role, "content": str(content)})
+                if len(msgs) >= 2:
+                    out.append({"messages": msgs})
+            if out:
+                return out, "aihub"
+
+    # 10. Custom column mapper — user specified --instruction-col / --response-col
+    if instruction_col and response_col:
+        if instruction_col in keys and response_col in keys:
+            out = []
+            for r in rows:
+                inst = str(r[instruction_col]).strip()
+                resp = str(r[response_col]).strip()
+                if inst and resp:
+                    out.append({"messages": [
+                        {"role": "user", "content": inst},
+                        {"role": "assistant", "content": resp},
+                    ]})
+            if out:
+                return out, f"custom ({instruction_col}/{response_col})"
+        else:
+            available = sorted(keys)
+            err(f"--instruction-col '{instruction_col}' or --response-col '{response_col}' "
+                f"not found.\nAvailable columns: {available}")
+            sys.exit(2)
+
+    # Nothing matched — show helpful error with available columns
+    err(f"Unrecognized schema. Columns found: {sorted(keys)}")
+    err("Supported formats: messages | conversations | instruction+output | "
+        "prompt+completion | prompt+chosen+rejected | question+answer | "
+        "document+summary | aihub dialogues | function_call")
+    err("Tip: use --instruction-col <col> --response-col <col> to map custom columns.")
     sys.exit(2)
 
 
@@ -164,21 +310,71 @@ def download_http(url: str, dest: Path) -> list[dict]:
     return load_local(out)
 
 
-def load_local(path: Path) -> list[dict]:
+def load_local(path: Path, chunk_size: int = 2048) -> list[dict]:
     suf = path.suffix.lower()
     if suf == ".jsonl":
-        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        return [json.loads(line) for line in path.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
     if suf == ".json":
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
         return data if isinstance(data, list) else [data]
     if suf in (".parquet", ".pq"):
         import pandas as pd
         return pd.read_parquet(path).to_dict(orient="records")
-    if suf == ".csv":
+    if suf in (".csv", ".tsv"):
         import pandas as pd
-        return pd.read_csv(path).to_dict(orient="records")
-    err(f"Unsupported file extension: {suf}")
+        sep = "\t" if suf == ".tsv" else ","
+        return pd.read_csv(path, sep=sep).fillna("").to_dict(orient="records")
+    if suf == ".txt":
+        return _chunk_text(path.read_text(encoding="utf-8", errors="replace"), chunk_size)
+    err(f"Unsupported file extension: {suf}. Supported: .jsonl .json .parquet .csv .tsv .txt")
     sys.exit(2)
+
+
+def _chunk_text(text: str, chunk_size: int = 2048) -> list[dict]:
+    """Split plain text into overlapping chunks wrapped as ChatML rows.
+
+    Strategy:
+      - Split on paragraph breaks first (double newline)
+      - Accumulate paragraphs into chunks up to chunk_size chars
+      - Overlap: last paragraph of previous chunk becomes first of next
+    Each chunk becomes: user asks "Continue the text:" → assistant returns chunk.
+    Adjacent chunks become instruction→response pairs so the model learns continuation.
+    """
+    paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
+    if not paragraphs:
+        return []
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for para in paragraphs:
+        if current_len + len(para) > chunk_size and current:
+            chunks.append("\n\n".join(current))
+            # Overlap: keep last paragraph
+            current = [current[-1], para]
+            current_len = len(current[-2]) + len(para)
+        else:
+            current.append(para)
+            current_len += len(para)
+    if current:
+        chunks.append("\n\n".join(current))
+
+    if len(chunks) < 2:
+        # Single chunk — wrap as standalone completion
+        return [{"messages": [
+            {"role": "user", "content": "Please continue writing based on the following text:"},
+            {"role": "assistant", "content": chunks[0]},
+        ]}]
+
+    # Pair consecutive chunks: chunk[i] as context → chunk[i+1] as continuation
+    rows = []
+    for i in range(len(chunks) - 1):
+        rows.append({"messages": [
+            {"role": "user",
+             "content": f"Continue the following text:\n\n{chunks[i]}"},
+            {"role": "assistant", "content": chunks[i + 1]},
+        ]})
+    return rows
 
 
 # ---- Main -------------------------------------------------------------------
@@ -187,6 +383,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("source", help="HF dataset URL/ID, HTTP URL, or local path")
     ap.add_argument("--name", help="Local name (default: derived from source)")
+    ap.add_argument("--instruction-col", default="",
+                    help="Column to use as the instruction/question (for custom schemas)")
+    ap.add_argument("--response-col", default="",
+                    help="Column to use as the response/answer (for custom schemas)")
+    ap.add_argument("--chunk-size", type=int, default=2048,
+                    help="Max chars per chunk for plain-text files (default: 2048)")
     args = ap.parse_args()
 
     root = project_root()
@@ -205,10 +407,17 @@ def main():
     elif kind == "http_file":
         rows = download_http(ident, raw_dir)
     else:  # local
-        rows = load_local(Path(ident))
+        rows = load_local(Path(ident), chunk_size=args.chunk_size)
 
     info(f"Loaded {len(rows)} raw rows")
-    chatml, fmt = to_chatml_rows(rows)
+    # Plain text files come back pre-chunked as ChatML rows
+    src_ext = Path(ident).suffix.lower() if kind == "local" else Path(args.source.split("?")[0]).suffix.lower()
+    if src_ext == ".txt" and rows and isinstance(rows[0], dict) and "messages" in rows[0]:
+        chatml, fmt = rows, "plain_text"
+    else:
+        chatml, fmt = to_chatml_rows(rows,
+                                     instruction_col=args.instruction_col,
+                                     response_col=args.response_col)
     info(f"Detected format: {fmt}    → normalized to ChatML ({len(chatml)} rows)")
 
     norm_path = out_dir / "normalized.jsonl"

@@ -129,10 +129,16 @@ def main():
         minfo = json.loads(model_info_path.read_text())
         model_id = minfo["model_id"]
         params_b = minfo.get("params_billion", 8.0)
-        local_model = str(model_dir.relative_to(root))
+        local_model = str(model_dir.resolve())
         info(f"Found model: {model_id}  ({params_b:.1f}B params)")
+    elif model_dir and model_dir.exists():
+        # MODEL_INFO.json missing but local folder exists — use absolute path
+        warn(f"No MODEL_INFO.json for '{args.model}' — using local folder path")
+        model_id = model_dir.name
+        params_b = 3.0
+        local_model = str(model_dir.resolve())
     else:
-        warn(f"No MODEL_INFO.json found for '{args.model}' — using name as HF ID")
+        warn(f"Model '{args.model}' not found locally — Axolotl will download from HF Hub")
         model_id = args.model
         params_b = 8.0
         local_model = args.model

@@ -35,3 +35,13 @@ logs/*.ndjson
 
 # W&B
 wandb/
+
+# Auto-generated per-run configs (ephemeral)
+configs/run_*
+
+# Per-run eval results (large, local only)
+eval_results/run_*
+eval_results/.lm_eval_*
+
+# Gradio cache
+.gradio/
