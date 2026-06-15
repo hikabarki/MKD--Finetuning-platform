@@ -170,6 +170,12 @@ for _fname in ("tokenizer.json", "tokenizer_config.json",
     _src = Path(base_path) / _fname
     if _src.exists():
         _sh.copy2(_src, Path(out_dir) / _fname)
+# Also copy processor files for VLMs (e.g. Nemotron-Omni, Qwen2-VL)
+for _fname in ("preprocessor_config.json", "processor_config.json",
+               "chat_template.json", "image_processing_config.json"):
+    _src = Path(base_path) / _fname
+    if _src.exists():
+        _sh.copy2(_src, Path(out_dir) / _fname)
 print("Merge complete.")
 """)
     try:

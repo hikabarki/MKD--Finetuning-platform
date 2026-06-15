@@ -267,11 +267,115 @@ def to_chatml_rows(rows: list[dict], instruction_col: str = "",
                 f"not found.\nAvailable columns: {available}")
             sys.exit(2)
 
+    # 11. LLaVA format — {"id":..., "image":"path.jpg", "conversations":[...]}
+    if "image" in keys and "conversations" in keys:
+        role_map = {"human": "user", "gpt": "assistant", "user": "user", "assistant": "assistant"}
+        out = []
+        for r in rows:
+            msgs = []
+            for turn in r.get("conversations", []):
+                role = role_map.get(str(turn.get("from", "")).lower(), "user")
+                content = str(turn.get("value", turn.get("content", ""))).replace("<image>", "").strip()
+                if content:
+                    msgs.append({"role": role, "content": content})
+            if len(msgs) >= 2:
+                row_out = {"messages": msgs}
+                if r.get("image"):
+                    row_out["images"] = [str(r["image"])]
+                out.append(row_out)
+        if out:
+            return out, "llava"
+
+    # 12. OpenAI vision format — content is a list with {"type":"image_url",...}
+    if "messages" in keys:
+        sample_msgs = sample.get("messages", [])
+        has_vision = any(
+            isinstance(m.get("content"), list) and
+            any(c.get("type") in ("image_url", "image") for c in m["content"] if isinstance(c, dict))
+            for m in sample_msgs
+        )
+        if has_vision:
+            out = []
+            for r in rows:
+                msgs, images = [], []
+                for m in r.get("messages", []):
+                    role = m.get("role", "user")
+                    content = m.get("content", "")
+                    if isinstance(content, list):
+                        texts, img_urls = [], []
+                        for c in content:
+                            if not isinstance(c, dict):
+                                texts.append(str(c))
+                                continue
+                            if c.get("type") == "text":
+                                texts.append(c.get("text", ""))
+                            elif c.get("type") == "image_url":
+                                url = c.get("image_url", {}).get("url", "")
+                                if url:
+                                    img_urls.append(url)
+                            elif c.get("type") == "image":
+                                img_urls.append(c.get("image", c.get("url", "")))
+                        content = " ".join(texts).strip()
+                        images.extend(img_urls)
+                    if content:
+                        msgs.append({"role": role, "content": content})
+                if len(msgs) >= 2:
+                    row_out = {"messages": msgs}
+                    if images:
+                        row_out["images"] = images
+                    out.append(row_out)
+            if out:
+                return out, "openai_vision"
+
+    # 13. Image-caption pairs — {"image": "path.jpg", "caption": "..."}
+    CAPTION_COLS = ["caption", "text", "description", "label", "title", "요약", "설명"]
+    cap_col = next((c for c in CAPTION_COLS if c in keys and c != "image"), None)
+    if "image" in keys and cap_col:
+        out = []
+        for r in rows:
+            img = r.get("image", "")
+            caption = str(r.get(cap_col, "")).strip()
+            if caption:
+                row_out = {"messages": [
+                    {"role": "user",      "content": "Describe this image."},
+                    {"role": "assistant", "content": caption},
+                ]}
+                if img:
+                    row_out["images"] = [str(img)]
+                out.append(row_out)
+        if out:
+            return out, f"image_caption ({cap_col})"
+
+    # 14. VQA format — {"image": "path.jpg", "question": "...", "answer": "..."}
+    VQA_Q = ["question", "query", "질문"]
+    VQA_A = ["answer", "answers", "response", "답변"]
+    vqa_q = next((c for c in VQA_Q if c in keys), None)
+    vqa_a = next((c for c in VQA_A if c in keys), None)
+    if "image" in keys and vqa_q and vqa_a:
+        out = []
+        for r in rows:
+            q   = str(r.get(vqa_q, "")).strip()
+            ans = r.get(vqa_a, "")
+            if isinstance(ans, list):
+                ans = ans[0] if ans else ""
+            ans = str(ans).strip()
+            if q and ans:
+                row_out = {"messages": [
+                    {"role": "user",      "content": q},
+                    {"role": "assistant", "content": ans},
+                ]}
+                if r.get("image"):
+                    row_out["images"] = [str(r["image"])]
+                out.append(row_out)
+        if out:
+            return out, f"vqa ({vqa_q}/{vqa_a})"
+
     # Nothing matched — show helpful error with available columns
     err(f"Unrecognized schema. Columns found: {sorted(keys)}")
     err("Supported formats: messages | conversations | instruction+output | "
         "prompt+completion | prompt+chosen+rejected | question+answer | "
-        "document+summary | aihub dialogues | function_call")
+        "document+summary | aihub dialogues | function_call | "
+        "llava | openai_vision | image_caption | vqa")
     err("Tip: use --instruction-col <col> --response-col <col> to map custom columns.")
     sys.exit(2)
 

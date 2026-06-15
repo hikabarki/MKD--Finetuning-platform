@@ -24,14 +24,97 @@ import matplotlib.ticker as mticker
 import pandas as pd
 
 # ── Chat model state (loaded lazily) ─────────────────────────────────────────
-_chat_model  = None
-_chat_tok    = None
-_chat_name   = None
+_chat_model     = None
+_chat_tok       = None   # AutoTokenizer (text) or AutoProcessor (vision)
+_chat_name      = None
+_chat_is_vision = False  # True when a VLM (image-capable) model is loaded
 
 # ── Project root ──────────────────────────────────────────────────────────────
 ROOT   = Path(os.environ.get("FT_PROJECT", Path(__file__).resolve().parent))
 SCRIPTS = ROOT / "scripts"
 PYTHON  = sys.executable
+
+# ── Multimodal / VLM helpers ──────────────────────────────────────────────────
+
+# Default base model for fine-tuning and Quick Start
+DEFAULT_BASE_MODEL = "nvidia/Nemotron-Nano-4B-Omni"
+DEFAULT_BASE_DIR   = "nvidia__nemotron-nano-4b-omni"   # local models/ dir name
+
+NEMOTRON_HF_ID = "nvidia/Nemotron-Nano-4B-Omni"
+
+
+def _is_vision_model(path: str) -> bool:
+    """True if the model directory has a vision processor config."""
+    p = Path(path)
+    return any((p / f).exists() for f in (
+        "preprocessor_config.json", "processor_config.json"))
+
+
+def _nvfp4_quant_config():
+    """BitsAndBytesConfig with FP4 on Blackwell GPUs (SM ≥ 9.x), else None.
+    Closest available mapping to NVIDIA NVFP4 inside transformers/bitsandbytes."""
+    try:
+        import torch
+        from transformers import BitsAndBytesConfig
+        if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 9:
+            return BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="fp4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+            )
+    except Exception:
+        pass
+    return None
+
+
+def _load_chat_model(model_path: str):
+    """Unified loader for text-only models and VLMs.
+    Returns (tokenizer_or_processor, model, is_vision)."""
+    import torch
+    from transformers import (AutoTokenizer, AutoProcessor,
+                               AutoModelForCausalLM, AutoModelForVision2Seq)
+    mp = Path(model_path)
+    is_vision = _is_vision_model(model_path)
+    bnb_cfg = _nvfp4_quant_config()
+    load_kw: dict = dict(device_map="auto", trust_remote_code=True, local_files_only=True)
+    if bnb_cfg:
+        load_kw["quantization_config"] = bnb_cfg
+    else:
+        load_kw["torch_dtype"] = torch.bfloat16
+
+    if is_vision:
+        tok = AutoProcessor.from_pretrained(
+            str(mp), trust_remote_code=True, local_files_only=True)
+        try:
+            model = AutoModelForVision2Seq.from_pretrained(str(mp), **load_kw)
+        except Exception:
+            model = AutoModelForCausalLM.from_pretrained(str(mp), **load_kw)
+    else:
+        tok = AutoTokenizer.from_pretrained(
+            str(mp), trust_remote_code=True, local_files_only=True)
+        model = AutoModelForCausalLM.from_pretrained(str(mp), **load_kw)
+    return tok, model, is_vision
+
+
+def _build_chat_inputs(messages: list, image=None):
+    """Build tensors for model.generate(). image is a PIL Image or None."""
+    global _chat_model, _chat_tok, _chat_is_vision
+    device = next(_chat_model.parameters()).device
+    if _chat_is_vision and image is not None:
+        # Replace last user turn with vision content list
+        vision_content = [{"type": "image", "image": image},
+                          {"type": "text", "text": messages[-1]["content"]}]
+        vision_msgs = messages[:-1] + [{"role": "user", "content": vision_content}]
+        text = _chat_tok.apply_chat_template(
+            vision_msgs, tokenize=False, add_generation_prompt=True)
+        inputs = _chat_tok(text=text, images=[image], return_tensors="pt").to(device)
+    else:
+        text = _chat_tok.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True)
+        enc = _chat_tok(text, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in enc.items()}
+    return inputs
 
 # ── ANSI → HTML terminal renderer ─────────────────────────────────────────────
 _ANSI_COLOR = {
@@ -1555,7 +1638,10 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
               </div>
             </div>
             """)
-            user_chatbot = gr.Chatbot(height=380, label="Chat with your fine-tuned model")
+            user_chatbot = gr.Chatbot(height=360, label="Chat with your fine-tuned model")
+            user_chat_image = gr.Image(
+                type="pil", label="Upload image (optional — for multimodal models)",
+                height=140, visible=True, scale=1)
             with gr.Row():
                 user_chat_input = gr.Textbox(
                     placeholder="Type your message and press Enter...",
@@ -1826,7 +1912,18 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
 
     def run_user_quickstart(dataset_choice, upload_file, model_name, test_mode=True, test_steps=50):
         dataset = "alpaca"
-        model   = "qwen__qwen2.5-7b-instruct"
+        # Prefer Nemotron if downloaded, fall back to Qwen 7B then 3B
+        _nemotron_path = ROOT / "models" / DEFAULT_BASE_DIR
+        _qwen7b_path   = ROOT / "models" / "qwen__qwen2.5-7b-instruct"
+        _qwen3b_path   = ROOT / "models" / "qwen__qwen2.5-3b-instruct"
+        if _nemotron_path.exists():
+            model = DEFAULT_BASE_DIR
+        elif _qwen7b_path.exists():
+            model = "qwen__qwen2.5-7b-instruct"
+        elif _qwen3b_path.exists():
+            model = "qwen__qwen2.5-3b-instruct"
+        else:
+            model = DEFAULT_BASE_DIR
         test_steps = int(test_steps or 50)
 
         # For test mode: create a tiny 100-row dataset to skip preprocessing wait
@@ -1942,12 +2039,12 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
         test_steps = int(test_steps or 50)
         epochs = int(epochs or 1)
         model_map = {
+            "Nemotron-Nano-4B-Omni": DEFAULT_BASE_DIR,
             "Qwen2.5-7B-Instruct": "qwen__qwen2.5-7b-instruct",
-            "Phi-3.5-mini-instruct": "phi-3.5-mini-instruct",
             "Qwen2.5-3B-Instruct": "qwen__qwen2.5-3b-instruct",
         }
         model_key = models_sel.split("  ")[0]
-        model = model_map.get(model_key, "qwen__qwen2.5-7b-instruct")
+        model = model_map.get(model_key, DEFAULT_BASE_DIR)
         ds_names = []
         for d in (datasets_sel or []):
             if "alpaca" in d: ds_names.append("alpaca")
@@ -2065,15 +2162,14 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
     )
 
     # Inline chat in Screen 4
-    def user_chat_send(message, history):
-        global _chat_model, _chat_tok, _chat_name
+    def user_chat_send(message, history, image=None):
+        global _chat_model, _chat_tok, _chat_name, _chat_is_vision
         if not message.strip():
             yield history or [], ""
             return
         history = list(history or [])
         if _chat_model is None:
             model_path = _user_last_model_path.get("path")
-            # Validate path has actual model files; fallback to newest valid export if not
             def _is_valid_model(p):
                 mp = Path(p) if p else None
                 return mp and mp.exists() and (mp / "tokenizer.json").exists() and (mp / "config.json").exists()
@@ -2090,23 +2186,11 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                 history.append({"role": "assistant", "content": "No trained model found. Please complete the training step first."})
                 yield history, ""
                 return
-            # Auto-load the model on first message
             history.append({"role": "user", "content": message})
-            history.append({"role": "assistant", "content": "⏳ Loading your model, please wait (this takes ~30–60 seconds)..."})
+            history.append({"role": "assistant", "content": "⏳ Loading your model, please wait (~30–60 s)..."})
             yield history, ""
             try:
-                from transformers import AutoTokenizer, AutoModelForCausalLM
-                import torch
-                mp = Path(model_path)
-                _chat_tok = AutoTokenizer.from_pretrained(str(mp), trust_remote_code=True, local_files_only=True)
-                try:
-                    _chat_model = AutoModelForCausalLM.from_pretrained(
-                        str(mp), device_map="auto", dtype=torch.bfloat16,
-                        trust_remote_code=False, local_files_only=True)
-                except Exception:
-                    _chat_model = AutoModelForCausalLM.from_pretrained(
-                        str(mp), device_map="auto", dtype=torch.bfloat16,
-                        trust_remote_code=True, local_files_only=True)
+                _chat_tok, _chat_model, _chat_is_vision = _load_chat_model(model_path)
                 _chat_name = model_path
                 history[-1]["content"] = "✓ Model loaded. Now answering your message..."
                 yield history, ""
@@ -2124,20 +2208,23 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                         content = " ".join(i.get("text", str(i)) for i in content)
                     msgs.append({"role": t["role"], "content": str(content)})
             msgs.append({"role": "user", "content": message})
-            text = _chat_tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-            ids  = _chat_tok(text, return_tensors="pt").input_ids.to(_chat_model.device)
+            inputs = _build_chat_inputs(msgs, image=image)
+            ids = inputs.get("input_ids", inputs.get("input_ids"))
             _eos_ids = [_chat_tok.eos_token_id]
-            _im_end = _chat_tok.convert_tokens_to_ids("<|im_end|>")
-            if _im_end and _im_end != _chat_tok.eos_token_id:
-                _eos_ids.append(_im_end)
+            try:
+                _im_end = _chat_tok.convert_tokens_to_ids("<|im_end|>")
+                if _im_end and _im_end != _chat_tok.eos_token_id:
+                    _eos_ids.append(_im_end)
+            except Exception:
+                pass
             with torch.no_grad():
-                out = _chat_model.generate(ids, max_new_tokens=256, do_sample=True,
-                                           temperature=0.7, top_p=0.9,
-                                           eos_token_id=_eos_ids,
-                                           pad_token_id=_chat_tok.eos_token_id)
+                out = _chat_model.generate(
+                    **inputs, max_new_tokens=256, do_sample=True,
+                    temperature=0.7, top_p=0.9,
+                    eos_token_id=_eos_ids,
+                    pad_token_id=_chat_tok.eos_token_id)
             reply = _chat_tok.decode(out[0][ids.shape[1]:], skip_special_tokens=True,
                                      clean_up_tokenization_spaces=False).strip()
-            # Convert byte-fallback tokens like <0x0A> → actual characters (Qwen/sentencepiece models)
             import re as _re
             reply = _re.sub(r'<0x([0-9A-Fa-f]{2})>',
                             lambda m: bytes([int(m.group(1), 16)]).decode('utf-8', errors='replace'),
@@ -2150,12 +2237,12 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
         yield history, ""
 
     user_send_btn.click(user_chat_send,
-                        inputs=[user_chat_input, user_chatbot],
+                        inputs=[user_chat_input, user_chatbot, user_chat_image],
                         outputs=[user_chatbot, user_chat_input], show_progress=False)
     user_chat_input.submit(user_chat_send,
-                           inputs=[user_chat_input, user_chatbot],
+                           inputs=[user_chat_input, user_chatbot, user_chat_image],
                            outputs=[user_chatbot, user_chat_input], show_progress=False)
-    user_clear_btn.click(lambda: [], outputs=user_chatbot)
+    user_clear_btn.click(lambda: ([], None), outputs=[user_chatbot, user_chat_image])
 
     # Publish from user mode
     user_publish_btn.click(
@@ -3084,7 +3171,11 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                             '<div style="color:#8b949e;font-size:12px;padding:8px 0;">No model loaded.</div>')
     
                     with gr.Column(scale=2):
-                        chatbot = gr.Chatbot(height=420)
+                        chatbot = gr.Chatbot(height=380)
+                        chat_image = gr.Image(
+                            type="pil",
+                            label="Upload image (optional — for vision models)",
+                            height=140)
                         with gr.Row():
                             chat_input = gr.Textbox(
                                 placeholder="Type your message...",
@@ -3094,45 +3185,31 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                         chat_clear = gr.Button("Clear conversation", size="sm", variant="secondary")
     
                 def load_model(model_name):
-                    global _chat_model, _chat_tok, _chat_name
+                    global _chat_model, _chat_tok, _chat_name, _chat_is_vision
                     if not model_name:
                         return '<div style="color:#f85149;padding:8px;">Select a model first.</div>'
-                    # Unload previous
                     if _chat_model is not None:
-                        del _chat_model
-                        _chat_model = None
+                        del _chat_model; _chat_model = None
                         import gc; gc.collect()
                         try:
                             import torch; torch.cuda.empty_cache()
                         except Exception:
                             pass
-    
-                    # Resolve the path (strips label suffix like "  [fine-tuned]")
+
                     resolved = resolve_chat_path(model_name)
                     model_path = Path(resolved)
                     if not model_path.exists():
                         model_path = ROOT / resolved
                     if not model_path.exists():
                         return f'<div style="color:#f85149;padding:8px;">Path not found: {resolved}</div>'
-    
+
                     try:
-                        from transformers import AutoTokenizer, AutoModelForCausalLM
-                        import torch
-                        _chat_tok = AutoTokenizer.from_pretrained(
-                            str(model_path), trust_remote_code=True, local_files_only=True)
-                        try:
-                            _chat_model = AutoModelForCausalLM.from_pretrained(
-                                str(model_path), device_map="auto",
-                                dtype=torch.bfloat16, trust_remote_code=False,
-                                local_files_only=True)
-                        except Exception:
-                            _chat_model = AutoModelForCausalLM.from_pretrained(
-                                str(model_path), device_map="auto",
-                                dtype=torch.bfloat16, trust_remote_code=True,
-                                local_files_only=True)
+                        _chat_tok, _chat_model, _chat_is_vision = _load_chat_model(str(model_path))
                         _chat_name = model_name
                         label = model_name.split("  [")[0]
-                        return f'<div style="color:#3fb950;font-weight:600;padding:8px;">Loaded: {label}</div>'
+                        tag = " (vision)" if _chat_is_vision else ""
+                        return (f'<div style="color:#3fb950;font-weight:600;padding:8px;">'
+                                f'Loaded: {label}{tag}</div>')
                     except Exception as e:
                         return f'<div style="color:#f85149;padding:8px;">Failed: {e}</div>'
     
@@ -3149,63 +3226,48 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                             pass
                     return '<div style="color:#8b949e;padding:8px;">Model unloaded. GPU memory freed.</div>'
     
-                def chat_respond(message, history, system_prompt, max_tokens):
-                    global _chat_model, _chat_tok
+                def chat_respond(message, history, system_prompt, max_tokens, image=None):
+                    global _chat_model, _chat_tok, _chat_is_vision
                     if not message.strip():
                         yield history or [], ""
                         return
-    
                     history = list(history or [])
-    
                     if _chat_model is None:
                         history.append({"role": "user",      "content": message})
                         history.append({"role": "assistant", "content": "No model loaded. Please load a model first."})
                         yield history, ""
                         return
-    
                     try:
                         import torch
-                        # Build messages for the model
                         def extract_text(content) -> str:
-                            """Gradio 6 stores content as str or [{'text':...,'type':'text'}]."""
                             if isinstance(content, str):
                                 return content
                             if isinstance(content, list):
-                                parts = []
-                                for item in content:
-                                    if isinstance(item, dict):
-                                        parts.append(item.get("text", str(item)))
-                                    else:
-                                        parts.append(str(item))
-                                return " ".join(parts)
+                                return " ".join(i.get("text", str(i)) if isinstance(i, dict) else str(i) for i in content)
                             return str(content)
-    
+
                         msgs = [{"role": "system", "content": system_prompt}]
                         for turn in history:
                             if isinstance(turn, dict):
-                                msgs.append({
-                                    "role": turn.get("role", "user"),
-                                    "content": extract_text(turn.get("content", "")),
-                                })
+                                msgs.append({"role": turn.get("role", "user"),
+                                             "content": extract_text(turn.get("content", ""))})
                         msgs.append({"role": "user", "content": message})
-    
-                        text = _chat_tok.apply_chat_template(
-                            msgs, tokenize=False, add_generation_prompt=True)
-                        enc = _chat_tok(text, return_tensors="pt").to(_chat_model.device)
-                        ids = enc.input_ids
-                        attn_mask = enc.attention_mask
+
+                        inputs = _build_chat_inputs(msgs, image=image)
+                        ids = inputs.get("input_ids")
                         _eos_ids = [_chat_tok.eos_token_id]
-                        _im_end = _chat_tok.convert_tokens_to_ids("<|im_end|>")
-                        if _im_end and _im_end != _chat_tok.eos_token_id:
-                            _eos_ids.append(_im_end)
+                        try:
+                            _im_end = _chat_tok.convert_tokens_to_ids("<|im_end|>")
+                            if _im_end and _im_end != _chat_tok.eos_token_id:
+                                _eos_ids.append(_im_end)
+                        except Exception:
+                            pass
                         with torch.no_grad():
                             out = _chat_model.generate(
-                                ids, attention_mask=attn_mask,
-                                max_new_tokens=max_tokens,
+                                **inputs, max_new_tokens=max_tokens,
                                 do_sample=True, temperature=0.7, top_p=0.9,
                                 eos_token_id=_eos_ids,
-                                pad_token_id=_chat_tok.eos_token_id,
-                            )
+                                pad_token_id=_chat_tok.eos_token_id)
                         reply = _chat_tok.decode(out[0][ids.shape[1]:], skip_special_tokens=True,
                                                  clean_up_tokenization_spaces=False).strip()
                         import re as _re
@@ -3219,16 +3281,16 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                     history.append({"role": "user",      "content": message})
                     history.append({"role": "assistant", "content": reply})
                     yield history, ""
-    
+
                 chat_load_btn.click(load_model, inputs=chat_model_dd, outputs=chat_status)
                 chat_unload_btn.click(unload_model, outputs=chat_status)
                 chat_send.click(chat_respond,
-                                inputs=[chat_input, chatbot, chat_system, chat_max_tokens],
+                                inputs=[chat_input, chatbot, chat_system, chat_max_tokens, chat_image],
                                 outputs=[chatbot, chat_input], show_progress=False)
                 chat_input.submit(chat_respond,
-                                  inputs=[chat_input, chatbot, chat_system, chat_max_tokens],
+                                  inputs=[chat_input, chatbot, chat_system, chat_max_tokens, chat_image],
                                   outputs=[chatbot, chat_input], show_progress=False)
-                chat_clear.click(lambda: [], outputs=chatbot)
+                chat_clear.click(lambda: ([], None), outputs=[chatbot, chat_image])
     
         # ── Footer ────────────────────────────────────────────────────────────────
         gr.HTML("""
