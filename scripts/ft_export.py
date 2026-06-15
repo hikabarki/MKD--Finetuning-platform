@@ -157,8 +157,19 @@ print("Saving merged model ...")
 merged.save_pretrained(str(out_dir), safe_serialization=True, max_shard_size="4GB")
 
 tok_src = str(ckpt_dir) if (ckpt_dir / "tokenizer.json").exists() else str(base_path)
-tok = AutoTokenizer.from_pretrained(tok_src, local_files_only=True)
+try:
+    tok = AutoTokenizer.from_pretrained(tok_src, trust_remote_code=True, local_files_only=True)
+except Exception:
+    tok = AutoTokenizer.from_pretrained(tok_src, local_files_only=True)
 tok.save_pretrained(str(out_dir))
+# Always overwrite tokenizer files from base model — Axolotl can corrupt them
+import shutil as _sh
+for _fname in ("tokenizer.json", "tokenizer_config.json",
+               "vocab.json", "merges.txt", "chat_template.jinja",
+               "special_tokens_map.json"):
+    _src = Path(base_path) / _fname
+    if _src.exists():
+        _sh.copy2(_src, Path(out_dir) / _fname)
 print("Merge complete.")
 """)
     try:

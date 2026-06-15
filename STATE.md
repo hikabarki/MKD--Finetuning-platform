@@ -1,11 +1,11 @@
 # STATE
 
-**Updated:** 2026-06-09 02:33 UTC by ft-cli
-**Phase:** 3 / Data Pipeline (cleaned)
-**Status:** ✓ Dataset 'alpaca' cleaned. Train=51390, Val=519.
+**Updated:** 2026-06-15 05:02 UTC by ft-cli
+**Phase:** 7 / Export complete
+**Status:** ✓ Export complete: /home/mkd-s002/fine-tune/ft-platform/exports/run_2026-06-15_0502
 
 ## Recent actions
-- ✅ Cleaned dataset 'alpaca'
+- ✅ Exported checkpoint run_2026-06-15_0502 → run_2026-06-15_0502
 
 ## Next action
-Eyeball datasets/alpaca/sample_100.jsonl, then add a base model: `ft add-model <hf-model-id>`
+Publish: `ft publish /home/mkd-s002/fine-tune/ft-platform/exports/run_2026-06-15_0502`

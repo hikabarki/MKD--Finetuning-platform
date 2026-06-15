@@ -6,7 +6,7 @@ Usage:
     python ft_clean_dataset.py <name> [options]
 
 Pipeline (in order):
-    schema validation → length filter → PII scrub → dedup → decontam → split → sample
+    schema validation → language ID → quality heuristics → length filter → PII scrub → dedup → decontam → split → sample
 
 Output:
     datasets/<name>/train.jsonl
@@ -64,6 +64,112 @@ def length_ok(row: dict, max_chars: int) -> bool:
         total = len(str(row.get("prompt"))) + len(row["chosen"]["content"]) + len(row["rejected"]["content"])
     # chars ≈ tokens*4 heuristic; we tokenize properly in `ft configure`
     return total <= max_chars
+
+
+# ---- Language identification ------------------------------------------------
+
+# Korean Hangul Unicode blocks (covers syllables, jamo, compatibility jamo)
+_HANGUL = re.compile(r"[가-힣ᄀ-ᇿ㄰-㆏ꥠ-꥿ힰ-퟿]")
+# CJK unified ideographs (Chinese/Japanese)
+_CJK    = re.compile(r"[一-鿿㐀-䶿]")
+
+
+def detect_lang(text: str) -> str:
+    """Return ISO 639-1 language code. Fast path: Unicode heuristic first,
+    then langdetect if installed, then 'unknown'."""
+    if not text.strip():
+        return "unknown"
+    # Heuristic: count script chars
+    total = max(len(text), 1)
+    ko_ratio = len(_HANGUL.findall(text)) / total
+    cjk_ratio = len(_CJK.findall(text)) / total
+    if ko_ratio > 0.05:
+        return "ko"
+    if cjk_ratio > 0.1:
+        return "zh"
+    try:
+        from langdetect import detect as _ld_detect, LangDetectException
+        try:
+            return _ld_detect(text[:500])
+        except LangDetectException:
+            return "unknown"
+    except ImportError:
+        pass
+    # Fallback: assume English if mostly ASCII
+    ascii_ratio = sum(1 for c in text if ord(c) < 128) / total
+    return "en" if ascii_ratio > 0.8 else "unknown"
+
+
+def tag_language(rows: list[dict]) -> list[dict]:
+    """Add __lang__ field to every row. Does not drop anything."""
+    out = []
+    for r in rows:
+        text = _row_text(r)[:800]
+        out.append({**r, "__lang__": detect_lang(text)})
+    return out
+
+
+def filter_language(rows: list[dict], keep_langs: list[str]) -> tuple[list[dict], dict]:
+    """Keep only rows whose __lang__ is in keep_langs. Returns (kept, report)."""
+    report: dict[str, int] = {}
+    kept = []
+    for r in rows:
+        lang = r.get("__lang__", "unknown")
+        report[lang] = report.get(lang, 0) + 1
+        if lang in keep_langs or "unknown" in keep_langs:
+            kept.append(r)
+    return kept, report
+
+
+# ---- Quality heuristics -----------------------------------------------------
+
+def _ngram_rep_ratio(text: str, n: int = 5) -> float:
+    """Fraction of n-grams that are duplicates. High = repetitive/degenerate text."""
+    words = text.split()
+    if len(words) < n + 1:
+        return 0.0
+    grams = [tuple(words[i:i+n]) for i in range(len(words) - n + 1)]
+    if not grams:
+        return 0.0
+    return 1.0 - len(set(grams)) / len(grams)
+
+
+def _garbled_ratio(text: str) -> float:
+    """Fraction of chars that look garbled: non-printable, replacement chars, etc."""
+    if not text:
+        return 0.0
+    bad = sum(1 for c in text if ord(c) < 32 and c not in "\n\t\r")
+    bad += text.count("�")   # Unicode replacement char
+    bad += text.count("\x00")
+    return bad / len(text)
+
+
+def quality_ok(row: dict, min_response_chars: int, max_rep_ratio: float,
+               max_garbled_ratio: float) -> tuple[bool, str]:
+    """Return (passes, reason_if_dropped)."""
+    if "messages" not in row:
+        return True, ""
+    msgs = row["messages"]
+
+    # 1. Min assistant response length
+    for m in msgs:
+        if m.get("role") == "assistant":
+            resp = m.get("content", "")
+            if len(resp.strip()) < min_response_chars:
+                return False, f"short_response ({len(resp.strip())} chars)"
+
+    # 2. Repetition ratio on full text
+    full = _row_text(row)
+    rep = _ngram_rep_ratio(full)
+    if rep > max_rep_ratio:
+        return False, f"repetitive (rep_ratio={rep:.2f})"
+
+    # 3. Garbled / encoding junk
+    garbled = _garbled_ratio(full)
+    if garbled > max_garbled_ratio:
+        return False, f"garbled (garbled_ratio={garbled:.3f})"
+
+    return True, ""
 
 
 _EMAIL = re.compile(r"\b[\w._%+-]+@[\w.-]+\.[A-Za-z]{2,}\b")
@@ -153,6 +259,21 @@ def main():
                     help="skip PII scrub (NOT recommended)")
     ap.add_argument("--no-dedup", action="store_true",
                     help="skip dedup (use only for tiny test datasets)")
+    # Language identification
+    ap.add_argument("--lang", default="",
+                    help="Comma-separated ISO 639-1 codes to keep, e.g. 'ko,en'. "
+                         "Empty = keep all (just tag). 'unknown' always kept when listed.")
+    ap.add_argument("--no-lang", action="store_true",
+                    help="skip language identification entirely")
+    # Quality heuristics
+    ap.add_argument("--min-response-chars", type=int, default=10,
+                    help="drop rows where assistant reply is shorter than this (default 10)")
+    ap.add_argument("--max-rep-ratio", type=float, default=0.4,
+                    help="drop rows where 5-gram repetition ratio exceeds this (default 0.4)")
+    ap.add_argument("--max-garbled-ratio", type=float, default=0.02,
+                    help="drop rows with this fraction of non-printable/junk chars (default 0.02)")
+    ap.add_argument("--no-quality", action="store_true",
+                    help="skip quality heuristic filtering")
     args = ap.parse_args()
 
     root = project_root()
@@ -173,6 +294,47 @@ def main():
     rows = [r for r in rows if schema_valid(r)]
     info(f"After schema validation: {len(rows)} rows")
     card["rows_after_schema"] = len(rows)
+
+    # Language identification
+    if not args.no_lang:
+        rows = tag_language(rows)
+        lang_counts: dict[str, int] = {}
+        for r in rows:
+            l = r.get("__lang__", "unknown")
+            lang_counts[l] = lang_counts.get(l, 0) + 1
+        info(f"Language distribution: {dict(sorted(lang_counts.items(), key=lambda x: -x[1]))}")
+        card["lang_distribution"] = lang_counts
+        if args.lang:
+            keep = [l.strip() for l in args.lang.split(",") if l.strip()]
+            rows, _ = filter_language(rows, keep)
+            info(f"After language filter (keep={keep}): {len(rows)} rows")
+            card["rows_after_lang_filter"] = len(rows)
+        # Strip internal tag before further processing
+        rows = [{k: v for k, v in r.items() if k != "__lang__"} for r in rows]
+
+    # Quality heuristics
+    if not args.no_quality:
+        quality_report = {"short_response": 0, "repetitive": 0, "garbled": 0}
+        kept = []
+        for r in rows:
+            ok_flag, reason = quality_ok(
+                r,
+                min_response_chars=args.min_response_chars,
+                max_rep_ratio=args.max_rep_ratio,
+                max_garbled_ratio=args.max_garbled_ratio,
+            )
+            if ok_flag:
+                kept.append(r)
+            else:
+                bucket = reason.split(" ")[0]
+                quality_report[bucket] = quality_report.get(bucket, 0) + 1
+        rows = kept
+        info(f"After quality heuristics: {len(rows)} rows. Dropped: {quality_report}")
+        card["rows_after_quality"] = len(rows)
+        card["quality_report"] = quality_report
+        (root / "eval_results").mkdir(exist_ok=True)
+        (root / "eval_results" / f"{args.name}_quality_report.json").write_text(
+            json.dumps(quality_report, indent=2))
 
     # Length
     rows = [r for r in rows if length_ok(r, args.max_chars)]

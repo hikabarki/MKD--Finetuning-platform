@@ -682,14 +682,13 @@ def save_model_card(name: str, content: str) -> str:
 # ── Evaluation helpers ────────────────────────────────────────────────────────
 
 def list_eval_runs() -> list[str]:
-    log_dir = ROOT / "logs"
-    if not log_dir.exists():
+    eval_dir = ROOT / "eval_results"
+    if not eval_dir.exists():
         return []
-    names = sorted(
-        [p.stem.replace("train_", "") for p in log_dir.glob("train_run_*.log")],
+    return sorted(
+        [p.name for p in eval_dir.iterdir() if p.is_dir()],
         reverse=True,
     )
-    return names
 
 
 def parse_training_log(run_name: str) -> dict:
@@ -957,6 +956,14 @@ button.stop, button[data-testid="stop"] {
   background: #3d1a1a !important; border: 1px solid #f85149 !important;
   color: #f85149 !important;
 }
+#land_dev_btn {
+  background: #0d1b2a !important; border: 1px solid #58a6ff !important;
+  color: #58a6ff !important; font-weight: 600 !important;
+}
+#land_dev_btn:hover {
+  background: #1a2d42 !important; border-color: #79c0ff !important;
+  color: #79c0ff !important;
+}
 
 /* ── Tabs ─────────────────────────────────────────────────────────────────── */
 .tab-nav { border-bottom: 1px solid #30363d !important; }
@@ -1133,15 +1140,18 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
           <p style="color:#8b949e;font-size:16px;margin:0 0 48px;">
             Fine-tune any LLM on your data — who are you?
           </p>
-          <div style="display:flex;gap:24px;justify-content:center;flex-wrap:wrap;max-width:760px;margin:0 auto;">
+          <!-- Two main cards — equal height via align-items:stretch -->
+          <div style="display:flex;gap:24px;justify-content:center;max-width:760px;
+                      margin:0 auto;align-items:stretch;">
 
             <div style="flex:1;min-width:280px;background:#161b22;border:1px solid #30363d;
-                        border-radius:12px;padding:32px;text-align:left;">
+                        border-radius:12px;padding:32px;text-align:left;
+                        display:flex;flex-direction:column;">
               <div style="font-size:24px;margin-bottom:10px;">&#9881;</div>
               <h2 style="margin:0 0 8px;color:#e6edf3;font-size:20px;">Developer</h2>
-              <p style="color:#8b949e;font-size:14px;line-height:1.6;margin:0 0 20px;">
-                Full control — custom configs, all 8 pipeline steps,
-                live metrics, eval benchmarks, advanced export.
+              <p style="color:#8b949e;font-size:14px;line-height:1.6;margin:0 0 20px;flex:1;">
+                Full control over training — custom configs, live metrics,
+                eval benchmarks, and advanced export.
               </p>
               <div style="padding:6px 12px;background:#21262d;border-radius:6px;
                           display:inline-block;color:#8b949e;font-size:12px;">
@@ -1150,10 +1160,11 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
             </div>
 
             <div style="flex:1;min-width:280px;background:#0d2a1a;border:1px solid #238636;
-                        border-radius:12px;padding:32px;text-align:left;">
+                        border-radius:12px;padding:32px;text-align:left;
+                        display:flex;flex-direction:column;">
               <div style="font-size:24px;margin-bottom:10px;">&#9654;</div>
               <h2 style="margin:0 0 8px;color:#e6edf3;font-size:20px;">General User</h2>
-              <p style="color:#8b949e;font-size:14px;line-height:1.6;margin:0 0 20px;">
+              <p style="color:#8b949e;font-size:14px;line-height:1.6;margin:0 0 20px;flex:1;">
                 Simple 3-step flow — pick a preset, upload data, click Start.
                 All settings pre-configured. No coding needed.
               </p>
@@ -1163,25 +1174,22 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
               </div>
             </div>
 
-            <div style="flex:1;min-width:280px;background:#0d1b2a;border:1px solid #1f6feb;
-                        border-radius:12px;padding:32px;text-align:left;">
-              <div style="font-size:24px;margin-bottom:10px;">&#128202;</div>
-              <h2 style="margin:0 0 8px;color:#e6edf3;font-size:20px;">Evaluation</h2>
-              <p style="color:#8b949e;font-size:14px;line-height:1.6;margin:0 0 20px;">
-                Compare your fine-tuned model vs the base model —
-                loss curves, perplexity, and before/after metrics table.
-              </p>
-              <div style="padding:6px 12px;background:#0d1b2a;border:1px solid #1f6feb;
-                          border-radius:6px;display:inline-block;color:#58a6ff;font-size:12px;">
-                View results after training
-              </div>
-            </div>
+          </div>
 
+          <!-- Evaluation — secondary link below the main cards -->
+          <div style="max-width:760px;margin:20px auto 0;text-align:center;">
+            <div style="display:inline-flex;align-items:center;gap:10px;
+                        background:#0d1b2a;border:1px solid #1f6feb;border-radius:8px;
+                        padding:12px 24px;">
+              <span style="font-size:16px;">&#128202;</span>
+              <span style="color:#8b949e;font-size:14px;">Already trained a model?</span>
+              <span style="color:#58a6ff;font-size:14px;font-weight:600;">View Evaluation →</span>
+            </div>
           </div>
         </div>
         """)
         with gr.Row():
-            land_dev_btn  = gr.Button("Enter as Developer",    variant="secondary", scale=1)
+            land_dev_btn  = gr.Button("Enter as Developer",    variant="secondary", scale=1, elem_id="land_dev_btn")
             land_user_btn = gr.Button("Enter as General User", variant="primary",   scale=1)
             land_eval_btn = gr.Button("View Evaluation",       variant="secondary", scale=1)
 
@@ -1330,9 +1338,18 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                 gr.HTML('<div style="height:4px;"></div>')
 
                 user_qs_test_mode = gr.Checkbox(
-                    label="Do a quick test run first (10 steps, about 1 minute)",
+                    label="Do a quick test run first",
                     value=True,
                     info="Recommended — confirms everything works before the full training run.",
+                )
+                user_qs_test_steps = gr.Number(
+                    label="Quick test steps",
+                    value=50,
+                    precision=0,
+                    minimum=10,
+                    maximum=500,
+                    info="Number of steps for the quick test. More steps = better evaluation metrics.",
+                    visible=True,
                 )
 
                 gr.HTML('<div style="height:20px;"></div>')
@@ -1433,6 +1450,27 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                 label="What should we call your model?",
                 placeholder="e.g.  my-assistant  or  support-bot")
 
+            gr.HTML('<div style="height:8px;"></div>')
+            with gr.Row():
+                user_cm_epochs = gr.Number(
+                    label="Epochs",
+                    value=1,
+                    precision=0,
+                    minimum=1,
+                    maximum=10,
+                    info="Full training epochs. 1 = fast (~1-3 hrs), 3 = thorough (~9 hrs).",
+                    scale=1,
+                )
+                user_cm_test_steps = gr.Number(
+                    label="Quick test steps",
+                    value=50,
+                    precision=0,
+                    minimum=10,
+                    maximum=500,
+                    info="Steps for the quick check before full training.",
+                    scale=1,
+                )
+
             gr.HTML('<div style="height:16px;"></div>')
             with gr.Row():
                 user_cm_back_btn  = gr.Button("← Back",        variant="secondary", scale=1)
@@ -1473,6 +1511,12 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
             """)
             user_progress_html = gr.HTML("")
             user_progress_out  = gr.HTML("", visible=False)
+
+            gr.HTML('<div style="margin-top:16px;color:#8b949e;font-size:12px;font-weight:600;'
+                    'letter-spacing:.05em;text-transform:uppercase;">GPU Status</div>')
+            user_gpu_html = gr.HTML(get_gpu_html())
+            user_gpu_timer = gr.Timer(value=5)
+            user_gpu_timer.tick(get_gpu_html, outputs=user_gpu_html)
 
         # Screen 4: Inline chat
         with gr.Group(visible=False) as user_screen4:
@@ -1526,7 +1570,14 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                 user_publish_btn = gr.Button("Publish to HuggingFace", size="sm", variant="primary")
             user_publish_repo = gr.Textbox(
                 label="HuggingFace repo  (fill in before publishing)",
-                placeholder="mkd-hika/my-fine-tuned-model",
+                placeholder="username/my-fine-tuned-model",
+                visible=False,
+            )
+            user_publish_token = gr.Textbox(
+                label="HuggingFace Write token",
+                placeholder="hf_xxxxxxxxxxxxxxxxxxxx",
+                type="password",
+                info="Get it at huggingface.co/settings/tokens → New token → Write",
                 visible=False,
             )
             user_publish_out = gr.HTML("")
@@ -1679,6 +1730,11 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
     user_qs_back_btn.click(lambda: show_screen4(True,False,False,False,False), outputs=_all_screens)
     user_cm_back_btn.click(lambda: show_screen4(True,False,False,False,False), outputs=_all_screens)
 
+    # Show/hide steps box based on test mode checkbox
+    user_qs_test_mode.change(
+        lambda v: gr.Number(visible=v),
+        inputs=user_qs_test_mode, outputs=user_qs_test_steps)
+
     # Show/hide file upload in Quick Start
     user_qs_dataset.change(
         lambda v: gr.File(visible="own data" in v.lower()),
@@ -1768,9 +1824,10 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
     _user_last_model_path = {"path": None}   # shared state for inline chat
     _user_training_proc   = {"proc": None}   # track subprocess for cancellation
 
-    def run_user_quickstart(dataset_choice, upload_file, model_name, test_mode=True):
+    def run_user_quickstart(dataset_choice, upload_file, model_name, test_mode=True, test_steps=50):
         dataset = "alpaca"
-        model   = "microsoft__phi-3.5-mini-instruct"
+        model   = "qwen__qwen2.5-7b-instruct"
+        test_steps = int(test_steps or 50)
 
         # For test mode: create a tiny 100-row dataset to skip preprocessing wait
         if test_mode:
@@ -1807,12 +1864,14 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
             cfg_path = ROOT / "configs" / configs[0]
             if cfg_path.exists():
                 txt = cfg_path.read_text()
+                import re as _re
                 if "max_steps" not in txt:
-                    import re as _re
-                    txt = _re.sub(r'^num_epochs:', 'max_steps: 10\nnum_epochs:', txt, flags=_re.MULTILINE)
-                    cfg_path.write_text(txt)
+                    txt = _re.sub(r'^num_epochs:', f'max_steps: {test_steps}\nnum_epochs:', txt, flags=_re.MULTILINE)
+                else:
+                    txt = _re.sub(r'^max_steps:.*', f'max_steps: {test_steps}', txt, flags=_re.MULTILINE)
+                cfg_path.write_text(txt)
 
-        for chunk in run_ft(["smoke-test", latest_cfg, "--steps=10"]):
+        for chunk in run_ft(["smoke-test", latest_cfg, f"--steps={test_steps}"]):
             yield build_progress_html("smoke"), chunk
 
         yield build_progress_html("train"), terminal_wrap("Starting training...")
@@ -1832,7 +1891,9 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
             '<span style="color:#3fb950;font-weight:bold;font-size:16px;">Complete!</span>')
 
 
-    def run_user_custommix(models_sel, datasets_sel, upload_file, model_name):
+    def run_user_custommix(models_sel, datasets_sel, upload_file, model_name, test_steps=50, epochs=1):
+        test_steps = int(test_steps or 50)
+        epochs = int(epochs or 1)
         # Resolve model: match display label back to folder name
         model = "microsoft__phi-3.5-mini-instruct"  # default
         label = (models_sel or "").split("  ")[0].strip().lower().replace("-", "").replace(".", "")
@@ -1851,7 +1912,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
 
         yield build_progress_html("configure"), terminal_wrap("Generating recipe...")
         cfg_args = ["configure", f"--model={model}", f"--dataset={dataset}",
-                    "--quantize=4bit", "--epochs=3", "--lr=2e-4"]
+                    "--quantize=4bit", f"--epochs={epochs}", "--lr=2e-4"]
         for chunk in run_ft(cfg_args): yield build_progress_html("configure"), chunk
 
         configs = list_configs()
@@ -1877,7 +1938,9 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
         yield build_progress_html("done"), terminal_wrap(
             '<span style="color:#3fb950;font-weight:bold;font-size:16px;">Complete!</span>')
 
-    def run_user_custommix(models_sel, datasets_sel, upload_file, model_name):
+    def run_user_custommix(models_sel, datasets_sel, upload_file, model_name, test_steps=50, epochs=1):
+        test_steps = int(test_steps or 50)
+        epochs = int(epochs or 1)
         model_map = {
             "Qwen2.5-7B-Instruct": "qwen__qwen2.5-7b-instruct",
             "Phi-3.5-mini-instruct": "phi-3.5-mini-instruct",
@@ -1894,7 +1957,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
 
         yield build_progress_html("configure"), terminal_wrap("Generating recipe..."), gr.Row(visible=False)
         cfg_args = ["configure", f"--model={model}", f"--dataset={dataset}",
-                    "--quantize=4bit", "--epochs=3", "--lr=2e-4"]
+                    "--quantize=4bit", f"--epochs={epochs}", "--lr=2e-4"]
         for chunk in run_ft(cfg_args):
             yield build_progress_html("configure"), chunk, gr.Row(visible=False)
 
@@ -1905,7 +1968,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
 
         latest_cfg = f"configs/{configs[0]}"
         yield build_progress_html("smoke"), terminal_wrap("Running smoke test..."), gr.Row(visible=False)
-        for chunk in run_ft(["smoke-test", latest_cfg, "--steps=20"]):
+        for chunk in run_ft(["smoke-test", latest_cfg, f"--steps={test_steps}"]):
             yield build_progress_html("smoke"), chunk, gr.Row(visible=False)
 
         yield build_progress_html("train"), terminal_wrap("Training started..."), gr.Row(visible=False)
@@ -1950,7 +2013,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
     ).then(show_cancel_btn, outputs=_btn_outs
     ).then(
         run_user_quickstart,
-        inputs=[user_qs_dataset, user_qs_file, user_qs_name, user_qs_test_mode],
+        inputs=[user_qs_dataset, user_qs_file, user_qs_name, user_qs_test_mode, user_qs_test_steps],
         outputs=[user_progress_html, user_progress_out],
         show_progress=False,
     ).then(show_home_btn, outputs=_btn_outs
@@ -1961,7 +2024,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
     ).then(show_cancel_btn, outputs=_btn_outs
     ).then(
         run_user_custommix,
-        inputs=[user_cm_model, user_cm_dataset, user_cm_file, user_cm_name],
+        inputs=[user_cm_model, user_cm_dataset, user_cm_file, user_cm_name, user_cm_test_steps, user_cm_epochs],
         outputs=[user_progress_html, user_progress_out],
         show_progress=False,
     ).then(show_home_btn, outputs=_btn_outs
@@ -2003,15 +2066,54 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
 
     # Inline chat in Screen 4
     def user_chat_send(message, history):
+        global _chat_model, _chat_tok, _chat_name
         if not message.strip():
             yield history or [], ""
             return
         history = list(history or [])
         if _chat_model is None:
+            model_path = _user_last_model_path.get("path")
+            # Validate path has actual model files; fallback to newest valid export if not
+            def _is_valid_model(p):
+                mp = Path(p) if p else None
+                return mp and mp.exists() and (mp / "tokenizer.json").exists() and (mp / "config.json").exists()
+            if not _is_valid_model(model_path):
+                exports = list_exports()
+                model_path = None
+                for exp in exports:
+                    candidate = ROOT / "exports" / exp / "merged"
+                    if _is_valid_model(str(candidate)):
+                        model_path = str(candidate)
+                        break
+            if not model_path:
+                history.append({"role": "user", "content": message})
+                history.append({"role": "assistant", "content": "No trained model found. Please complete the training step first."})
+                yield history, ""
+                return
+            # Auto-load the model on first message
             history.append({"role": "user", "content": message})
-            history.append({"role": "assistant", "content": "Model not loaded yet. Please wait or try again."})
+            history.append({"role": "assistant", "content": "⏳ Loading your model, please wait (this takes ~30–60 seconds)..."})
             yield history, ""
-            return
+            try:
+                from transformers import AutoTokenizer, AutoModelForCausalLM
+                import torch
+                mp = Path(model_path)
+                _chat_tok = AutoTokenizer.from_pretrained(str(mp), trust_remote_code=True, local_files_only=True)
+                try:
+                    _chat_model = AutoModelForCausalLM.from_pretrained(
+                        str(mp), device_map="auto", dtype=torch.bfloat16,
+                        trust_remote_code=False, local_files_only=True)
+                except Exception:
+                    _chat_model = AutoModelForCausalLM.from_pretrained(
+                        str(mp), device_map="auto", dtype=torch.bfloat16,
+                        trust_remote_code=True, local_files_only=True)
+                _chat_name = model_path
+                history[-1]["content"] = "✓ Model loaded. Now answering your message..."
+                yield history, ""
+            except Exception as e:
+                history[-1]["content"] = f"Failed to load model: {e}"
+                yield history, ""
+                return
         try:
             import torch
             msgs = [{"role": "system", "content": "You are a helpful assistant."}]
@@ -2024,11 +2126,23 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
             msgs.append({"role": "user", "content": message})
             text = _chat_tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
             ids  = _chat_tok(text, return_tensors="pt").input_ids.to(_chat_model.device)
+            _eos_ids = [_chat_tok.eos_token_id]
+            _im_end = _chat_tok.convert_tokens_to_ids("<|im_end|>")
+            if _im_end and _im_end != _chat_tok.eos_token_id:
+                _eos_ids.append(_im_end)
             with torch.no_grad():
                 out = _chat_model.generate(ids, max_new_tokens=256, do_sample=True,
                                            temperature=0.7, top_p=0.9,
+                                           eos_token_id=_eos_ids,
                                            pad_token_id=_chat_tok.eos_token_id)
-            reply = _chat_tok.decode(out[0][ids.shape[1]:], skip_special_tokens=True).strip()
+            reply = _chat_tok.decode(out[0][ids.shape[1]:], skip_special_tokens=True,
+                                     clean_up_tokenization_spaces=False).strip()
+            # Convert byte-fallback tokens like <0x0A> → actual characters (Qwen/sentencepiece models)
+            import re as _re
+            reply = _re.sub(r'<0x([0-9A-Fa-f]{2})>',
+                            lambda m: bytes([int(m.group(1), 16)]).decode('utf-8', errors='replace'),
+                            reply)
+            reply = reply.replace("<|im_end|>", "").replace("<|im_start|>", "").strip()
         except Exception as e:
             reply = f"Error: {e}"
         history.append({"role": "user", "content": message})
@@ -2045,17 +2159,44 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
 
     # Publish from user mode
     user_publish_btn.click(
-        lambda: gr.Textbox(visible=True), outputs=user_publish_repo)
+        lambda: (gr.Textbox(visible=True), gr.Textbox(visible=True)),
+        outputs=[user_publish_repo, user_publish_token])
 
-    def do_user_publish(repo):
-        exports = list_exports()
-        if not exports or not repo.strip():
-            yield terminal_wrap('<span style="color:#f85149;">Enter a repo name first.</span>')
+    def do_user_publish(repo, token):
+        if not repo or not repo.strip():
+            yield terminal_wrap('<span style="color:#f85149;">Enter a HuggingFace repo name first.</span>')
             return
-        yield from run_ft(["publish", f"exports/{exports[0]}", "--hf-repo", repo.strip(),
+        if not token or not token.strip():
+            yield terminal_wrap('<span style="color:#f85149;">Enter your HuggingFace Write token first.</span>')
+            return
+        # Find newest valid export
+        best_export = None
+        for exp in list_exports():
+            candidate = ROOT / "exports" / exp / "merged"
+            if candidate.exists() and (candidate / "tokenizer.json").exists() and (candidate / "config.json").exists():
+                best_export = exp
+                break
+        if not best_export:
+            yield terminal_wrap('<span style="color:#f85149;">No valid exported model found. Complete training first.</span>')
+            return
+        # Auto-fill MODEL_CARD.md placeholders so publish doesn't block
+        import os as _os
+        _os.environ["HF_TOKEN"] = token.strip()
+        _os.environ["HUGGING_FACE_HUB_TOKEN"] = token.strip()
+        card_path = ROOT / "exports" / best_export / "MODEL_CARD.md"
+        if card_path.exists():
+            txt = card_path.read_text()
+            txt = txt.replace("{filled by user — describe what this model is for}",
+                              "General-purpose instruction-following model fine-tuned by MKD Fine-Tuning Platform.")
+            txt = txt.replace("{filled by user — describe known limitations}",
+                              "May inherit limitations of the base model. Evaluate before production use.")
+            txt = txt.replace("{repo-name}", repo.strip())
+            txt = txt.replace("{optional}", "")
+            card_path.write_text(txt)
+        yield from run_ft(["publish", f"exports/{best_export}", "--hf-repo", repo.strip(),
                            "--acknowledge-contamination", "--accept-base-license"])
 
-    user_publish_btn.click(do_user_publish, inputs=user_publish_repo,
+    user_publish_btn.click(do_user_publish, inputs=[user_publish_repo, user_publish_token],
                            outputs=user_publish_out, show_progress=False)
 
     with dev_content_group:
@@ -2617,78 +2758,83 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                     inputs=clean_dd, outputs=cfg_ds,
                 )
 
+                # Cross-tab: Tab 1 "Use selected" → auto-fill cfg_ds in Tab 4
+                existing_ds_use.click(
+                    lambda ds_name: gr.Dropdown(value=ds_name),
+                    inputs=clean_dd, outputs=cfg_ds,
+                )
+
             # ── 5 · Train ─────────────────────────────────────────────────────────
             with gr.Tab("5 · Train"):
-                gr.HTML('<h3 style="color:#e6edf3;margin:0 0 4px;">Smoke test → Full training</h3>'
-                        '<p style="color:#8b949e;font-size:13px;margin:0 0 16px;">'
-                        'Always run smoke test first · trains via Axolotl · live watchdog for NaN/OOM</p>')
-                with gr.Row():
-                    train_cfg_dd = gr.Dropdown(label="Recipe", choices=list_configs(),
-                                                allow_custom_value=True, scale=3)
-                    gr.Button("↺", size="sm", variant="secondary", scale=0).click(
-                        lambda: gr.Dropdown(choices=list_configs()), outputs=train_cfg_dd)
-    
-                gr.HTML("""
-                <div style="background:#161b22;border:1px solid #d29922;border-radius:8px;
-                            padding:10px 16px;margin-bottom:12px;font-size:13px;color:#d29922;">
-                  !  Always run <strong>Smoke Test</strong> before full training.
-                  It confirms memory, loss shape, and checkpoint save/load — takes ~2 min.
-                </div>
-                """)
-                smoke_steps = gr.Slider(
-                    minimum=10, maximum=200, value=50, step=10,
-                    label="Smoke test steps  (more steps = more confidence, longer wait)",
-                )
-                gr.HTML('<p style="color:#8b949e;font-size:12px;margin:-8px 0 12px;">'
-                        '10 steps ≈ 30 sec · 50 steps ≈ 2 min · 200 steps ≈ 8 min</p>')
-                with gr.Row():
-                    smoke_btn  = gr.Button("Smoke Test",         variant="secondary", scale=1)
-                    train_btn  = gr.Button("Start Full Training", variant="primary",   scale=2)
+                def _recipe_label_html():
+                    cfg = list_configs()[0] if list_configs() else "none — run Configure first"
+                    return (f'<div style="color:#8b949e;font-size:13px;margin-bottom:12px;">'
+                            f'Using recipe: <span style="color:#58a6ff;font-weight:600;">{cfg}</span></div>')
+
+                train_recipe_label = gr.HTML(value=_recipe_label_html())
 
                 with gr.Row():
+                    smoke_steps = gr.Number(
+                        label="Smoke test steps", value=50, precision=0,
+                        minimum=10, maximum=200,
+                        info="10 ≈ 30 sec · 50 ≈ 2 min · 200 ≈ 8 min", scale=1,
+                    )
                     train_max_steps = gr.Number(
-                        label="Max steps  (leave 0 for full run based on epochs)",
-                        value=0, precision=0, minimum=0, scale=2,
-                        info="e.g. 200 for a quick test · 0 = run all epochs",
+                        label="Max training steps (0 = run all epochs)",
+                        value=0, precision=0, minimum=0, scale=1,
+                        info="e.g. 200 for a quick test · 0 = use epochs from Configure",
                     )
 
-                train_out = gr.HTML(terminal_wrap(""))
-    
-                gr.HTML('<div style="border-top:1px solid #30363d;margin:16px 0;"></div>')
-                gr.HTML('<h4 style="color:#c9d1d9;margin:0 0 10px;">Live training monitor</h4>')
                 with gr.Row():
-                    log_dd  = gr.Dropdown(label="Run", choices=list_checkpoints(),
-                                           allow_custom_value=True, scale=3)
-                    log_ref = gr.Button("↺ Refresh", size="sm", variant="secondary", scale=0)
-    
-                metrics_out = gr.HTML("")
-                log_out = gr.HTML(terminal_wrap(""))
-    
-                # Auto-refresh metrics every 10s when training is active
-                metrics_timer = gr.Timer(value=10)
-                metrics_timer.tick(
-                    lambda r: (get_metrics_html(r), read_log(r)),
-                    inputs=log_dd, outputs=[metrics_out, log_out],
-                )
-    
-                def do_smoke(c, steps):
-                    yield from run_ft(["smoke-test", f"configs/{c}",
-                                       "--steps", str(int(steps))])
-    
-                def do_train(c, max_steps):
+                    smoke_btn      = gr.Button("Smoke Test",         variant="secondary", scale=1)
+                    train_btn      = gr.Button("Start Full Training", variant="primary",   scale=2)
+                    dev_cancel_btn = gr.Button("Cancel",              variant="stop",      scale=0, visible=False)
+
+                train_out = gr.HTML(terminal_wrap(""))
+
+                def _latest_config():
+                    cfgs = list_configs()
+                    return cfgs[0] if cfgs else ""
+
+                def do_smoke(steps):
+                    c = _latest_config()
+                    if not c:
+                        yield gr.Button(visible=False), terminal_wrap(
+                            '<span style="color:#f85149;">No recipe found — run Configure first.</span>')
+                        return
+                    yield gr.Button(visible=True), terminal_wrap(f"Running smoke test with {c}...")
+                    for chunk in run_ft(["smoke-test", f"configs/{c}", "--steps", str(int(steps))]):
+                        yield gr.Button(visible=True), chunk
+                    yield gr.Button(visible=False), chunk
+
+                def do_train(max_steps):
+                    c = _latest_config()
+                    if not c:
+                        yield gr.Button(visible=False), terminal_wrap(
+                            '<span style="color:#f85149;">No recipe found — run Configure first.</span>')
+                        return
                     cmd = ["train", f"configs/{c}"]
                     if int(max_steps or 0) > 0:
                         cmd += ["--max-steps", str(int(max_steps))]
-                    yield from run_ft(cmd)
+                    chunk = ""
+                    yield gr.Button(visible=True), terminal_wrap(f"Starting training with {c}...")
+                    for chunk in run_ft(cmd):
+                        yield gr.Button(visible=True), chunk
+                    yield gr.Button(visible=False), chunk
 
-                smoke_btn.click(do_smoke, inputs=[train_cfg_dd, smoke_steps],
-                                outputs=train_out, show_progress=False)
-                train_btn.click(do_train, inputs=[train_cfg_dd, train_max_steps],
-                                outputs=train_out, show_progress=False)
-                log_ref.click(lambda r: (get_metrics_html(r), read_log(r)),
-                              inputs=log_dd, outputs=[metrics_out, log_out])
-                log_dd.change(lambda r: (get_metrics_html(r), read_log(r)),
-                              inputs=log_dd, outputs=[metrics_out, log_out])
+                def dev_cancel():
+                    import subprocess as _sp
+                    _sp.run(["pkill", "-f", "axolotl.cli.train"], capture_output=True)
+                    _sp.run(["pkill", "-f", "ft_train.py"],       capture_output=True)
+                    _sp.run(["pkill", "-f", "ft_smoke_test.py"],  capture_output=True)
+                    return gr.Button(visible=False), terminal_wrap(
+                        '<span style="color:#f85149;font-weight:600;">Training cancelled.</span>')
+
+                smoke_btn.click(do_smoke, inputs=[smoke_steps],
+                                outputs=[dev_cancel_btn, train_out], show_progress=False)
+                train_btn.click(do_train, inputs=[train_max_steps],
+                                outputs=[dev_cancel_btn, train_out], show_progress=False)
+                dev_cancel_btn.click(dev_cancel, outputs=[dev_cancel_btn, train_out])
     
             # ── 6 · Eval ──────────────────────────────────────────────────────────
             with gr.Tab("6 · Eval"):
@@ -2846,6 +2992,10 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                             pub_ref = gr.Button("↺", size="sm", variant="secondary", scale=0)
                         hf_repo = gr.Textbox(label="HuggingFace repo",
                                               placeholder="mkd-hika/qwen2.5-7b-alpaca")
+                        hf_token = gr.Textbox(label="HuggingFace Write token",
+                                               placeholder="hf_xxxxxxxxxxxxxxxxxxxx",
+                                               type="password",
+                                               info="Get it at huggingface.co/settings/tokens → New token → Write")
                         gh_repo = gr.Textbox(label="GitHub repo  (optional)",
                                               placeholder="mkd-hika/qwen2.5-7b-alpaca")
                         gr.HTML("""
@@ -2862,14 +3012,26 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                         pub_out = gr.HTML(terminal_wrap(""))
     
                         pub_ref.click(lambda: gr.Dropdown(choices=list_exports()), outputs=pub_dd)
-                        def do_publish(exp, hf, gh, ack, lic):
-                            args = ["publish", f"exports/{exp}", "--hf-repo", hf]
-                            if gh.strip(): args += ["--github-repo", gh]
+                        def do_publish(exp, hf, token, gh, ack, lic):
+                            if not hf or not hf.strip():
+                                yield terminal_wrap('<span style="color:#f85149;font-weight:600;">✗ HuggingFace repo name is required — e.g. mkd-hika/qwen2.5-7b-alpaca</span>')
+                                return
+                            if "/" not in hf.strip():
+                                yield terminal_wrap('<span style="color:#f85149;font-weight:600;">✗ Repo must be in format: username/repo-name</span>')
+                                return
+                            if not token or not token.strip():
+                                yield terminal_wrap('<span style="color:#f85149;font-weight:600;">✗ HuggingFace Write token is required — get it at huggingface.co/settings/tokens</span>')
+                                return
+                            import os as _os
+                            _os.environ["HF_TOKEN"] = token.strip()
+                            _os.environ["HUGGING_FACE_HUB_TOKEN"] = token.strip()
+                            args = ["publish", f"exports/{exp}", "--hf-repo", hf.strip()]
+                            if gh.strip(): args += ["--github-repo", gh.strip()]
                             if ack: args.append("--acknowledge-contamination")
                             if lic: args.append("--accept-base-license")
                             yield from run_ft(args)
-    
-                        pub_btn.click(do_publish, inputs=[pub_dd, hf_repo, gh_repo, pub_ack, pub_lic],
+
+                        pub_btn.click(do_publish, inputs=[pub_dd, hf_repo, hf_token, gh_repo, pub_ack, pub_lic],
                                       outputs=pub_out, show_progress=False)
     
             # ── 8 · Chat ──────────────────────────────────────────────────────────
@@ -2957,12 +3119,17 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                         from transformers import AutoTokenizer, AutoModelForCausalLM
                         import torch
                         _chat_tok = AutoTokenizer.from_pretrained(
-                            str(model_path), trust_remote_code=False, local_files_only=True)
-                        _chat_model = AutoModelForCausalLM.from_pretrained(
-                            str(model_path), device_map="auto",
-                            torch_dtype=torch.bfloat16, trust_remote_code=False,
-                            local_files_only=True,
-                        )
+                            str(model_path), trust_remote_code=True, local_files_only=True)
+                        try:
+                            _chat_model = AutoModelForCausalLM.from_pretrained(
+                                str(model_path), device_map="auto",
+                                dtype=torch.bfloat16, trust_remote_code=False,
+                                local_files_only=True)
+                        except Exception:
+                            _chat_model = AutoModelForCausalLM.from_pretrained(
+                                str(model_path), device_map="auto",
+                                dtype=torch.bfloat16, trust_remote_code=True,
+                                local_files_only=True)
                         _chat_name = model_name
                         label = model_name.split("  [")[0]
                         return f'<div style="color:#3fb950;font-weight:600;padding:8px;">Loaded: {label}</div>'
@@ -3024,17 +3191,31 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
     
                         text = _chat_tok.apply_chat_template(
                             msgs, tokenize=False, add_generation_prompt=True)
-                        ids = _chat_tok(text, return_tensors="pt").input_ids.to(_chat_model.device)
+                        enc = _chat_tok(text, return_tensors="pt").to(_chat_model.device)
+                        ids = enc.input_ids
+                        attn_mask = enc.attention_mask
+                        _eos_ids = [_chat_tok.eos_token_id]
+                        _im_end = _chat_tok.convert_tokens_to_ids("<|im_end|>")
+                        if _im_end and _im_end != _chat_tok.eos_token_id:
+                            _eos_ids.append(_im_end)
                         with torch.no_grad():
                             out = _chat_model.generate(
-                                ids, max_new_tokens=max_tokens,
+                                ids, attention_mask=attn_mask,
+                                max_new_tokens=max_tokens,
                                 do_sample=True, temperature=0.7, top_p=0.9,
+                                eos_token_id=_eos_ids,
                                 pad_token_id=_chat_tok.eos_token_id,
                             )
-                        reply = _chat_tok.decode(out[0][ids.shape[1]:], skip_special_tokens=True).strip()
+                        reply = _chat_tok.decode(out[0][ids.shape[1]:], skip_special_tokens=True,
+                                                 clean_up_tokenization_spaces=False).strip()
+                        import re as _re
+                        reply = _re.sub(r'<0x([0-9A-Fa-f]{2})>',
+                                        lambda m: bytes([int(m.group(1), 16)]).decode('utf-8', errors='replace'),
+                                        reply)
+                        reply = reply.replace("<|im_end|>", "").replace("<|im_start|>", "").strip()
                     except Exception as e:
                         reply = f"Error: {e}"
-    
+
                     history.append({"role": "user",      "content": message})
                     history.append({"role": "assistant", "content": reply})
                     yield history, ""
