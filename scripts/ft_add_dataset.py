@@ -76,7 +76,8 @@ def classify_source(src: str) -> tuple[str, str]:
 # ---- Format detection & conversion -----------------------------------------
 
 def to_chatml_rows(rows: list[dict], instruction_col: str = "",
-                   response_col: str = "") -> tuple[list[dict], str]:
+                   response_col: str = "",
+                   base_dir: "Path | None" = None) -> tuple[list[dict], str]:
     """Detect schema and convert to ChatML.
 
     Returns (chatml_rows, detected_format).
@@ -86,6 +87,19 @@ def to_chatml_rows(rows: list[dict], instruction_col: str = "",
         sys.exit(2)
     sample = rows[0]
     keys = set(sample.keys())
+
+    def _resolve_img(img_path: str) -> str:
+        """Resolve a relative image path to absolute using base_dir."""
+        if not img_path:
+            return img_path
+        p = Path(img_path)
+        if p.is_absolute():
+            return img_path
+        if base_dir is not None:
+            candidate = base_dir / p
+            if candidate.exists():
+                return str(candidate.resolve())
+        return img_path
 
     # 1. Already ChatML
     if "messages" in keys and isinstance(sample["messages"], list):
@@ -267,6 +281,23 @@ def to_chatml_rows(rows: list[dict], instruction_col: str = "",
                 f"not found.\nAvailable columns: {available}")
             sys.exit(2)
 
+    # 10.5 Audio transcript — rows with "transcript"/"text" alongside audio metadata
+    AUDIO_META_COLS = ["audio", "audio_path", "file", "filename", "path", "wav", "mp3"]
+    AUDIO_TEXT_COLS = ["transcript", "transcription", "text", "content"]
+    audio_col = next((c for c in AUDIO_META_COLS if c in keys), None)
+    text_col   = next((c for c in AUDIO_TEXT_COLS if c in keys), None)
+    if audio_col and text_col:
+        out = []
+        for r in rows:
+            transcript = str(r.get(text_col, "")).strip()
+            if transcript:
+                out.append({"messages": [
+                    {"role": "user",      "content": "Transcribe this audio."},
+                    {"role": "assistant", "content": transcript},
+                ]})
+        if out:
+            return out, f"audio_transcript ({text_col})"
+
     # 11. LLaVA format — {"id":..., "image":"path.jpg", "conversations":[...]}
     if "image" in keys and "conversations" in keys:
         role_map = {"human": "user", "gpt": "assistant", "user": "user", "assistant": "assistant"}
@@ -281,7 +312,7 @@ def to_chatml_rows(rows: list[dict], instruction_col: str = "",
             if len(msgs) >= 2:
                 row_out = {"messages": msgs}
                 if r.get("image"):
-                    row_out["images"] = [str(r["image"])]
+                    row_out["images"] = [_resolve_img(str(r["image"]))]
                 out.append(row_out)
         if out:
             return out, "llava"
@@ -333,7 +364,7 @@ def to_chatml_rows(rows: list[dict], instruction_col: str = "",
     if "image" in keys and cap_col:
         out = []
         for r in rows:
-            img = r.get("image", "")
+            img     = _resolve_img(str(r.get("image", "")))
             caption = str(r.get(cap_col, "")).strip()
             if caption:
                 row_out = {"messages": [
@@ -341,14 +372,15 @@ def to_chatml_rows(rows: list[dict], instruction_col: str = "",
                     {"role": "assistant", "content": caption},
                 ]}
                 if img:
-                    row_out["images"] = [str(img)]
+                    row_out["images"] = [img]
                 out.append(row_out)
         if out:
             return out, f"image_caption ({cap_col})"
 
     # 14. VQA format — {"image": "path.jpg", "question": "...", "answer": "..."}
     VQA_Q = ["question", "query", "질문"]
-    VQA_A = ["answer", "answers", "response", "답변"]
+    VQA_A = ["answer", "answers", "multiple_choice_answer", "correct_answer",
+             "response", "답변", "정답"]
     vqa_q = next((c for c in VQA_Q if c in keys), None)
     vqa_a = next((c for c in VQA_A if c in keys), None)
     if "image" in keys and vqa_q and vqa_a:
@@ -365,7 +397,7 @@ def to_chatml_rows(rows: list[dict], instruction_col: str = "",
                     {"role": "assistant", "content": ans},
                 ]}
                 if r.get("image"):
-                    row_out["images"] = [str(r["image"])]
+                    row_out["images"] = [_resolve_img(str(r["image"]))]
                 out.append(row_out)
         if out:
             return out, f"vqa ({vqa_q}/{vqa_a})"
@@ -390,14 +422,40 @@ def _as_text(x):
 
 def download_hf(ds_id: str, dest: Path) -> list[dict]:
     info(f"Downloading HuggingFace dataset: {ds_id}")
-    from datasets import load_dataset       # heavy import, do it lazily
+    from datasets import load_dataset
     ds = load_dataset(ds_id)
-    # Prefer 'train' if available, else first split
     split = "train" if "train" in ds else next(iter(ds))
     info(f"Using split: {split}  ({len(ds[split])} rows)")
-    rows = [dict(r) for r in ds[split]]
+
+    # Save PIL Images to disk so image-path columns work in vl_trainer
+    img_dir = dest / "images"
+    raw_rows = list(ds[split])
+    rows: list[dict] = []
+    pil_cols: list[str] = []
+
+    for i, r in enumerate(raw_rows):
+        d = dict(r)
+        for col, val in list(d.items()):
+            # Detect PIL Image objects (covers datasets.Image features)
+            if hasattr(val, "save") and hasattr(val, "mode"):
+                if col not in pil_cols:
+                    pil_cols.append(col)
+                    img_dir.mkdir(parents=True, exist_ok=True)
+                    info(f"Detected image column '{col}' — saving images to {img_dir}")
+                fname = img_dir / f"{i:06d}.jpg"
+                try:
+                    val.convert("RGB").save(str(fname), "JPEG", quality=90)
+                    d[col] = str(fname)
+                except Exception as _ie:
+                    warn(f"Could not save image {i}: {_ie}")
+                    d[col] = ""
+        rows.append(d)
+
+    if pil_cols:
+        info(f"Saved {len(rows)} images for columns: {pil_cols}")
+
     (dest / f"{ds_id.replace('/', '__')}_{split}.json").write_text(
-        json.dumps(rows[:50], indent=2))   # small preview, full lives in HF cache
+        json.dumps(rows[:50], indent=2))
     return rows
 
 
@@ -428,10 +486,84 @@ def load_local(path: Path, chunk_size: int = 2048) -> list[dict]:
         import pandas as pd
         sep = "\t" if suf == ".tsv" else ","
         return pd.read_csv(path, sep=sep).fillna("").to_dict(orient="records")
+    if suf in (".xlsx", ".xls"):
+        try:
+            import pandas as pd
+            df = pd.read_excel(path, engine="openpyxl" if suf == ".xlsx" else "xlrd")
+            return df.fillna("").to_dict(orient="records")
+        except ImportError:
+            err("openpyxl not installed. Install with: pip install openpyxl")
+            sys.exit(2)
+    if suf == ".pdf":
+        return _load_pdf(path, chunk_size)
     if suf == ".txt":
         return _chunk_text(path.read_text(encoding="utf-8", errors="replace"), chunk_size)
-    err(f"Unsupported file extension: {suf}. Supported: .jsonl .json .parquet .csv .tsv .txt")
+    err(f"Unsupported file extension: {suf}. Supported: .jsonl .json .parquet .csv .tsv .txt .pdf .xlsx .xls")
     sys.exit(2)
+
+
+def _load_pdf(path: Path, chunk_size: int = 2048) -> list[dict]:
+    """Extract text+images from a PDF.
+
+    With pymupdf: renders each page as a JPEG and pairs it with that page's
+    text → image-caption rows usable by vl_trainer.
+    Falls back to text-only chunking if pymupdf is unavailable.
+    """
+    try:
+        import fitz  # pymupdf
+        img_dir = path.parent / "images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        doc = fitz.open(str(path))
+        rows = []
+        for i, page in enumerate(doc):
+            text = page.get_text().strip()
+            # Render page to image
+            pix = page.get_pixmap(dpi=150)
+            img_path = img_dir / f"{path.stem}_page{i+1:04d}.jpg"
+            pix.save(str(img_path))
+            if text:
+                rows.append({
+                    "messages": [
+                        {"role": "user",      "content": "Describe what you see on this page."},
+                        {"role": "assistant", "content": text},
+                    ],
+                    "images": [str(img_path)],
+                })
+            else:
+                # Image-only page (scanned) — ask model to describe it
+                rows.append({
+                    "messages": [
+                        {"role": "user",      "content": "Describe what you see on this page."},
+                        {"role": "assistant", "content": ""},
+                    ],
+                    "images": [str(img_path)],
+                })
+        doc.close()
+        rows = [r for r in rows if r["messages"][1]["content"]]  # drop blank-text pages
+        if rows:
+            info(f"PDF → {len(rows)} image+text pages from {path.name}")
+            return rows
+    except ImportError:
+        pass
+
+    # Fallback: text-only extraction
+    text = ""
+    try:
+        from pdfminer.high_level import extract_text as _pdfminer_extract
+        text = _pdfminer_extract(str(path))
+    except ImportError:
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(str(path))
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        except ImportError:
+            err("No PDF library found. Install: pip install pymupdf")
+            sys.exit(2)
+    if not text.strip():
+        err(f"PDF appears empty or unreadable: {path}")
+        sys.exit(2)
+    info(f"Extracted {len(text)} chars (text only) from PDF: {path.name}")
+    return _chunk_text(text, chunk_size)
 
 
 def _chunk_text(text: str, chunk_size: int = 2048) -> list[dict]:
@@ -519,9 +651,14 @@ def main():
     if src_ext == ".txt" and rows and isinstance(rows[0], dict) and "messages" in rows[0]:
         chatml, fmt = rows, "plain_text"
     else:
-        chatml, fmt = to_chatml_rows(rows,
-                                     instruction_col=args.instruction_col,
-                                     response_col=args.response_col)
+        # Pass base_dir so relative image paths in local datasets resolve correctly
+        _base_dir = Path(ident).parent if kind == "local" else None
+        chatml, fmt = to_chatml_rows(
+            rows,
+            instruction_col=args.instruction_col,
+            response_col=args.response_col,
+            base_dir=_base_dir,
+        )
     info(f"Detected format: {fmt}    → normalized to ChatML ({len(chatml)} rows)")
 
     norm_path = out_dir / "normalized.jsonl"

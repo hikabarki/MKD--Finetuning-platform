@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -29,6 +30,19 @@ _chat_tok       = None   # AutoTokenizer (text) or AutoProcessor (vision)
 _chat_name      = None
 _chat_is_vision = False  # True when a VLM (image-capable) model is loaded
 
+# vLLM server backend (used for pre-quantized NVFP4 models)
+_vllm_proc      = None   # subprocess.Popen
+_vllm_client    = None   # openai.OpenAI pointing at local vLLM server
+_vllm_model_id  = None   # model path string passed to vLLM
+
+# H-5: Locks for shared mutable state accessed from multiple Gradio threads
+_vllm_lock             = threading.Lock()
+_user_model_path_lock  = threading.Lock()
+_user_training_lock    = threading.Lock()
+
+VLLM_PYTHON = "/home/mkd-s002/vLLM-h/keural-rag/venv/bin/python"
+VLLM_PORT   = 8001
+
 # ── Project root ──────────────────────────────────────────────────────────────
 ROOT   = Path(os.environ.get("FT_PROJECT", Path(__file__).resolve().parent))
 SCRIPTS = ROOT / "scripts"
@@ -36,11 +50,22 @@ PYTHON  = sys.executable
 
 # ── Multimodal / VLM helpers ──────────────────────────────────────────────────
 
-# Default base model for fine-tuning and Quick Start
-DEFAULT_BASE_MODEL = "nvidia/Nemotron-Nano-4B-Omni"
-DEFAULT_BASE_DIR   = "nvidia__nemotron-nano-4b-omni"   # local models/ dir name
+# Default base model for General User Mode (Quick Start + Choose model & data)
+DEFAULT_BASE_MODEL = "nvidia/NVIDIA-Nemotron-Nano-VL-12B-v2"
+DEFAULT_BASE_DIR   = "nvidia__nvidia-nemotron-nano-12b-v2-vl-bf16"
 
-NEMOTRON_HF_ID = "nvidia/Nemotron-Nano-4B-Omni"
+# Fallback when VL model not yet downloaded
+_FALLBACK_BASE_DIR = "nvidia__nvidia-nemotron-3-nano-4b-bf16"
+
+NEMOTRON_HF_ID = "nvidia/NVIDIA-Nemotron-Nano-VL-12B-v2"
+
+# Friendly display info for known model folders (General User Mode radio buttons).
+# Key = local folder name under models/; value = shown after "  (" in the choice label.
+# To add a new NVIDIA Nemotron model: drop its folder into models/ and add an entry here.
+_MODEL_DISPLAY_INFO: dict = {
+    "nvidia__nvidia-nemotron-nano-12b-v2-vl-bf16":  "Nemotron VL 12B · image+text  (25 GB VRAM)",
+    "nvidia__nvidia-nemotron-3-nano-4b-bf16":        "Nemotron 4B · BF16  (4.3 GB VRAM)",
+}
 
 
 def _is_vision_model(path: str) -> bool:
@@ -48,6 +73,27 @@ def _is_vision_model(path: str) -> bool:
     p = Path(path)
     return any((p / f).exists() for f in (
         "preprocessor_config.json", "processor_config.json"))
+
+
+def _is_vl_model(path: str) -> bool:
+    """True if the model is a Vision-Language model that needs the VL training path.
+    Detected via auto_map with a VL class name, or presence of a vision_config key."""
+    p = Path(path)
+    cfg = p / "config.json"
+    if not cfg.exists():
+        return False
+    try:
+        data = json.loads(cfg.read_text())
+        auto_map = data.get("auto_map", {})
+        for cls in auto_map.values():
+            if "VL" in cls or "Vision" in cls or "vision" in cls:
+                return True
+        if "vision_config" in data:
+            return True
+        arch = data.get("architectures", [])
+        return any("VL" in a or "Vision" in a for a in arch)
+    except Exception:
+        return False
 
 
 def _nvfp4_quant_config():
@@ -69,30 +115,132 @@ def _nvfp4_quant_config():
 
 
 def _load_chat_model(model_path: str):
-    """Unified loader for text-only models and VLMs.
-    Returns (tokenizer_or_processor, model, is_vision)."""
+    """Unified loader for text-only models, VLMs, and pre-quantized vLLM models.
+    Returns (tokenizer_or_processor, model, is_vision).
+    For vLLM models returns (None, None, True) and sets _vllm_client globally."""
+    global _chat_is_vision
+
+    if _is_vllm_model(model_path):
+        ok = _start_vllm_server(model_path)
+        if not ok:
+            raise RuntimeError(
+                "vLLM server failed to start. Check that "
+                f"{VLLM_PYTHON} is available and the model path is correct.")
+        _chat_is_vision = True
+        return None, None, True
+
     import torch
-    from transformers import (AutoTokenizer, AutoProcessor,
-                               AutoModelForCausalLM, AutoModelForVision2Seq)
+    from transformers import AutoTokenizer, AutoProcessor, AutoModelForCausalLM
+    try:
+        from transformers import AutoModelForImageTextToText as _VLMClass
+    except ImportError:
+        try:
+            from transformers import AutoModelForVision2Seq as _VLMClass
+        except ImportError:
+            _VLMClass = AutoModelForCausalLM
+
     mp = Path(model_path)
-    is_vision = _is_vision_model(model_path)
+    is_vl = _is_vl_model(model_path)
+    is_vision = is_vl or _is_vision_model(model_path)
+
+    if is_vl:
+        # NemotronH VL: BF16, single-GPU, eager attention, HF_HUB_OFFLINE, cache pre-populated
+        import glob, shutil as _sh, os as _os, subprocess as _sp2, time as _t2
+        _os.environ["HF_HUB_OFFLINE"] = "1"
+        _os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        # Kill ALL processes that could be holding VRAM (vLLM server, trainers)
+        _stop_vllm_server()  # kills vLLM server + orphaned EngineCore/VllmWorker
+        _sp2.run(["pkill", "-9", "-f", "vl_trainer.py"], capture_output=True)
+        _sp2.run(["pkill", "-9", "-f", "axolotl.cli.train"], capture_output=True)
+        _sp2.run(["pkill", "-9", "-f", "ft_train.py"], capture_output=True)
+        # Poll until enough VRAM is free (need ~25 GiB for BF16 VL model)
+        for _wi in range(30):
+            torch.cuda.empty_cache()
+            _free_gb = torch.cuda.mem_get_info()[0] / 1024 ** 3
+            if _free_gb >= 25.0:
+                break
+            _t2.sleep(1)
+        # Pre-populate transformers cache with model .py files
+        cache_base = _os.path.expanduser("~/.cache/huggingface/modules/transformers_modules")
+        model_name_san = mp.name.replace("-", "_hyphen_")
+        cache_model_dir = _os.path.join(cache_base, model_name_san)
+        if _os.path.isdir(cache_model_dir):
+            all_py = glob.glob(str(mp / "*.py"))
+            for hash_dir in _os.listdir(cache_model_dir):
+                hash_path = _os.path.join(cache_model_dir, hash_dir)
+                if _os.path.isdir(hash_path) and not hash_dir.startswith("__"):
+                    for pyf in all_py:
+                        dest = _os.path.join(hash_path, _os.path.basename(pyf))
+                        if not _os.path.exists(dest):
+                            _sh.copy2(pyf, dest)
+
+        tok = AutoProcessor.from_pretrained(str(mp), trust_remote_code=True, local_files_only=True)
+        # transformers 5.x uses `dtype`; fall back to `torch_dtype` for older versions
+        # M-2: Prefer FlashAttention-2; fall back to eager with a clear warning
+        try:
+            import flash_attn  # noqa: F401
+            _attn_impl = "flash_attention_2"
+        except ImportError:
+            print(
+                "WARNING: flash-attn not installed — loading VL model with eager attention. "
+                "Install: pip install flash-attn --no-build-isolation",
+                flush=True,
+            )
+            _attn_impl = "eager"
+        vl_load_kw = dict(
+            device_map={"": "cuda:0"},
+            trust_remote_code=True,
+            local_files_only=True,
+            attn_implementation=_attn_impl,
+        )
+        try:
+            import transformers as _tf
+            from packaging.version import Version
+            if Version(_tf.__version__) >= Version("5.0"):
+                vl_load_kw["dtype"] = torch.bfloat16
+            else:
+                vl_load_kw["torch_dtype"] = torch.bfloat16
+        except Exception:
+            vl_load_kw["dtype"] = torch.bfloat16
+        model = AutoModelForCausalLM.from_pretrained(str(mp), **vl_load_kw)
+
+        # Fix: summary_idxs buffer is MISSING from the checkpoint — it was never saved.
+        # At init time the buffer is allocated with torch.empty() → garbage values like
+        # [127690034228576, 105553488615024, 0].  The correct value is [0, 1, 2, ...] —
+        # one index per teacher, selecting ALL teachers for summary token extraction.
+        try:
+            _rm = model.vision_model.radio_model
+            if hasattr(_rm, "summary_idxs") and _rm.summary_idxs is not None:
+                _n = _rm.summary_idxs.shape[0]
+                _rm.summary_idxs = torch.arange(_n, dtype=torch.int64,
+                                                device=_rm.summary_idxs.device)
+                print(f"[VL] Patched summary_idxs → {_rm.summary_idxs.tolist()}", flush=True)
+        except Exception as _e:
+            print(f"[VL] Warning: could not patch summary_idxs: {_e}", flush=True)
+
+        return tok, model, True
+
     bnb_cfg = _nvfp4_quant_config()
     load_kw: dict = dict(device_map="auto", trust_remote_code=True, local_files_only=True)
     if bnb_cfg:
         load_kw["quantization_config"] = bnb_cfg
     else:
-        load_kw["torch_dtype"] = torch.bfloat16
+        try:
+            import transformers as _tf
+            from packaging.version import Version
+            dtype_key = "dtype" if Version(_tf.__version__) >= Version("5.0") else "torch_dtype"
+        except Exception:
+            dtype_key = "dtype"
+        load_kw[dtype_key] = torch.bfloat16
 
     if is_vision:
-        tok = AutoProcessor.from_pretrained(
-            str(mp), trust_remote_code=True, local_files_only=True)
+        tok = AutoProcessor.from_pretrained(str(mp), trust_remote_code=True, local_files_only=True)
         try:
-            model = AutoModelForVision2Seq.from_pretrained(str(mp), **load_kw)
+            model = _VLMClass.from_pretrained(str(mp), **load_kw)
         except Exception:
             model = AutoModelForCausalLM.from_pretrained(str(mp), **load_kw)
     else:
-        tok = AutoTokenizer.from_pretrained(
-            str(mp), trust_remote_code=True, local_files_only=True)
+        tok = AutoTokenizer.from_pretrained(str(mp), trust_remote_code=True, local_files_only=True)
         model = AutoModelForCausalLM.from_pretrained(str(mp), **load_kw)
     return tok, model, is_vision
 
@@ -100,21 +248,216 @@ def _load_chat_model(model_path: str):
 def _build_chat_inputs(messages: list, image=None):
     """Build tensors for model.generate(). image is a PIL Image or None."""
     global _chat_model, _chat_tok, _chat_is_vision
+    import torch
     device = next(_chat_model.parameters()).device
     if _chat_is_vision and image is not None:
-        # Replace last user turn with vision content list
-        vision_content = [{"type": "image", "image": image},
-                          {"type": "text", "text": messages[-1]["content"]}]
-        vision_msgs = messages[:-1] + [{"role": "user", "content": vision_content}]
+        # NemotronH VL expects <image> token literally in text, not a content-dict.
+        _user_q = str(messages[-1]["content"])
+        # Reframe vague prompts so the VL model understands it must describe/analyze
+        # the attached image rather than generate one.
+        if not any(w in _user_q.lower() for w in ["<image>", "image", "picture", "photo", "figure", "diagram", "describe", "show", "see", "look", "what is", "what's"]):
+            _user_q = f"Please describe what you see in the image. {_user_q}"
+        user_text = "<image>\n" + _user_q
+        vision_msgs = messages[:-1] + [{"role": "user", "content": user_text}]
         text = _chat_tok.apply_chat_template(
             vision_msgs, tokenize=False, add_generation_prompt=True)
         inputs = _chat_tok(text=text, images=[image], return_tensors="pt").to(device)
+        # NemotronH VL: remove keys that generate() doesn't accept.
+        # image_flags is only for forward() during training; generate() uses
+        # pixel_values + img_context_token_id to inject visual features directly.
+        inputs.pop("num_patches", None)
+        inputs.pop("image_flags", None)
     else:
         text = _chat_tok.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True)
-        enc = _chat_tok(text, return_tensors="pt")
+        # VL processors fail on text-only input (image preprocessing path fires);
+        # use the underlying tokenizer directly to avoid "Incorrect image source" error.
+        _tok_only = getattr(_chat_tok, "tokenizer", _chat_tok)
+        enc = _tok_only(text, return_tensors="pt")
         inputs = {k: v.to(device) for k, v in enc.items()}
     return inputs
+
+
+def _is_vllm_model(path: str) -> bool:
+    """True if the model needs vLLM (pre-quantized NVFP4/FP8 not loadable by transformers)."""
+    p = Path(path)
+    if (p / "hf_quant_config.json").exists():
+        return True
+    cfg = p / "config.json"
+    if cfg.exists():
+        import json
+        try:
+            c = json.loads(cfg.read_text())
+            arch = c.get("architectures", [""])[0]
+            # NemotronH_Nano_VL_V2 and Llama_Nemotron_Nano_VL require custom modeling
+            # patches (modeling.py) that vLLM cannot apply — they go through transformers.
+            vllm_archs = {
+                "NemotronH_Nano_Omni_Reasoning_V3",
+                "NemotronH_Super_Omni_Reasoning_V3",
+            }
+            if arch in vllm_archs:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _start_vllm_server(model_path: str) -> bool:
+    """Launch vLLM OpenAI-compatible server for the given model. Returns True on success."""
+    import subprocess, time, urllib.request, urllib.error
+    global _vllm_proc, _vllm_client, _vllm_model_id
+
+    _stop_vllm_server()
+
+    cmd = [
+        VLLM_PYTHON, "-m", "vllm.entrypoints.openai.api_server",
+        "--model", model_path,
+        "--trust-remote-code",
+        "--port", str(VLLM_PORT),
+        "--max-model-len", "8192",
+        "--gpu-memory-utilization", "0.85",
+        "--enforce-eager",
+    ]
+    _vllm_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    _vllm_model_id = model_path
+
+    # Wait up to 180 s for server to be ready
+    health_url = f"http://localhost:{VLLM_PORT}/health"
+    for _ in range(180):
+        time.sleep(1)
+        try:
+            urllib.request.urlopen(health_url, timeout=2)
+            break
+        except Exception:
+            if _vllm_proc.poll() is not None:
+                return False
+    else:
+        return False
+
+    try:
+        from openai import OpenAI
+        _vllm_client = OpenAI(base_url=f"http://localhost:{VLLM_PORT}/v1", api_key="none")
+    except ImportError:
+        import subprocess as _sp
+        _sp.run([VLLM_PYTHON, "-m", "pip", "install", "openai", "-q"])
+        from openai import OpenAI
+        _vllm_client = OpenAI(base_url=f"http://localhost:{VLLM_PORT}/v1", api_key="none")
+    return True
+
+
+def _stop_vllm_server():
+    """Terminate the running vLLM server process AND any orphaned vLLM processes."""
+    import subprocess as _sp_vllm, time as _t_vllm
+    global _vllm_proc, _vllm_client, _vllm_model_id
+    if _vllm_proc is not None:
+        try:
+            _vllm_proc.terminate()
+            _vllm_proc.wait(timeout=10)
+        except Exception:
+            try:
+                _vllm_proc.kill()
+            except Exception:
+                pass
+        _vllm_proc = None
+    # Kill any orphaned vLLM processes left over from previous sessions
+    _sp_vllm.run(["pkill", "-9", "-f", "vllm.entrypoints"], capture_output=True)
+    _sp_vllm.run(["pkill", "-9", "-f", "EngineCore"], capture_output=True)
+    _sp_vllm.run(["pkill", "-9", "-f", "VllmWorker"], capture_output=True)
+    _t_vllm.sleep(3)  # Give OS time to reclaim VRAM
+    _vllm_client = None
+    _vllm_model_id = None
+
+
+def _generate_reply(msgs: list, max_tokens: int = 256, image=None) -> str:
+    """Unified generation: uses vLLM client if loaded, else transformers."""
+    global _vllm_client, _vllm_model_id, _chat_model, _chat_tok
+    import re as _re
+
+    if _vllm_client is not None:
+        # Build OpenAI-format messages with optional image
+        api_msgs = []
+        for m in msgs[:-1]:
+            api_msgs.append({"role": m["role"], "content": m["content"]})
+        last = msgs[-1]
+        if image is not None:
+            import base64
+            from io import BytesIO
+            buf = BytesIO()
+            image.save(buf, format="JPEG")
+            b64 = base64.b64encode(buf.getvalue()).decode()
+            content = [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                {"type": "text", "text": last["content"]},
+            ]
+        else:
+            content = last["content"]
+        api_msgs.append({"role": last["role"], "content": content})
+
+        resp = _vllm_client.chat.completions.create(
+            model=_vllm_model_id,
+            messages=api_msgs,
+            max_tokens=max_tokens,
+            temperature=0.7,
+            top_p=0.9,
+        )
+        return resp.choices[0].message.content.strip()
+
+    # Transformers path
+    import torch
+    inputs = _build_chat_inputs(msgs, image=image)
+    ids = inputs.get("input_ids")
+    _prompt_len = ids.shape[1] if ids is not None else 0
+    # Processor objects (VL models) wrap a tokenizer — resolve it for token-level ops
+    _tokenizer = getattr(_chat_tok, "tokenizer", _chat_tok)
+    _eos_ids = [_tokenizer.eos_token_id]
+    try:
+        _im_end = _tokenizer.convert_tokens_to_ids("<|im_end|>")
+        if _im_end and _im_end != _tokenizer.eos_token_id:
+            _eos_ids.append(_im_end)
+    except Exception:
+        pass
+    with torch.no_grad():
+        try:
+            # VL path: greedy + repetition_penalty to avoid "222..." degenerate loops.
+            # Text-only path: light sampling for variety.
+            if image is not None and _chat_is_vision:
+                _gen_kwargs = dict(do_sample=False, repetition_penalty=1.15)
+            else:
+                _gen_kwargs = dict(do_sample=True, temperature=0.7, top_p=0.9, repetition_penalty=1.05)
+            out = _chat_model.generate(
+                **inputs, max_new_tokens=max_tokens,
+                eos_token_id=_eos_ids,
+                pad_token_id=_tokenizer.eos_token_id,
+                **_gen_kwargs)
+        except Exception as _gen_exc:
+            import traceback as _tb_inner
+            _tb_inner_str = _tb_inner.format_exc()
+            try:
+                with open("/tmp/ft_chat_errors.log", "a") as _ef2:
+                    _ef2.write(f"[_generate_reply] {type(_gen_exc).__name__}: {_gen_exc}\n{_tb_inner_str}\n---\n")
+            except Exception:
+                pass
+            raise
+    # The VL wrapper (NemotronH_Nano_VL_V2.generate) always calls
+    # language_model.generate(inputs_embeds=...) so output is new tokens only — start=0.
+    _start = 0
+    reply_raw = _tokenizer.decode(out[0], skip_special_tokens=False,
+                                  clean_up_tokenization_spaces=False)
+    try:
+        with open("/tmp/vl_debug.log", "a") as _vd:
+            _vd.write(f"[gen] prompt_len={_prompt_len} out_len={out[0].shape[0]} start=0 image={'yes' if image is not None else 'no'}\n")
+            _vd.write(f"[raw] {repr(reply_raw[:400])}\n---\n")
+    except Exception:
+        pass
+    reply = _tokenizer.decode(out[0], skip_special_tokens=True,
+                              clean_up_tokenization_spaces=False).strip()
+    reply = _re.sub(r'<0x([0-9A-Fa-f]{2})>',
+                    lambda m: bytes([int(m.group(1), 16)]).decode('utf-8', errors='replace'),
+                    reply)
+    # Strip thinking blocks (<think>...</think>) — leave only the final answer
+    reply = _re.sub(r'<think>.*?</think>', '', reply, flags=_re.DOTALL).strip()
+    return reply.replace("<|im_end|>", "").replace("<|im_start|>", "").strip()
+
 
 # ── ANSI → HTML terminal renderer ─────────────────────────────────────────────
 _ANSI_COLOR = {
@@ -790,7 +1133,7 @@ def parse_training_log(run_name: str) -> dict:
             d = ast.literal_eval(line)
         except Exception:
             continue
-        if "loss" in d and "eval_loss" not in d:
+        if "loss" in d and "eval_loss" not in d and "vqa_accuracy_before" not in d:
             step += 1
             train_steps.append(step)
             train_loss.append(float(d["loss"]))
@@ -799,10 +1142,25 @@ def parse_training_log(run_name: str) -> dict:
             eval_steps.append(step)
             eval_loss.append(float(d["eval_loss"]))
             eval_ppl.append(float(d.get("eval_ppl", 0)) or float(d["eval_loss"]) ** 2.718)
-    return dict(
+    result = dict(
         train_steps=train_steps, train_loss=train_loss, train_ppl=train_ppl,
         eval_steps=eval_steps,   eval_loss=eval_loss,   eval_ppl=eval_ppl,
     )
+    # Also check for VQA metrics line in log
+    for line in log_path.read_text().splitlines():
+        line = line.strip()
+        if not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            d = ast.literal_eval(line)
+        except Exception:
+            continue
+        if "vqa_accuracy_before" in d and "vqa_accuracy_after" in d:
+            result["vqa_accuracy_before"] = float(d["vqa_accuracy_before"])
+            result["vqa_accuracy_after"]  = float(d["vqa_accuracy_after"])
+            result["vqa_n_samples"]       = int(d.get("vqa_n_samples", 0))
+            break
+    return result
 
 
 # ── Chart palette ─────────────────────────────────────────────────────────────
@@ -907,6 +1265,7 @@ def build_ppl_chart(data: dict):
 
 def build_summary_chart(data: dict):
     fig, ax = _new_fig()
+    has_vqa = "vqa_accuracy_before" in data and "vqa_accuracy_after" in data
     if data.get("train_loss"):
         bl = data["train_loss"][0];  al = data["train_loss"][-1]
         bp = data["train_ppl"][0];   ap = data["train_ppl"][-1]
@@ -914,24 +1273,42 @@ def build_summary_chart(data: dict):
             al = data["eval_loss"][-1]
         if data.get("eval_ppl") and len(data["eval_ppl"]) >= 2:
             ap = data["eval_ppl"][-1]
-        x, w = [0, 1], 0.30
-        b1 = ax.bar([i - w/2 for i in x], [bl, bp], w,
+        x_pos   = [0, 1]
+        x_labels = ["Loss", "Perplexity"]
+        before_vals = [bl, bp]
+        after_vals  = [al, ap]
+        if has_vqa:
+            x_pos.append(2)
+            x_labels.append("VQA Accuracy")
+            before_vals.append(data["vqa_accuracy_before"])
+            after_vals.append(data["vqa_accuracy_after"])
+        w = 0.30
+        b1 = ax.bar([i - w/2 for i in x_pos], before_vals, w,
                     color=_GREY_BAR, label="Before", zorder=3,
                     edgecolor=_GRID_COL, linewidth=0.5)
-        b2 = ax.bar([i + w/2 for i in x], [al, ap], w,
+        b2 = ax.bar([i + w/2 for i in x_pos], after_vals, w,
                     color=_PURPLE,   label="After",  zorder=3,
                     edgecolor=_GRID_COL, linewidth=0.5)
-        max_y = max(bl, bp)
+        max_y = max(before_vals + after_vals)
         for bar in list(b1) + list(b2):
             h = bar.get_height()
+            label = f"{h:.1%}" if has_vqa and bar.get_x() > 1.5 else f"{h:.2f}"
             ax.text(bar.get_x() + bar.get_width() / 2,
-                    h + max_y * 0.015, f"{h:.2f}",
+                    h + max_y * 0.015, label,
                     ha="center", va="bottom",
                     color=_TITLE_COL, fontsize=8, fontweight="bold")
-        ax.set_xticks(x)
-        ax.set_xticklabels(["Loss", "Perplexity"],
-                           color=_TICK_COL, fontsize=9.5)
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(x_labels, color=_TICK_COL, fontsize=9.5)
         ax.set_ylim(0, max_y * 1.28)
+    elif has_vqa:
+        vb = data["vqa_accuracy_before"]; va = data["vqa_accuracy_after"]
+        b1 = ax.bar([0 - 0.15], [vb], 0.30, color=_GREY_BAR, label="Before", zorder=3)
+        b2 = ax.bar([0 + 0.15], [va], 0.30, color=_PURPLE,   label="After",  zorder=3)
+        for bar, val in zip(list(b1)+list(b2), [vb, va]):
+            ax.text(bar.get_x()+bar.get_width()/2, val+0.01, f"{val:.1%}",
+                    ha="center", va="bottom", color=_TITLE_COL, fontsize=9, fontweight="bold")
+        ax.set_xticks([0]); ax.set_xticklabels(["VQA Accuracy"], color=_TICK_COL, fontsize=9.5)
+        ax.set_ylim(0, max(vb, va) * 1.3)
     else:
         ax.text(0.5, 0.5, "No data yet", ha="center", va="center",
                 color=_LABEL_COL, transform=ax.transAxes, fontsize=11)
@@ -958,6 +1335,11 @@ def build_metrics_df(data: dict) -> pd.DataFrame:
         ep_b = data["eval_ppl"][0]; ep_a = data["eval_ppl"][-1]
         rows.append(("Eval Perplexity", f"{ep_b:.3f}", f"{ep_a:.3f}",
                      f"{(ep_a-ep_b)/ep_b*100:+.1f}%"))
+    if "vqa_accuracy_before" in data and "vqa_accuracy_after" in data:
+        vb = data["vqa_accuracy_before"]; va = data["vqa_accuracy_after"]
+        n  = data.get("vqa_n_samples", "?")
+        change = f"{(va - vb) * 100:+.1f}pp"
+        rows.append((f"VQA Accuracy  (n={n})", f"{vb:.1%}", f"{va:.1%}", change))
     return pd.DataFrame(rows, columns=cols)
 
 
@@ -1429,8 +1811,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                     label="Quick test steps",
                     value=50,
                     precision=0,
-                    minimum=10,
-                    maximum=500,
+                    minimum=1,
                     info="Number of steps for the quick test. More steps = better evaluation metrics.",
                     visible=True,
                 )
@@ -1447,17 +1828,20 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
         # Screen 2b: Custom Mix config — fully dynamic from server
         def get_model_choices():
             choices = []
-            for m in list_models():
-                info_f = ROOT / "models" / m / "MODEL_INFO.json"
-                try:
-                    info = json.loads(info_f.read_text())
-                    hf_id  = info.get("model_id", m)
-                    params = f'{info.get("params_billion", "?")}B'
-                    label  = hf_id.split("/")[-1].replace("-Instruct","").replace("-instruct","")
-                    choices.append(f"{label}  ({params})")
-                except Exception:
-                    choices.append(m)
-            return choices or ["Phi-3.5-mini-instruct  (3.8B)"]
+            # VL 12B first so it appears as the top radio option
+            preferred_order = [DEFAULT_BASE_DIR, _FALLBACK_BASE_DIR]
+            all_models = list_models()
+            ordered = [m for m in preferred_order if m in all_models] + \
+                      [m for m in all_models if m not in preferred_order]
+            for m in ordered:
+                # Exclude NVFP4/vLLM-only models — they cannot be fine-tuned
+                if _is_vllm_model(str(ROOT / "models" / m)):
+                    continue
+                friendly = _MODEL_DISPLAY_INFO.get(m)
+                # Format: "folder-name  (friendly info)" — folder-name prefix is used
+                # by run_user_custommix for fuzzy-matching back to the folder.
+                choices.append(f"{m}  ({friendly})" if friendly else m)
+            return choices or [f"{_FALLBACK_BASE_DIR}  (Nemotron 4B · BF16  (4.3 GB VRAM))"]
 
         def get_cm_dataset_choices():
             choices = []
@@ -1504,9 +1888,18 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
             </div>
             """)
             with gr.Row():
+                def _default_model_choice():
+                    choices = get_model_choices()
+                    # Prefer VL 12B, then any Nemotron, then first available
+                    for priority in (DEFAULT_BASE_DIR, _FALLBACK_BASE_DIR):
+                        for c in choices:
+                            if c.startswith(priority):
+                                return c
+                    return choices[0] if choices else None
+
                 user_cm_model = gr.Radio(
                     choices=get_model_choices(),
-                    value=get_model_choices()[0],
+                    value=_default_model_choice(),
                     label="Which AI model do you want to fine-tune?",
                     scale=3,
                 )
@@ -1529,30 +1922,44 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
             )
 
             gr.HTML('<div style="height:8px;"></div>')
+
+            def _auto_model_name(model_choice):
+                import datetime, re as _re
+                if not model_choice:
+                    return ""
+                # Take the folder-name part before "  (" and strip trailing spaces
+                slug = model_choice.split("  (")[0].strip().lower()
+                # Keep only alphanumeric and hyphens; collapse repeated dashes
+                slug = _re.sub(r"[^a-z0-9]+", "-", slug)
+                slug = _re.sub(r"-{2,}", "-", slug).strip("-")
+                date = datetime.date.today().strftime("%b%d").lower()
+                return f"{slug}-{date}"
+
             user_cm_name = gr.Textbox(
-                label="What should we call your model?",
-                placeholder="e.g.  my-assistant  or  support-bot")
+                label="What should we call your model?  (auto-filled — you can change it)",
+                value=_auto_model_name(_default_model_choice()),
+                placeholder="e.g.  my-assistant  or  support-bot",
+            )
+            user_cm_model.change(_auto_model_name, inputs=user_cm_model, outputs=user_cm_name)
 
             gr.HTML('<div style="height:8px;"></div>')
-            with gr.Row():
-                user_cm_epochs = gr.Number(
-                    label="Epochs",
-                    value=1,
-                    precision=0,
-                    minimum=1,
-                    maximum=10,
-                    info="Full training epochs. 1 = fast (~1-3 hrs), 3 = thorough (~9 hrs).",
-                    scale=1,
-                )
-                user_cm_test_steps = gr.Number(
-                    label="Quick test steps",
-                    value=50,
-                    precision=0,
-                    minimum=10,
-                    maximum=500,
-                    info="Steps for the quick check before full training.",
-                    scale=1,
-                )
+            user_cm_epochs = gr.Radio(
+                choices=["Fast — 1 epoch (~1-3 hrs)", "Standard — 3 epochs (~6-9 hrs)"],
+                value="Fast — 1 epoch (~1-3 hrs)",
+                label="Training depth",
+                info="Fast is good for testing. Standard gives better results.",
+            )
+
+            gr.HTML('<div style="height:8px;"></div>')
+            user_cm_max_steps = gr.Number(
+                value=0,
+                minimum=0,
+                label="Max training steps  (0 = run full epochs above)",
+                info="0 = complete all epochs · 100 steps ≈ 5 min · 500 ≈ 30 min · 1000 ≈ 1 hr  |  Useful to cap a long run early.",
+            )
+
+            # Hidden — always 50, no need to expose to general users
+            user_cm_test_steps = gr.Number(value=50, visible=False)
 
             gr.HTML('<div style="height:16px;"></div>')
             with gr.Row():
@@ -1639,9 +2046,8 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
             </div>
             """)
             user_chatbot = gr.Chatbot(height=360, label="Chat with your fine-tuned model")
-            user_chat_image = gr.Image(
-                type="pil", label="Upload image (optional — for multimodal models)",
-                height=140, visible=True, scale=1)
+            with gr.Accordion("📷 Upload image (optional — for vision/multimodal models)", open=False):
+                user_chat_image = gr.Image(type="pil", label="Image", height=200)
             with gr.Row():
                 user_chat_input = gr.Textbox(
                     placeholder="Type your message and press Enter...",
@@ -1654,6 +2060,15 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                 user_clear_btn  = gr.Button("Clear conversation", size="sm", variant="secondary")
                 user_new_btn    = gr.Button("Train a new model", size="sm", variant="secondary")
                 user_publish_btn = gr.Button("Publish to HuggingFace", size="sm", variant="primary")
+            with gr.Accordion("🔍 Error Log", open=False):
+                user_error_log = gr.Textbox(
+                    label="Recent errors (most recent first)",
+                    value="No errors yet.",
+                    lines=8,
+                    max_lines=20,
+                    interactive=False,
+                    elem_id="user_error_log",
+                )
             user_publish_repo = gr.Textbox(
                 label="HuggingFace repo  (fill in before publishing)",
                 placeholder="username/my-fine-tuned-model",
@@ -1912,19 +2327,30 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
 
     def run_user_quickstart(dataset_choice, upload_file, model_name, test_mode=True, test_steps=50):
         dataset = "alpaca"
-        # Prefer Nemotron if downloaded, fall back to Qwen 7B then 3B
-        _nemotron_path = ROOT / "models" / DEFAULT_BASE_DIR
-        _qwen7b_path   = ROOT / "models" / "qwen__qwen2.5-7b-instruct"
-        _qwen3b_path   = ROOT / "models" / "qwen__qwen2.5-3b-instruct"
-        if _nemotron_path.exists():
-            model = DEFAULT_BASE_DIR
-        elif _qwen7b_path.exists():
-            model = "qwen__qwen2.5-7b-instruct"
-        elif _qwen3b_path.exists():
-            model = "qwen__qwen2.5-3b-instruct"
-        else:
-            model = DEFAULT_BASE_DIR
+        # Priority: VL 12B → Nemotron 4B BF16 → Qwen 7B → Qwen 3B
+        _model_priority = [
+            DEFAULT_BASE_DIR,   # nvidia__nvidia-nemotron-nano-12b-v2-vl-bf16  (VL 12B — default)
+            _FALLBACK_BASE_DIR, # nvidia__nvidia-nemotron-3-nano-4b-bf16        (4B fallback)
+        ]
+        model = DEFAULT_BASE_DIR
+        for _m in _model_priority:
+            if (ROOT / "models" / _m).exists():
+                model = _m
+                break
         test_steps = int(test_steps or 50)
+
+        # If customer uploaded their own file, prepare it first (add → clean)
+        if dataset_choice != "Use the built-in example dataset" and upload_file is not None:
+            import re as _re_qs
+            _upath = Path(upload_file.name if hasattr(upload_file, "name") else str(upload_file))
+            _ds_slug = _re_qs.sub(r"[^a-z0-9]+", "-", _upath.stem.lower()).strip("-")[:30] or "my-dataset"
+            yield build_progress_html("prepare"), terminal_wrap(f"Preparing your data: {_upath.name}…")
+            for chunk in run_ft(["add-dataset", str(_upath), "--name", _ds_slug]):
+                yield build_progress_html("prepare"), chunk
+            for chunk in run_ft(["clean-dataset", _ds_slug]):
+                yield build_progress_html("prepare"), chunk
+            dataset = _ds_slug
+            test_mode = False   # real data — skip the alpaca_tiny shortcut
 
         # For test mode: create a tiny 100-row dataset to skip preprocessing wait
         if test_mode:
@@ -1941,6 +2367,79 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                     _j.dumps({"name": "alpaca_tiny", "train_rows": 100, "val_rows": 10}))
                 dataset = "alpaca_tiny"
 
+        import subprocess as _sp_qs
+        model_path = str(ROOT / "models" / model)
+        is_vl = _is_vl_model(model_path)
+
+        # ── VL path ──────────────────────────────────────────────────────────
+        if is_vl:
+            ds_path = str(ROOT / "datasets" / dataset)
+            if not Path(ds_path).exists():
+                ds_path = str(ROOT / "cleaned_datasets" / dataset)
+            out_path = str(ROOT / "checkpoints" / f"vl_{model}")
+            epochs_vl = 1
+            cmd = [
+                "python", str(ROOT / "vl_trainer.py"),
+                "--model", model_path,
+                "--dataset", ds_path,
+                "--output", out_path,
+                "--quant", "bf16",
+                "--lora-r", "16",
+                "--lr", "2e-4",
+                "--epochs", str(epochs_vl),
+            ]
+            if test_mode:
+                cmd += ["--max-steps", str(test_steps)]
+
+            yield build_progress_html("configure"), terminal_wrap("Setting up VL training...")
+            yield build_progress_html("smoke"), terminal_wrap("Starting VL trainer (smoke + train + merge)...")
+
+            env = {**os.environ,
+                   "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                   "HF_HUB_OFFLINE": "1",
+                   "TOKENIZERS_PARALLELISM": "false"}
+            export_path = None
+            buf = []
+            with _sp_qs.Popen(cmd, stdout=_sp_qs.PIPE, stderr=_sp_qs.STDOUT, text=True, env=env) as proc:
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    buf.append(line)
+                    if line.startswith("EXPORT_PATH="):
+                        export_path = line.split("=", 1)[1].strip()
+                    step = "train" if "step" in line.lower() or "loss" in line.lower() else \
+                           "export" if "merging" in line.lower() or "export" in line.lower() else "smoke"
+                    yield build_progress_html(step), terminal_wrap("\n".join(buf[-150:]))
+
+            if export_path and Path(export_path).exists():
+                _user_last_model_path["path"] = export_path
+            else:
+                exp_dir = ROOT / "exports"
+                if exp_dir.exists():
+                    candidates = sorted(
+                        [d / "merged" for d in exp_dir.iterdir() if (d / "merged" / "config.json").exists()],
+                        key=lambda p: p.stat().st_mtime, reverse=True)
+                    if candidates:
+                        _user_last_model_path["path"] = str(candidates[0])
+
+            yield build_progress_html("done"), terminal_wrap(
+                'Waiting for GPU memory to clear before loading chat model...')
+            _sp_qs.run(["pkill", "-9", "-f", "vl_trainer.py"], capture_output=True)
+            _stop_vllm_server()
+            import time as _time_qs
+            import torch as _torch_qs
+            for _wi in range(30):
+                _torch_qs.cuda.empty_cache()
+                if _torch_qs.cuda.mem_get_info()[0] / 1024 ** 3 >= 25.0:
+                    break
+                _time_qs.sleep(1)
+
+            yield build_progress_html("done"), terminal_wrap(
+                '<span style="color:#3fb950;font-weight:bold;font-size:16px;">Complete!</span><br>'
+                '<span style="color:#8b949e;">Your VL model is ready. Click "Test in Chat" to try it.</span>'
+            )
+            return
+
+        # ── Text (Axolotl) path ───────────────────────────────────────────────
         yield build_progress_html("configure"), terminal_wrap("Generating recipe...")
         epochs = "1" if test_mode else "3"
         cfg_args = ["configure", f"--model={model}", f"--dataset={dataset}",
@@ -1971,6 +2470,15 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
         for chunk in run_ft(["smoke-test", latest_cfg, f"--steps={test_steps}"]):
             yield build_progress_html("smoke"), chunk
 
+        # Remove the test-only max_steps cap so full training runs all epochs
+        if test_mode:
+            cfg_path = ROOT / "configs" / configs[0]
+            if cfg_path.exists():
+                import re as _re2
+                txt = cfg_path.read_text()
+                txt = _re2.sub(r'^max_steps:.*\n?', '', txt, flags=_re2.MULTILINE)
+                cfg_path.write_text(txt)
+
         yield build_progress_html("train"), terminal_wrap("Starting training...")
         for chunk in run_ft(["train", latest_cfg]):
             yield build_progress_html("train"), chunk
@@ -1984,33 +2492,171 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
             if exports:
                 _user_last_model_path["path"] = str(ROOT / "exports" / exports[0] / "merged")
 
+            # Register run in eval_results so the Evaluation Dashboard can discover it
+            _qs_run = new_ckpts[0]
+            _qs_eval_dir = ROOT / "eval_results" / _qs_run
+            _qs_eval_dir.mkdir(parents=True, exist_ok=True)
+            if not (_qs_eval_dir / "summary.md").exists():
+                (_qs_eval_dir / "summary.md").write_text(
+                    f"# Training run: {_qs_run}\n\n"
+                    f"Model: {model}  |  Dataset: {dataset}  |  Mode: Quick Start\n\n"
+                    f"See the Training Loss and Perplexity charts for metrics.\n"
+                )
+
         yield build_progress_html("done"), terminal_wrap(
             '<span style="color:#3fb950;font-weight:bold;font-size:16px;">Complete!</span>')
 
 
-    def run_user_custommix(models_sel, datasets_sel, upload_file, model_name, test_steps=50, epochs=1):
+    def run_user_custommix(models_sel, datasets_sel, upload_file, model_name, test_steps=50, epochs="Fast — 1 epoch (~1-3 hrs)", max_steps=0):
+        import subprocess as _sp
         test_steps = int(test_steps or 50)
-        epochs = int(epochs or 1)
-        # Resolve model: match display label back to folder name
-        model = "microsoft__phi-3.5-mini-instruct"  # default
+        max_steps = int(max_steps or 0)
+        if isinstance(epochs, str):
+            epochs = 3 if "3" in epochs else 1
+        else:
+            epochs = int(epochs or 1)
+
+        # Resolve model folder name from display label
+        available = list_models()
+        model = available[0] if available else ""
         label = (models_sel or "").split("  ")[0].strip().lower().replace("-", "").replace(".", "")
-        for m in list_models():
+        for m in available:
             if label in m.lower().replace("-", "").replace(".", "").replace("_", ""):
                 model = m
                 break
 
-        # Resolve dataset: extract name before the row-count suffix
-        dataset = "alpaca"
-        for d in (datasets_sel or []):
-            ds_name = d.split("  ")[0].strip()
-            if ds_name and ds_name != "Upload my own data":
-                dataset = ds_name
-                break
+        # Resolve dataset — handle customer file upload first
+        ds_names = []
+        _wants_upload = any("Upload" in (x or "") for x in (datasets_sel or []))
+        if _wants_upload and upload_file is not None:
+            import re as _re_cm
+            _upath = Path(upload_file.name if hasattr(upload_file, "name") else str(upload_file))
+            _ds_slug = _re_cm.sub(r"[^a-z0-9]+", "-", _upath.stem.lower()).strip("-")[:30] or "my-dataset"
+            yield build_progress_html("prepare"), terminal_wrap(f"Preparing your data: {_upath.name}…")
+            for chunk in run_ft(["add-dataset", str(_upath), "--name", _ds_slug]):
+                yield build_progress_html("prepare"), chunk
+            for chunk in run_ft(["clean-dataset", _ds_slug]):
+                yield build_progress_html("prepare"), chunk
+            ds_names = [_ds_slug]
+        else:
+            for d in (datasets_sel or []):
+                ds_name = d.split("  ")[0].strip()
+                if ds_name and "Upload" not in ds_name:
+                    ds_names.append(ds_name)
 
+        if not ds_names:
+            available_ds = list_cleaned_datasets()
+            ds_names = [available_ds[0]] if available_ds else ["alpaca"]
+        dataset = ds_names[0]
+
+        model_path = str(ROOT / "models" / model)
+        is_vl = _is_vl_model(model_path)
+
+        # ── VL path ──────────────────────────────────────────────────────────
+        if is_vl:
+            # M-5: Canonical dataset path is datasets/<name>/train.jsonl
+            ds_path = str(ROOT / "datasets" / dataset)
+            if not Path(ds_path).exists():
+                ds_path = str(ROOT / "cleaned_datasets" / dataset)  # legacy fallback
+            out_path = str(ROOT / "checkpoints" / f"vl_{model}")
+            cmd = [
+                "python", str(ROOT / "vl_trainer.py"),
+                "--model", model_path,
+                "--dataset", ds_path,
+                "--output", out_path,
+                "--quant", "bf16",
+                "--lora-r", "16",
+                "--lr", "2e-4",
+                "--epochs", str(epochs),
+            ]
+            if max_steps > 0:
+                cmd += ["--max-steps", str(max_steps)]
+
+            yield build_progress_html("configure"), terminal_wrap("Setting up VL training...")
+            yield build_progress_html("smoke"), terminal_wrap("Starting VL trainer (smoke + train + merge)...")
+
+            env = {**os.environ,
+                   "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                   "HF_HUB_OFFLINE": "1",
+                   "TOKENIZERS_PARALLELISM": "false"}
+            export_path = None
+            vqa_metrics = {}
+            buf = []
+            with _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True, env=env) as proc:
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    buf.append(line)
+                    if line.startswith("EXPORT_PATH="):
+                        export_path = line.split("=", 1)[1].strip()
+                    elif line.startswith("VQA_METRICS="):
+                        try:
+                            vqa_metrics = json.loads(line.split("=", 1)[1])
+                        except Exception:
+                            pass
+                    step = "train" if "step" in line.lower() or "loss" in line.lower() else \
+                           "export" if "merging" in line.lower() or "export" in line.lower() else "smoke"
+                    yield build_progress_html(step), terminal_wrap("\n".join(buf[-150:]))
+
+            if export_path and Path(export_path).exists():
+                _user_last_model_path["path"] = export_path
+            else:
+                # Fallback: find newest export
+                exp_dir = ROOT / "exports"
+                if exp_dir.exists():
+                    candidates = sorted(
+                        [d / "merged" for d in exp_dir.iterdir() if (d / "merged" / "config.json").exists()],
+                        key=lambda p: p.stat().st_mtime, reverse=True)
+                    if candidates:
+                        _user_last_model_path["path"] = str(candidates[0])
+
+            # Write VQA metrics to log so the eval dashboard can find this run
+            if vqa_metrics:
+                import datetime as _dt_vqa
+                _vl_run = f"vl_{model}_{_dt_vqa.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                _log_dir = ROOT / "logs"; _log_dir.mkdir(exist_ok=True)
+                _eval_dir = ROOT / "eval_results" / _vl_run; _eval_dir.mkdir(parents=True, exist_ok=True)
+                _log_lines = [
+                    json.dumps({"loss": vqa_metrics.get("vqa_accuracy_before", 0), "ppl": 1.0}),
+                    json.dumps({"loss": vqa_metrics.get("vqa_accuracy_after",  0), "ppl": 1.0}),
+                    json.dumps({"vqa_accuracy_before": vqa_metrics["vqa_accuracy_before"],
+                                "vqa_accuracy_after":  vqa_metrics["vqa_accuracy_after"],
+                                "vqa_n_samples":       vqa_metrics.get("vqa_n_samples", 0)}),
+                ]
+                (_log_dir / f"train_{_vl_run}.log").write_text("\n".join(_log_lines))
+                (_eval_dir / "summary.md").write_text(
+                    f"# VL Training: {model}\n\n"
+                    f"| Metric | Before | After | Change |\n|---|---|---|---|\n"
+                    f"| VQA Accuracy | {vqa_metrics['vqa_accuracy_before']:.1%} | "
+                    f"{vqa_metrics['vqa_accuracy_after']:.1%} | "
+                    f"{(vqa_metrics['vqa_accuracy_after']-vqa_metrics['vqa_accuracy_before'])*100:+.1f}pp |\n"
+                )
+
+            # Kill ALL processes that hold VRAM and wait for memory to be fully released
+            yield build_progress_html("done"), terminal_wrap(
+                'Waiting for GPU memory to clear before loading chat model...')
+            _sp.run(["pkill", "-9", "-f", "vl_trainer.py"], capture_output=True)
+            _stop_vllm_server()  # kills vLLM server + orphaned EngineCore/VllmWorker
+            import time as _time
+            import torch as _torch_gc
+            for _wi in range(30):
+                _torch_gc.cuda.empty_cache()
+                _free_gb = _torch_gc.cuda.mem_get_info()[0] / 1024 ** 3
+                if _free_gb >= 25.0:
+                    break
+                _time.sleep(1)
+
+            yield build_progress_html("done"), terminal_wrap(
+                '<span style="color:#3fb950;font-weight:bold;font-size:16px;">Fine-tuning complete!</span><br>'
+                '<span style="color:#8b949e;">Your VL model is ready. Click "Test in Chat" to try it.</span>'
+            )
+            return
+
+        # ── Text (Axolotl) path ───────────────────────────────────────────────
         yield build_progress_html("configure"), terminal_wrap("Generating recipe...")
         cfg_args = ["configure", f"--model={model}", f"--dataset={dataset}",
                     "--quantize=4bit", f"--epochs={epochs}", "--lr=2e-4"]
-        for chunk in run_ft(cfg_args): yield build_progress_html("configure"), chunk
+        for chunk in run_ft(cfg_args):
+            yield build_progress_html("configure"), chunk
 
         configs = list_configs()
         if not configs:
@@ -2018,70 +2664,41 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
             return
 
         latest_cfg = f"configs/{configs[0]}"
-        for chunk in run_ft(["smoke-test", latest_cfg, "--steps=20"]):
+        yield build_progress_html("smoke"), terminal_wrap("Running smoke test...")
+        for chunk in run_ft(["smoke-test", latest_cfg, f"--steps={test_steps}"]):
             yield build_progress_html("smoke"), chunk
 
-        for chunk in run_ft(["train", latest_cfg]):
+        yield build_progress_html("train"), terminal_wrap("Training started...")
+        train_cmd = ["train", latest_cfg]
+        if max_steps > 0:
+            train_cmd += ["--max-steps", str(max_steps)]
+        for chunk in run_ft(train_cmd):
             yield build_progress_html("train"), chunk
 
         new_ckpts = list_checkpoints()
         if new_ckpts:
+            yield build_progress_html("export"), terminal_wrap("Exporting...")
             for chunk in run_ft(["export", f"checkpoints/{new_ckpts[0]}", "--merge", "--quantize=none"]):
                 yield build_progress_html("export"), chunk
             exports = list_exports()
             if exports:
                 _user_last_model_path["path"] = str(ROOT / "exports" / exports[0] / "merged")
 
+            # Register run in eval_results so the Evaluation Dashboard can discover it
+            _cm_run = new_ckpts[0]
+            _cm_eval_dir = ROOT / "eval_results" / _cm_run
+            _cm_eval_dir.mkdir(parents=True, exist_ok=True)
+            if not (_cm_eval_dir / "summary.md").exists():
+                (_cm_eval_dir / "summary.md").write_text(
+                    f"# Training run: {_cm_run}\n\n"
+                    f"Model: {model}  |  Dataset: {dataset}  |  Mode: Custom Mix\n\n"
+                    f"See the Training Loss and Perplexity charts for metrics.\n"
+                )
+
         yield build_progress_html("done"), terminal_wrap(
-            '<span style="color:#3fb950;font-weight:bold;font-size:16px;">Complete!</span>')
-
-    def run_user_custommix(models_sel, datasets_sel, upload_file, model_name, test_steps=50, epochs=1):
-        test_steps = int(test_steps or 50)
-        epochs = int(epochs or 1)
-        model_map = {
-            "Nemotron-Nano-4B-Omni": DEFAULT_BASE_DIR,
-            "Qwen2.5-7B-Instruct": "qwen__qwen2.5-7b-instruct",
-            "Qwen2.5-3B-Instruct": "qwen__qwen2.5-3b-instruct",
-        }
-        model_key = models_sel.split("  ")[0]
-        model = model_map.get(model_key, DEFAULT_BASE_DIR)
-        ds_names = []
-        for d in (datasets_sel or []):
-            if "alpaca" in d: ds_names.append("alpaca")
-            elif "guanaco" in d: ds_names.append("guanaco-llama2-1k")
-        if not ds_names: ds_names = ["alpaca"]
-        dataset = ds_names[0]
-
-        yield build_progress_html("configure"), terminal_wrap("Generating recipe..."), gr.Row(visible=False)
-        cfg_args = ["configure", f"--model={model}", f"--dataset={dataset}",
-                    "--quantize=4bit", f"--epochs={epochs}", "--lr=2e-4"]
-        for chunk in run_ft(cfg_args):
-            yield build_progress_html("configure"), chunk, gr.Row(visible=False)
-
-        configs = list_configs()
-        if not configs:
-            yield build_progress_html("configure"), terminal_wrap('<span style="color:#f85149;">Config failed.</span>'), gr.Row(visible=False)
-            return
-
-        latest_cfg = f"configs/{configs[0]}"
-        yield build_progress_html("smoke"), terminal_wrap("Running smoke test..."), gr.Row(visible=False)
-        for chunk in run_ft(["smoke-test", latest_cfg, f"--steps={test_steps}"]):
-            yield build_progress_html("smoke"), chunk, gr.Row(visible=False)
-
-        yield build_progress_html("train"), terminal_wrap("Training started..."), gr.Row(visible=False)
-        for chunk in run_ft(["train", latest_cfg]):
-            yield build_progress_html("train"), chunk, gr.Row(visible=False)
-
-        new_ckpts = list_checkpoints()
-        if new_ckpts:
-            yield build_progress_html("export"), terminal_wrap("Exporting..."), gr.Row(visible=False)
-            for chunk in run_ft(["export", f"checkpoints/{new_ckpts[0]}", "--merge", "--quantize=none"]):
-                yield build_progress_html("export"), chunk, gr.Row(visible=False)
-
-        yield build_progress_html("export"), terminal_wrap(
             '<span style="color:#3fb950;font-weight:bold;font-size:16px;">Fine-tuning complete!</span><br>'
             '<span style="color:#8b949e;">Your model is ready. Click "Test in Chat" to try it.</span>'
-        ), gr.Row(visible=True)
+        )
 
     def show_screen4(s1, s2a, s2b, s3, s4):
         return (gr.Group(visible=s1), gr.Group(visible=s2a),
@@ -2097,10 +2714,49 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
         return gr.Button(visible=True), gr.Button(visible=False)
 
     def go_to_chat():
-        # Load model into user chat automatically
-        model_path = _user_last_model_path.get("path")
-        if model_path:
-            load_model(model_path)
+        try:
+            # Prefer: (1) just-trained VL export, (2) any VL export, (3) base VL model, (4) any export
+            def _is_valid(p):
+                mp = Path(p) if p else None
+                return mp and mp.exists() and (mp / "tokenizer.json").exists() and (mp / "config.json").exists()
+
+            model_path = _user_last_model_path.get("path")
+
+            # If last trained model isn't VL-capable, search for a better one
+            if not model_path or not _is_valid(model_path) or not _is_vl_model(model_path):
+                # Look for a VL export first (newest first)
+                vl_export = None
+                exp_dir = ROOT / "exports"
+                if exp_dir.exists():
+                    for d in sorted(exp_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+                        candidate = d / "merged"
+                        if _is_valid(str(candidate)) and _is_vl_model(str(candidate)):
+                            vl_export = str(candidate)
+                            break
+                if vl_export:
+                    model_path = vl_export
+                else:
+                    # Fall back to base VL model from models/
+                    models_dir = ROOT / "models"
+                    if models_dir.exists():
+                        for d in sorted(models_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+                            if _is_valid(str(d)) and _is_vl_model(str(d)):
+                                model_path = str(d)
+                                break
+                    # Last resort: any valid model
+                    if not model_path or not _is_valid(model_path):
+                        if models_dir.exists():
+                            for d in sorted(models_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+                                if _is_valid(str(d)):
+                                    model_path = str(d)
+                                    break
+
+            if model_path and _is_valid(model_path):
+                _user_last_model_path["path"] = model_path
+        except Exception as _gtc_exc:
+            import traceback as _gtc_tb
+            with open("/tmp/ft_chat_errors.log", "a") as _ef:
+                _ef.write(f"[go_to_chat] {_gtc_exc}\n{_gtc_tb.format_exc()}\n---\n")
         return show_screen4(False, False, False, False, True)
 
     _btn_outs = [back_user_btn, cancel_train_btn]
@@ -2121,7 +2777,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
     ).then(show_cancel_btn, outputs=_btn_outs
     ).then(
         run_user_custommix,
-        inputs=[user_cm_model, user_cm_dataset, user_cm_file, user_cm_name, user_cm_test_steps, user_cm_epochs],
+        inputs=[user_cm_model, user_cm_dataset, user_cm_file, user_cm_name, user_cm_test_steps, user_cm_epochs, user_cm_max_steps],
         outputs=[user_progress_html, user_progress_out],
         show_progress=False,
     ).then(show_home_btn, outputs=_btn_outs
@@ -2162,86 +2818,146 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
     )
 
     # Inline chat in Screen 4
+    _user_error_log_lines = []
+
+    def _append_error_log(text: str) -> str:
+        import datetime as _dt_err
+        ts = _dt_err.datetime.now().strftime("%H:%M:%S")
+        _user_error_log_lines.insert(0, f"[{ts}] {text}")
+        if len(_user_error_log_lines) > 50:
+            _user_error_log_lines.pop()
+        entry = "\n\n".join(_user_error_log_lines[:10])
+        # Also write to disk for persistent inspection
+        try:
+            with open("/tmp/ft_chat_errors.log", "a") as _ef:
+                _ef.write(f"[{ts}] {text}\n---\n")
+        except Exception:
+            pass
+        return entry
+
+    def _build_chat_content(message: str, image):
+        """Build chat history content — plain string for text-only, base64 img+text for image."""
+        if image is None:
+            return message
+        import base64, io
+        try:
+            buf = io.BytesIO()
+            image.convert("RGB").save(buf, "JPEG", quality=85)
+            b64 = base64.b64encode(buf.getvalue()).decode()
+            img_html = (f'<img src="data:image/jpeg;base64,{b64}" '
+                        f'style="max-width:280px;max-height:200px;border-radius:8px;'
+                        f'display:block;margin-bottom:6px;">')
+            return f'{img_html}{message}' if message.strip() else img_html
+        except Exception:
+            return message
+
     def user_chat_send(message, history, image=None):
         global _chat_model, _chat_tok, _chat_name, _chat_is_vision
         if not message.strip():
-            yield history or [], ""
+            yield history or [], "", "No errors yet." if not _user_error_log_lines else "\n\n".join(_user_error_log_lines[:10]), None
             return
         history = list(history or [])
         if _chat_model is None:
-            model_path = _user_last_model_path.get("path")
             def _is_valid_model(p):
                 mp = Path(p) if p else None
                 return mp and mp.exists() and (mp / "tokenizer.json").exists() and (mp / "config.json").exists()
-            if not _is_valid_model(model_path):
-                exports = list_exports()
-                model_path = None
-                for exp in exports:
-                    candidate = ROOT / "exports" / exp / "merged"
-                    if _is_valid_model(str(candidate)):
-                        model_path = str(candidate)
-                        break
+
+            # Priority: last-trained VL export → any VL export → base VL model → any valid model
+            # NVFP4/vLLM models are inference-only and cannot be loaded for chat — always skip them
+            model_path = _user_last_model_path.get("path")
+            if not _is_valid_model(model_path) or not _is_vl_model(model_path or "") or _is_vllm_model(model_path or ""):
+                # Search exports for a VL model (newest first)
+                exp_dir = ROOT / "exports"
+                vl_export = None
+                if exp_dir.exists():
+                    for d in sorted(exp_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+                        candidate = d / "merged"
+                        if _is_valid_model(str(candidate)) and _is_vl_model(str(candidate)) and not _is_vllm_model(str(candidate)):
+                            vl_export = str(candidate)
+                            break
+                if vl_export:
+                    model_path = vl_export
+                else:
+                    # Fall back to base VL model from models/ — prefer DEFAULT_BASE_DIR explicitly
+                    default_vl = ROOT / "models" / DEFAULT_BASE_DIR
+                    if _is_valid_model(str(default_vl)):
+                        model_path = str(default_vl)
+                    else:
+                        models_dir = ROOT / "models"
+                        if models_dir.exists():
+                            for d in sorted(models_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+                                if _is_valid_model(str(d)) and _is_vl_model(str(d)) and not _is_vllm_model(str(d)):
+                                    model_path = str(d)
+                                    break
+                    # Last resort: any valid non-NVFP4 model
+                    if not _is_valid_model(model_path):
+                        models_dir = ROOT / "models"
+                        if models_dir.exists():
+                            for d in sorted(models_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+                                if _is_valid_model(str(d)) and not _is_vllm_model(str(d)):
+                                    model_path = str(d)
+                                    break
             if not model_path:
                 history.append({"role": "user", "content": message})
-                history.append({"role": "assistant", "content": "No trained model found. Please complete the training step first."})
-                yield history, ""
+                history.append({"role": "assistant", "content": "No model found. Please complete the training step or add a model to the models/ directory."})
+                yield history, "", "No errors yet.", None
                 return
-            history.append({"role": "user", "content": message})
+            _user_content = _build_chat_content(message, image)
+            history.append({"role": "user", "content": _user_content})
             history.append({"role": "assistant", "content": "⏳ Loading your model, please wait (~30–60 s)..."})
-            yield history, ""
+            yield history, "", "No errors yet.", None
             try:
                 _chat_tok, _chat_model, _chat_is_vision = _load_chat_model(model_path)
                 _chat_name = model_path
                 history[-1]["content"] = "✓ Model loaded. Now answering your message..."
-                yield history, ""
+                yield history, "", "No errors yet.", None
             except Exception as e:
-                history[-1]["content"] = f"Failed to load model: {e}"
-                yield history, ""
+                import traceback as _tb_load
+                _tb_str = _tb_load.format_exc()
+                err_log = _append_error_log(f"Model load failed: {e}\n{_tb_str}")
+                history[-1]["content"] = f"Failed to load model: {e}\n\nSee Error Log for details."
+                yield history, "", err_log, None
                 return
+        err_log_val = "No errors yet." if not _user_error_log_lines else "\n\n".join(_user_error_log_lines[:10])
         try:
-            import torch
-            msgs = [{"role": "system", "content": "You are a helpful assistant."}]
-            for t in history:
-                if isinstance(t, dict):
-                    content = t.get("content", "")
-                    if isinstance(content, list):
-                        content = " ".join(i.get("text", str(i)) for i in content)
-                    msgs.append({"role": t["role"], "content": str(content)})
-            msgs.append({"role": "user", "content": message})
-            inputs = _build_chat_inputs(msgs, image=image)
-            ids = inputs.get("input_ids", inputs.get("input_ids"))
-            _eos_ids = [_chat_tok.eos_token_id]
-            try:
-                _im_end = _chat_tok.convert_tokens_to_ids("<|im_end|>")
-                if _im_end and _im_end != _chat_tok.eos_token_id:
-                    _eos_ids.append(_im_end)
-            except Exception:
-                pass
-            with torch.no_grad():
-                out = _chat_model.generate(
-                    **inputs, max_new_tokens=256, do_sample=True,
-                    temperature=0.7, top_p=0.9,
-                    eos_token_id=_eos_ids,
-                    pad_token_id=_chat_tok.eos_token_id)
-            reply = _chat_tok.decode(out[0][ids.shape[1]:], skip_special_tokens=True,
-                                     clean_up_tokenization_spaces=False).strip()
-            import re as _re
-            reply = _re.sub(r'<0x([0-9A-Fa-f]{2})>',
-                            lambda m: bytes([int(m.group(1), 16)]).decode('utf-8', errors='replace'),
-                            reply)
-            reply = reply.replace("<|im_end|>", "").replace("<|im_start|>", "").strip()
+            if image is not None and not _chat_is_vision:
+                reply = ("⚠️ This model is text-only and cannot process images. "
+                         "Load a vision-language model (e.g. Nemotron 12B VL) to use image input.")
+            else:
+                msgs = [{"role": "system", "content": "You are a helpful assistant."}]
+                for t in history:
+                    if isinstance(t, dict):
+                        content = t.get("content", "")
+                        if isinstance(content, list):
+                            content = " ".join(i.get("text", str(i)) for i in content)
+                        msgs.append({"role": t["role"], "content": str(content)})
+                msgs.append({"role": "user", "content": message})
+                _max_tok = 1024 if (image is not None and _chat_is_vision) else 256
+                reply = _generate_reply(msgs, max_tokens=_max_tok, image=image)
         except Exception as e:
-            reply = f"Error: {e}"
-        history.append({"role": "user", "content": message})
+            import traceback as _tb_gen
+            _tb_str = _tb_gen.format_exc()
+            err_reason = type(e).__name__
+            if "NoneType" in str(e) and "shape" in str(e):
+                err_detail = "Generation failed: model internal error (NoneType.shape). Check Error Log."
+            elif "CUDA out of memory" in str(e):
+                err_detail = "Generation failed: GPU out of memory. Try restarting the app."
+            elif "device" in str(e).lower():
+                err_detail = f"Generation failed: device/GPU error — {e}"
+            else:
+                err_detail = f"Generation failed ({err_reason}): {e}"
+            err_log_val = _append_error_log(f"{err_detail}\n\nFull traceback:\n{_tb_str}")
+            reply = f"⚠️ {err_detail}\n\nOpen the **Error Log** panel below to see the full traceback."
+        history.append({"role": "user", "content": _build_chat_content(message, image)})
         history.append({"role": "assistant", "content": reply})
-        yield history, ""
+        yield history, "", err_log_val, None
 
     user_send_btn.click(user_chat_send,
                         inputs=[user_chat_input, user_chatbot, user_chat_image],
-                        outputs=[user_chatbot, user_chat_input], show_progress=False)
+                        outputs=[user_chatbot, user_chat_input, user_error_log, user_chat_image], show_progress=False)
     user_chat_input.submit(user_chat_send,
                            inputs=[user_chat_input, user_chatbot, user_chat_image],
-                           outputs=[user_chatbot, user_chat_input], show_progress=False)
+                           outputs=[user_chatbot, user_chat_input, user_error_log, user_chat_image], show_progress=False)
     user_clear_btn.click(lambda: ([], None), outputs=[user_chatbot, user_chat_image])
 
     # Publish from user mode
@@ -2266,10 +2982,9 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
         if not best_export:
             yield terminal_wrap('<span style="color:#f85149;">No valid exported model found. Complete training first.</span>')
             return
-        # Auto-fill MODEL_CARD.md placeholders so publish doesn't block
-        import os as _os
-        _os.environ["HF_TOKEN"] = token.strip()
-        _os.environ["HUGGING_FACE_HUB_TOKEN"] = token.strip()
+        # H-6: Scope HF login to this publish call only; don't leak token into process env
+        import huggingface_hub as _hfhub
+        _hfhub.login(token=token.strip(), add_to_git_credential=False)
         card_path = ROOT / "exports" / best_export / "MODEL_CARD.md"
         if card_path.exists():
             txt = card_path.read_text()
@@ -2368,11 +3083,16 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
 
                         # Upload panel
                         with gr.Group(visible=False) as ds_panel_upload:
-                            ds_file = gr.File(label="Select a file",
-                                              file_types=[".jsonl", ".json", ".csv", ".parquet"],
+                            ds_file = gr.File(label="Select a file  (.jsonl / .json / .csv / .parquet / .pdf)",
+                                              file_types=[".jsonl", ".json", ".csv", ".parquet", ".pdf"],
                                               file_count="single")
                             ds_name_file = gr.Textbox(label="Local name  (optional — defaults to filename)",
                                                        placeholder="leave blank to use filename")
+                            ds_pdf_prompt = gr.Textbox(
+                                label="PDF page prompt  (only used for PDF uploads)",
+                                value="Describe this page in detail.",
+                                visible=True,
+                            )
                             add_ds_file_btn = gr.Button("Upload & Normalize", variant="primary")
 
                         # Server panel
@@ -2429,11 +3149,37 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                     args = ["add-dataset", src] + (["--name", name] if name else [])
                     yield from run_ft(args)
     
-                def do_upload(file, name):
+                def do_upload(file, name, pdf_prompt):
                     if file is None:
                         yield terminal_wrap('<span style="color:#f85149;">No file selected.</span>')
                         return
-                    derived = name.strip() or Path(file.name).stem.lower().replace(" ", "-")
+                    fpath = Path(file.name)
+                    derived = name.strip() or fpath.stem.lower().replace(" ", "-")
+                    if fpath.suffix.lower() == ".pdf":
+                        try:
+                            import sys as _sys
+                            _sys.path.insert(0, str(ROOT))
+                            from pdf_utils import pdf_dataset_to_jsonl
+                            ds_dir = ROOT / "datasets" / derived
+                            ds_dir.mkdir(parents=True, exist_ok=True)
+                            yield terminal_wrap(f"Converting PDF to image dataset: <b>{derived}</b>...")
+                            jsonl_path = pdf_dataset_to_jsonl(
+                                str(fpath), str(ds_dir),
+                                prompt=pdf_prompt.strip() or "Describe this page in detail.",
+                            )
+                            # M-5: write to canonical datasets/<name>/train.jsonl
+                            import shutil as _sh
+                            train_dir = ROOT / "datasets" / derived
+                            train_dir.mkdir(parents=True, exist_ok=True)
+                            _sh.copy2(jsonl_path, str(train_dir / "train.jsonl"))
+                            n_lines = sum(1 for _ in open(jsonl_path))
+                            yield terminal_wrap(
+                                f'<span style="color:#3fb950;">PDF converted: {n_lines} pages → '
+                                f'<b>{derived}</b> (ready for multimodal training)</span>')
+                        except Exception as exc:
+                            yield terminal_wrap(
+                                f'<span style="color:#f85149;">PDF conversion failed: {exc}</span>')
+                        return
                     yield from run_ft(["add-dataset", file.name, "--name", derived])
     
                 def show_existing_ds(names):
@@ -2625,7 +3371,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
 
                 add_ds_hf_btn.click(do_add_hf, inputs=[ds_src, ds_name_hf],
                                     outputs=add_ds_out, show_progress=False)
-                add_ds_file_btn.click(do_upload, inputs=[ds_file, ds_name_file],
+                add_ds_file_btn.click(do_upload, inputs=[ds_file, ds_name_file, ds_pdf_prompt],
                                       outputs=add_ds_out, show_progress=False)
                 existing_ds_ref.click(lambda: gr.CheckboxGroup(choices=list_datasets()), outputs=existing_ds_cb)
                 existing_ds_cb.change(show_existing_ds, inputs=existing_ds_cb, outputs=existing_ds_info)
@@ -2774,13 +3520,37 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                                                  allow_custom_value=True)
                         cfg_ds    = gr.Dropdown(label="Dataset", choices=list_cleaned_datasets(),
                                                  allow_custom_value=True)
-                        cfg_quant = gr.Radio(["4bit (QLoRA)", "8bit", "none (full LoRA)"],
-                                              value="4bit (QLoRA)", label="Quantization")
+
+                        # Training mode — auto-detected from model; user can override
+                        cfg_mode = gr.Radio(
+                            ["text", "multimodal"],
+                            value="text",
+                            label="Training mode",
+                            info="Auto-set when model is selected. Multimodal uses VL trainer.",
+                        )
+
+                        # Quantization — NVFP4 is INFERENCE-ONLY, never offered here
+                        cfg_quant = gr.Radio(
+                            ["BF16 + LoRA", "8-bit + LoRA", "4-bit QLoRA NF4"],
+                            value="BF16 + LoRA",
+                            label="Training quantization",
+                            info="NVFP4 is inference-only and is not available for training.",
+                        )
+
+                        # Multimodal-only options (shown when mode=multimodal)
+                        with gr.Group(visible=False) as cfg_vl_group:
+                            cfg_lora_r = gr.Slider(8, 64, value=16, step=8, label="LoRA rank")
+                            cfg_img_res = gr.Radio(
+                                ["224", "448", "672"],
+                                value="224",
+                                label="Image resolution (px)",
+                            )
+
                         with gr.Row():
                             cfg_lr     = gr.Number(value=2e-4, label="Learning rate", precision=6)
                             cfg_epochs = gr.Slider(1, 10, value=3, step=1, label="Epochs")
                         cfg_seq = gr.Slider(512, 8192, value=2048, step=512, label="Sequence length")
-    
+
                         gr.HTML('<div style="border-top:1px solid #30363d;margin:12px 0 8px;"></div>')
                         cfg_wandb_enable = gr.Checkbox(
                             label="Enable Weights & Biases logging",
@@ -2791,25 +3561,66 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                                 label="W&B Project", placeholder="mkd-finetuning")
                             cfg_wandb_entity  = gr.Textbox(
                                 label="W&B Entity (username/team)", placeholder="mkd-hika")
-    
+
                         cfg_wandb_enable.change(
                             lambda on: gr.Group(visible=on),
                             inputs=cfg_wandb_enable, outputs=cfg_wandb_group)
-    
+
+                        # Auto-detect training mode when model is chosen
+                        def _auto_detect_mode(model_name):
+                            if not model_name:
+                                return gr.Radio(value="text"), gr.Group(visible=False)
+                            p = ROOT / "models" / model_name
+                            is_vl = _is_vl_model(str(p))
+                            return gr.Radio(value="multimodal" if is_vl else "text"), gr.Group(visible=is_vl)
+                        cfg_model.change(_auto_detect_mode, inputs=cfg_model,
+                                         outputs=[cfg_mode, cfg_vl_group])
+                        cfg_mode.change(
+                            lambda m: gr.Group(visible=(m == "multimodal")),
+                            inputs=cfg_mode, outputs=cfg_vl_group)
+
                         with gr.Row():
                             gr.Button("↺ Refresh", size="sm", variant="secondary").click(
                                 lambda: (gr.Dropdown(choices=list_models()),
                                          gr.Dropdown(choices=list_cleaned_datasets())),
                                 outputs=[cfg_model, cfg_ds])
-                            cfg_btn = gr.Button("Generate", variant="primary")
-    
+                            cfg_btn = gr.Button("Generate / Save config", variant="primary")
+
                     with gr.Column(scale=2):
                         cfg_out  = gr.HTML(terminal_wrap(""))
-                        cfg_yaml = gr.Code(label="Generated YAML", language="yaml",
-                                           lines=22, interactive=False)
-    
-                def do_configure(model, ds, quant, lr, epochs, seq,
+                        cfg_yaml = gr.Code(label="Generated YAML (text mode) / Config summary (VL mode)",
+                                           language="yaml", lines=22, interactive=False)
+
+                def do_configure(model, ds, mode, quant, lora_r, lr, epochs, seq,
                                  wandb_on, wandb_project, wandb_entity):
+                    if mode == "multimodal":
+                        # For VL mode, write a JSON config file instead of Axolotl YAML
+                        import datetime
+                        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                        cfg_name = f"vl_{ts}.json"
+                        quant_map = {
+                            "BF16 + LoRA": "bf16",
+                            "8-bit + LoRA": "8bit",
+                            "4-bit QLoRA NF4": "4bit",
+                        }
+                        cfg_data = {
+                            "mode": "multimodal",
+                            "model": model,
+                            "dataset": ds,
+                            "quant": quant_map.get(quant, "bf16"),
+                            "lora_r": int(lora_r),
+                            "lr": lr,
+                            "epochs": int(epochs),
+                            "seq_len": int(seq),
+                        }
+                        cfg_path = ROOT / "configs" / cfg_name
+                        cfg_path.parent.mkdir(exist_ok=True)
+                        cfg_path.write_text(json.dumps(cfg_data, indent=2))
+                        summary = json.dumps(cfg_data, indent=2)
+                        yield terminal_wrap(
+                            f'<span style="color:#3fb950;">VL config saved: {cfg_name}</span>'), summary
+                        return
+
                     q = quant.split(" ")[0]
                     args = [
                         "configure", "--model", model, "--dataset", ds,
@@ -2820,7 +3631,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                         args += ["--wandb-project", wandb_project.strip()]
                     if wandb_on and wandb_entity.strip():
                         args += ["--wandb-entity", wandb_entity.strip()]
-    
+
                     output_html = terminal_wrap("")
                     for chunk in run_ft(args):
                         output_html = chunk
@@ -2830,7 +3641,8 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                     yield output_html, yaml_txt
     
                 cfg_btn.click(do_configure,
-                              inputs=[cfg_model, cfg_ds, cfg_quant, cfg_lr, cfg_epochs, cfg_seq,
+                              inputs=[cfg_model, cfg_ds, cfg_mode, cfg_quant, cfg_lora_r,
+                                      cfg_lr, cfg_epochs, cfg_seq,
                                       cfg_wandb_enable, cfg_wandb_project, cfg_wandb_entity],
                               outputs=[cfg_out, cfg_yaml], show_progress=False)
 
@@ -2883,11 +3695,82 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                     cfgs = list_configs()
                     return cfgs[0] if cfgs else ""
 
+                def _latest_vl_config():
+                    """Return parsed VL JSON config dict if the latest config is multimodal, else None."""
+                    cfgs = list_configs()
+                    if not cfgs:
+                        return None
+                    c = cfgs[0]
+                    cfg_path = ROOT / "configs" / c
+                    if not cfg_path.exists():
+                        return None
+                    try:
+                        data = json.loads(cfg_path.read_text())
+                        if data.get("mode") == "multimodal":
+                            return data
+                    except Exception:
+                        pass
+                    return None
+
+                def _vl_train_cmd(cfg_data, smoke=False):
+                    """Build the vl_trainer.py subprocess command from a VL config dict."""
+                    quant_map = {
+                        "BF16 + LoRA": "bf16",
+                        "8-bit + LoRA": "8bit",
+                        "4-bit QLoRA NF4": "4bit",
+                        "bf16": "bf16", "8bit": "8bit", "4bit": "4bit",
+                    }
+                    model_name = cfg_data.get("model", "")
+                    model_path = str(ROOT / "models" / model_name) if "/" not in model_name else model_name
+                    ds_name    = cfg_data.get("dataset", "")
+                    # M-5: canonical path is datasets/<name>; cleaned_datasets is legacy
+                    if "/" not in ds_name:
+                        _ds_canonical = ROOT / "datasets" / ds_name
+                        _ds_legacy    = ROOT / "cleaned_datasets" / ds_name
+                        ds_path = str(_ds_canonical if _ds_canonical.exists() else _ds_legacy)
+                    else:
+                        ds_path = ds_name
+                    out_path   = str(ROOT / "checkpoints" / f"vl_{model_name}")
+                    quant      = quant_map.get(cfg_data.get("quant", "bf16"), "bf16")
+                    lora_r     = cfg_data.get("lora_r", 16)
+                    lr         = cfg_data.get("lr", 2e-4)
+                    epochs     = cfg_data.get("epochs", 3)
+                    cmd = [
+                        "python", str(ROOT / "vl_trainer.py"),
+                        "--model", model_path,
+                        "--dataset", ds_path,
+                        "--output", out_path,
+                        "--quant", quant,
+                        "--lora-r", str(lora_r),
+                        "--lr", str(lr),
+                        "--epochs", str(int(epochs)),
+                    ]
+                    if smoke:
+                        cmd.append("--smoke")
+                    return cmd
+
                 def do_smoke(steps):
                     c = _latest_config()
                     if not c:
                         yield gr.Button(visible=False), terminal_wrap(
                             '<span style="color:#f85149;">No recipe found — run Configure first.</span>')
+                        return
+                    vl_cfg = _latest_vl_config()
+                    if vl_cfg:
+                        import subprocess as _sp
+                        cmd = _vl_train_cmd(vl_cfg, smoke=True)
+                        yield gr.Button(visible=True), terminal_wrap(f"Running VL smoke test ({c})...")
+                        with _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True,
+                                       env={**os.environ,
+                                            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                                            "HF_HUB_OFFLINE": "1",
+                                            "TOKENIZERS_PARALLELISM": "false"}) as proc:
+                            buf = []
+                            for line in proc.stdout:
+                                buf.append(line.rstrip())
+                                yield gr.Button(visible=True), terminal_wrap("\n".join(buf[-200:]))
+                        chunk = terminal_wrap("\n".join(buf[-200:]))
+                        yield gr.Button(visible=False), chunk
                         return
                     yield gr.Button(visible=True), terminal_wrap(f"Running smoke test with {c}...")
                     for chunk in run_ft(["smoke-test", f"configs/{c}", "--steps", str(int(steps))]):
@@ -2899,6 +3782,25 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                     if not c:
                         yield gr.Button(visible=False), terminal_wrap(
                             '<span style="color:#f85149;">No recipe found — run Configure first.</span>')
+                        return
+                    vl_cfg = _latest_vl_config()
+                    if vl_cfg:
+                        import subprocess as _sp
+                        cmd = _vl_train_cmd(vl_cfg, smoke=False)
+                        if int(max_steps or 0) > 0:
+                            cmd += ["--max-steps", str(int(max_steps))]
+                        yield gr.Button(visible=True), terminal_wrap(f"Starting VL training ({c})...")
+                        with _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True,
+                                       env={**os.environ,
+                                            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                                            "HF_HUB_OFFLINE": "1",
+                                            "TOKENIZERS_PARALLELISM": "false"}) as proc:
+                            buf = []
+                            for line in proc.stdout:
+                                buf.append(line.rstrip())
+                                yield gr.Button(visible=True), terminal_wrap("\n".join(buf[-200:]))
+                        chunk = terminal_wrap("\n".join(buf[-200:]))
+                        yield gr.Button(visible=False), chunk
                         return
                     cmd = ["train", f"configs/{c}"]
                     if int(max_steps or 0) > 0:
@@ -2914,6 +3816,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                     _sp.run(["pkill", "-f", "axolotl.cli.train"], capture_output=True)
                     _sp.run(["pkill", "-f", "ft_train.py"],       capture_output=True)
                     _sp.run(["pkill", "-f", "ft_smoke_test.py"],  capture_output=True)
+                    _sp.run(["pkill", "-f", "vl_trainer.py"],     capture_output=True)
                     return gr.Button(visible=False), terminal_wrap(
                         '<span style="color:#f85149;font-weight:600;">Training cancelled.</span>')
 
@@ -3109,9 +4012,9 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                             if not token or not token.strip():
                                 yield terminal_wrap('<span style="color:#f85149;font-weight:600;">✗ HuggingFace Write token is required — get it at huggingface.co/settings/tokens</span>')
                                 return
-                            import os as _os
-                            _os.environ["HF_TOKEN"] = token.strip()
-                            _os.environ["HUGGING_FACE_HUB_TOKEN"] = token.strip()
+                            # H-6: scope login to this call; don't pollute the process env
+                            import huggingface_hub as _hfhub
+                            _hfhub.login(token=token.strip(), add_to_git_credential=False)
                             args = ["publish", f"exports/{exp}", "--hf-repo", hf.strip()]
                             if gh.strip(): args += ["--github-repo", gh.strip()]
                             if ack: args.append("--acknowledge-contamination")
@@ -3195,6 +4098,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                             import torch; torch.cuda.empty_cache()
                         except Exception:
                             pass
+                    _stop_vllm_server()
 
                     resolved = resolve_chat_path(model_name)
                     model_path = Path(resolved)
@@ -3207,14 +4111,20 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                         _chat_tok, _chat_model, _chat_is_vision = _load_chat_model(str(model_path))
                         _chat_name = model_name
                         label = model_name.split("  [")[0]
-                        tag = " (vision)" if _chat_is_vision else ""
+                        if _vllm_client is not None:
+                            tag = " (vLLM · omni)"
+                        elif _chat_is_vision:
+                            tag = " (vision)"
+                        else:
+                            tag = ""
                         return (f'<div style="color:#3fb950;font-weight:600;padding:8px;">'
                                 f'Loaded: {label}{tag}</div>')
                     except Exception as e:
                         return f'<div style="color:#f85149;padding:8px;">Failed: {e}</div>'
-    
+
                 def unload_model():
                     global _chat_model, _chat_tok, _chat_name
+                    _stop_vllm_server()
                     if _chat_model is not None:
                         del _chat_model; _chat_model = None
                         del _chat_tok;   _chat_tok = None
@@ -3232,13 +4142,12 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                         yield history or [], ""
                         return
                     history = list(history or [])
-                    if _chat_model is None:
+                    if _chat_model is None and _vllm_client is None:
                         history.append({"role": "user",      "content": message})
                         history.append({"role": "assistant", "content": "No model loaded. Please load a model first."})
                         yield history, ""
                         return
                     try:
-                        import torch
                         def extract_text(content) -> str:
                             if isinstance(content, str):
                                 return content
@@ -3246,35 +4155,17 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                                 return " ".join(i.get("text", str(i)) if isinstance(i, dict) else str(i) for i in content)
                             return str(content)
 
-                        msgs = [{"role": "system", "content": system_prompt}]
-                        for turn in history:
-                            if isinstance(turn, dict):
-                                msgs.append({"role": turn.get("role", "user"),
-                                             "content": extract_text(turn.get("content", ""))})
-                        msgs.append({"role": "user", "content": message})
-
-                        inputs = _build_chat_inputs(msgs, image=image)
-                        ids = inputs.get("input_ids")
-                        _eos_ids = [_chat_tok.eos_token_id]
-                        try:
-                            _im_end = _chat_tok.convert_tokens_to_ids("<|im_end|>")
-                            if _im_end and _im_end != _chat_tok.eos_token_id:
-                                _eos_ids.append(_im_end)
-                        except Exception:
-                            pass
-                        with torch.no_grad():
-                            out = _chat_model.generate(
-                                **inputs, max_new_tokens=max_tokens,
-                                do_sample=True, temperature=0.7, top_p=0.9,
-                                eos_token_id=_eos_ids,
-                                pad_token_id=_chat_tok.eos_token_id)
-                        reply = _chat_tok.decode(out[0][ids.shape[1]:], skip_special_tokens=True,
-                                                 clean_up_tokenization_spaces=False).strip()
-                        import re as _re
-                        reply = _re.sub(r'<0x([0-9A-Fa-f]{2})>',
-                                        lambda m: bytes([int(m.group(1), 16)]).decode('utf-8', errors='replace'),
-                                        reply)
-                        reply = reply.replace("<|im_end|>", "").replace("<|im_start|>", "").strip()
+                        if image is not None and not _chat_is_vision:
+                            reply = ("⚠️ This model is text-only and cannot process images. "
+                                     "Load a vision-language model (e.g. Nemotron 12B VL) to use image input.")
+                        else:
+                            msgs = [{"role": "system", "content": system_prompt}]
+                            for turn in history:
+                                if isinstance(turn, dict):
+                                    msgs.append({"role": turn.get("role", "user"),
+                                                 "content": extract_text(turn.get("content", ""))})
+                            msgs.append({"role": "user", "content": message})
+                            reply = _generate_reply(msgs, max_tokens=max_tokens, image=image)
                     except Exception as e:
                         reply = f"Error: {e}"
 
@@ -3304,15 +4195,28 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
 # ── Launch ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import argparse
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="MKD Fine-Tuning Platform. "
+                    "Set ADMIN_PASSWORD env var to enable auth. "
+                    "To expose externally use --host 0.0.0.0 (or a reverse proxy)."
+    )
     ap.add_argument("--port",  type=int, default=7860)
-    ap.add_argument("--host",  default="0.0.0.0")
+    # H-7: Default to localhost-only for security.
+    # Use --host 0.0.0.0 to expose on the network (behind a firewall / reverse proxy).
+    ap.add_argument("--host",  default="127.0.0.1")
     ap.add_argument("--share", action="store_true")
     args = ap.parse_args()
 
+    # H-7: Optional HTTP basic auth via ADMIN_PASSWORD env var
+    _admin_pw = os.environ.get("ADMIN_PASSWORD", "").strip()
+    _auth     = [("admin", _admin_pw)] if _admin_pw else None
+
     print(f"\n   MKD Fine-Tuning Platform")
     print(f" Project : {ROOT}")
-    print(f" URL     : http://localhost:{args.port}\n")
+    print(f" URL     : http://{args.host}:{args.port}")
+    if _auth:
+        print(" Auth    : basic auth enabled (username: admin)")
+    print()
 
     theme = gr.themes.Base(
         primary_hue=gr.themes.colors.blue,
@@ -3349,6 +4253,7 @@ if __name__ == "__main__":
         server_name=args.host,
         server_port=args.port,
         share=args.share,
+        auth=_auth,
         theme=theme,
         css=CSS,
         max_threads=10,

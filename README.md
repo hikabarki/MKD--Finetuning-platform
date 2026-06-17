@@ -1,92 +1,125 @@
-# Self-Service Fine-Tuning Platform
+# MKD Fine-Tuning Platform — Multimodal
 
-A guided, command-line fine-tuning pipeline designed so **non-engineers** can
-take a base model + a dataset URL and ship a fine-tuned model — with the system
-telling them exactly what command to run next at every step.
-
-Maintained by: **Hika** (MKD Co., Ltd. — https://mkd.kr)
+A production-grade fine-tuning platform for NVIDIA GPUs supporting both **text** and **vision-language (VL)** models. Built with a Gradio UI for rapid prototyping and a clean CLI backend designed for frontend integration.
 
 ---
 
-## What this is
+## Features
 
-A thin, opinionated orchestration layer on top of proven OSS tools
-(`huggingface_hub`, `datasets`, `axolotl` / `LLaMA-Factory` / `trl`, `unsloth`,
-`vllm`). Each step is a single script. Each script ends by printing **the exact
-next command the user should run**, so the workflow is self-guiding.
+- **Multimodal training** — fine-tune vision-language models (NVIDIA Nemotron-Nano-12B-VL) on image+text datasets
+- **Text fine-tuning** — LoRA/QLoRA fine-tuning via Axolotl on any JSONL/CSV instruction dataset
+- **General User Mode** — Quick Start and Custom Mix flows for non-technical users
+- **Expert Mode** — full control over model, dataset, quantization, learning rate, epochs, and evaluation
+- **Model Evaluation Dashboard** — training loss, perplexity, before/after comparison charts for every run
+- **Multimodal Chat** — test your fine-tuned model with image + text inputs directly in the UI
+- **Export & Publish** — merged checkpoint export with LoRA adapter merge
+- **Automatic eval registration** — every completed training run appears in the Evaluation Dashboard automatically
 
-## The user journey (what an end-user sees)
+---
 
-```
-$ ft add-dataset https://huggingface.co/datasets/tatsu-lab/alpaca
-  → downloads, inspects, normalizes to ChatML JSONL
-  → prints: "✓ Done. Next: ft clean-dataset alpaca"
+## Stack
 
-$ ft clean-dataset alpaca
-  → deduplicates, decontaminates, filters by length, saves data_card
-  → prints: "✓ Done. Next: ft add-model meta-llama/Llama-3.1-8B-Instruct"
+| Layer | Technology |
+|-------|-----------|
+| UI | Gradio 6.x |
+| VL Training | Custom `vl_trainer.py` (HuggingFace Transformers + PEFT) |
+| Text Training | [Axolotl](https://github.com/axolotl-ai-cloud/axolotl) |
+| Quantization | bitsandbytes (4-bit QLoRA), BF16 |
+| Inference | vLLM (text), direct HF (VL) |
+| GPU | NVIDIA RTX 5090 / B200 (CUDA 12.8, PyTorch 2.11) |
 
-$ ft add-model meta-llama/Llama-3.1-8B-Instruct
-  → downloads weights + tokenizer, verifies chat template
-  → prints: "✓ Done. Next: ft configure --model llama-3.1-8b --dataset alpaca"
+---
 
-$ ft configure --model llama-3.1-8b --dataset alpaca
-  → generates configs/run_<timestamp>.yaml with sane defaults for detected GPU
-  → prints: "✓ Done. Next: ft smoke-test configs/run_<ts>.yaml"
+## Supported Models
 
-$ ft smoke-test configs/run_<ts>.yaml
-  → 50-step dry run, validates everything fits in memory, no NaN
-  → prints: "✓ Done. Next: ft train configs/run_<ts>.yaml"
+- **NVIDIA Nemotron-Nano-12B-VL BF16** (vision-language, default)
+- **NVIDIA Nemotron-3-Nano-4B BF16** (text, fallback)
+- Any HuggingFace-compatible causal LM
 
-$ ft train configs/run_<ts>.yaml
-  → full training, with periodic eval and W&B logging
-  → prints: "✓ Done. Next: ft eval checkpoints/<run-id>"
+---
 
-$ ft eval checkpoints/<run-id>
-  → runs lm-eval-harness + a contamination check
-  → prints: "✓ Done. Next: ft export checkpoints/<run-id> --merge --quantize awq"
+## Quick Start
 
-$ ft export checkpoints/<run-id> --merge --quantize awq
-  → merges LoRA, quantizes for serving, writes MODEL_CARD.md
-  → prints: "✓ Done. Push to HF? Run: ft publish checkpoints/<run-id>"
+```bash
+# Install dependencies
+pip install -r requirements.txt   # or: bash install.sh
 
-$ ft publish checkpoints/<run-id>
-  → pushes to huggingface.co/mkd-hika/<repo-name>
-  → prints: "🎉 Live at https://huggingface.co/mkd-hika/<repo-name>"
-```
+# Launch the UI
+python app.py
 
-## The 7-Phase Protocol (engineering docs)
+# With public share link
+python app.py --share
 
-| Phase | Doc | Purpose |
-|-------|-----|---------|
-| 1 | [01_scope.md](01_scope.md) | Intake & objectives |
-| 2 | [02_architecture.md](02_architecture.md) | Method, parallelism, precision |
-| 3 | [03_data.md](03_data.md) | Data pipeline & schema |
-| 4 | [04_recipe.yaml](04_recipe.yaml) | Concrete training recipe |
-| 5 | [05_runbook.md](05_runbook.md) | Run plan & abort criteria |
-| 6 | [06_eval_plan.md](06_eval_plan.md) | Evaluation & contamination |
-| 7 | [07_handoff.md](07_handoff.md) | Deployment & model card |
-
-## Folder layout
-
-```
-ft-platform/
-├── README.md                  ← you are here
-├── STATE.md                   ← current phase, blockers, next action
-├── DECISIONS.md               ← append-only ADR log
-├── 01_scope.md … 07_handoff.md
-├── configs/                   ← runnable YAML recipes
-├── scripts/                   ← the ft-* CLI scripts (the user-facing UX)
-├── data_cards/                ← one card per dataset version
-├── datasets/                  ← downloaded & processed datasets (gitignored)
-├── models/                    ← downloaded base models (gitignored)
-├── checkpoints/               ← training output manifests
-├── eval_results/              ← timestamped, never overwritten
-├── logs/                      ← training logs, NCCL traces, post-mortems
-└── guides/                    ← non-engineer-facing markdown manuals
+# CLI usage
+ft configure --model=<model> --dataset=<dataset>
+ft train configs/<run>.yml
+ft eval checkpoints/<run>
+ft export checkpoints/<run> --merge
 ```
 
-## Where to start
+---
 
-If you are **the operator setting this up**: read `STATE.md`, then `01_scope.md`.
-If you are **an end-user**: read `guides/00_quickstart.md`.
+## Project Structure
+
+```
+ft-platform-multimodal/
+├── app.py                  # Gradio UI (General User + Expert Mode)
+├── vl_trainer.py           # Vision-language fine-tuning trainer
+├── api.py                  # REST API layer
+├── setup.py                # Package setup
+├── install.sh              # Dependency installer
+├── scripts/
+│   ├── ft                  # CLI entry point
+│   ├── ft_train.py         # Training orchestration
+│   ├── ft_eval.py          # Evaluation (lm-eval-harness)
+│   ├── ft_configure.py     # Recipe/config generation
+│   ├── ft_export.py        # Checkpoint export + LoRA merge
+│   ├── ft_add_dataset.py   # Dataset ingestion
+│   ├── ft_clean_dataset.py # Dataset cleaning + PII scrub
+│   └── ft_common.py        # Shared utilities
+├── configs/                # Generated training recipes (gitignored: run_*)
+├── data_cards/             # Dataset metadata
+└── eval_results/           # Per-run evaluation results
+```
+
+---
+
+## API
+
+The Gradio UI exposes a full REST API automatically. With the server running:
+
+```
+http://localhost:7860/?view=api
+```
+
+See `API_SPEC.md` and `FRONTEND_CONTRACT.md` for the frontend integration contract.
+
+---
+
+## Hardware Requirements
+
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| GPU | 24 GB VRAM | 32 GB+ (RTX 5090 / B200) |
+| CUDA | 12.8 | 12.8 |
+| RAM | 32 GB | 64 GB |
+| Storage | 100 GB | 500 GB |
+
+> **Note:** NVFP4 quantization is inference-only. Training uses BF16 or 4-bit QLoRA.
+
+---
+
+## Evaluation Dashboard
+
+Every training run (Quick Start, Custom Mix, Expert) is automatically registered in the Evaluation Dashboard after completion. The dashboard shows:
+
+- Training loss curve
+- Perplexity over steps
+- Before vs After comparison (loss + perplexity)
+- Summary table with % improvement
+
+---
+
+## License
+
+Internal use — MKD © 2026

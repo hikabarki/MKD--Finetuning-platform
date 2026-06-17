@@ -172,22 +172,70 @@ def quality_ok(row: dict, min_response_chars: int, max_rep_ratio: float,
     return True, ""
 
 
-_EMAIL = re.compile(r"\b[\w._%+-]+@[\w.-]+\.[A-Za-z]{2,}\b")
-_PHONE = re.compile(r"(?<!\d)(\+?\d[\d\s().-]{7,}\d)(?!\d)")
+_EMAIL    = re.compile(r"\b[\w._%+-]+@[\w.-]+\.[A-Za-z]{2,}\b")
+_PHONE    = re.compile(r"(?<!\d)(\+?\d[\d\s().-]{7,}\d)(?!\d)")
 _SSN_LIKE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
-_CC_LIKE = re.compile(r"\b(?:\d[ -]*?){13,16}\b")
+_CC_LIKE  = re.compile(r"\b(?:\d[ -]*?){13,16}\b")
+
+
+def _make_presidio_scrubber():
+    """Return a Presidio-based scrub function, or None if Presidio is not installed.
+
+    M-7: If presidio_analyzer + presidio_anonymizer are available use them for
+    production-grade NER-based PII detection.  The regex fallback remains for
+    environments without Presidio.
+    """
+    try:
+        from presidio_analyzer import AnalyzerEngine
+        from presidio_anonymizer import AnonymizerEngine
+
+        _analyzer   = AnalyzerEngine()
+        _anonymizer = AnonymizerEngine()
+
+        def _scrub_presidio(text: str) -> tuple[str, bool]:
+            results = _analyzer.analyze(text=text, language="en")
+            had_cc  = any(r.entity_type == "CREDIT_CARD" for r in results)
+            anon    = _anonymizer.anonymize(text=text, analyzer_results=results)
+            return anon.text, had_cc
+
+        return _scrub_presidio
+    except ImportError:
+        warn(
+            "presidio_analyzer / presidio_anonymizer not installed — "
+            "using regex-only PII scrub (NOT production-grade). "
+            "Install with: pip install presidio-analyzer presidio-anonymizer && "
+            "python -m spacy download en_core_web_lg"
+        )
+        return None
+
+
+_presidio_scrubber = _make_presidio_scrubber()
+
 
 def scrub_pii(row: dict, report: dict) -> dict | None:
-    """Mask email/phone/SSN; drop the row if a credit-card-like number found.
+    """Mask PII; drop row if credit-card-like number found.
 
-    This is a fast regex baseline; for production, swap in Microsoft Presidio.
+    Uses Microsoft Presidio when available (NER-based); falls back to regex.
     """
+
     def scrub(s: str) -> tuple[str, bool]:
+        if _presidio_scrubber is not None:
+            cleaned, had_cc = _presidio_scrubber(s)
+            # Tally any entity placeholders that Presidio introduced
+            if "[EMAIL_ADDRESS]" in cleaned or "[EMAIL]" in cleaned:
+                report["email"] += 1
+            if "[PHONE_NUMBER]" in cleaned or "[PHONE]" in cleaned:
+                report["phone"] += 1
+            if "[US_SSN]" in cleaned or "[SSN]" in cleaned:
+                report["ssn"] += 1
+            return cleaned, had_cc
+
+        # Regex fallback
         had_cc = bool(_CC_LIKE.search(s))
         s = _CC_LIKE.sub("[CARD]", s)
-        if _EMAIL.search(s):  report["email"] += 1
-        if _PHONE.search(s):  report["phone"] += 1
-        if _SSN_LIKE.search(s): report["ssn"] += 1
+        if _EMAIL.search(s):    report["email"] += 1
+        if _PHONE.search(s):    report["phone"] += 1
+        if _SSN_LIKE.search(s): report["ssn"]   += 1
         s = _EMAIL.sub("[EMAIL]", s)
         s = _PHONE.sub("[PHONE]", s)
         s = _SSN_LIKE.sub("[SSN]", s)
@@ -198,7 +246,8 @@ def scrub_pii(row: dict, report: dict) -> dict | None:
         new = []
         for m in row["messages"]:
             c, cc = scrub(m["content"])
-            if cc: drop = True
+            if cc:
+                drop = True
             new.append({**m, "content": c})
         if drop:
             report["dropped_cc"] += 1
