@@ -162,6 +162,112 @@ lm_eval.__main__.cli_evaluate()
         return None
 
 
+def vqa_accuracy_eval(ckpt_dir: Path, val_jsonl: Path, output_dir: Path, root: Path) -> dict | None:
+    """Compute exact-match VQA accuracy on a held-out image-QA val split.
+
+    Expected val_jsonl format (ChatML with optional "image" field):
+        {"messages": [{"role":"user","content":"Q"},{"role":"assistant","content":"A"}], "image": "path.jpg"}
+
+    Returns a dict with accuracy metrics, or None if dependencies missing / no VQA rows found.
+    """
+    if not val_jsonl.exists():
+        warn(f"  VQA val not found: {val_jsonl}")
+        return None
+
+    try:
+        import torch
+        from transformers import AutoProcessor, AutoModelForCausalLM
+    except ImportError:
+        warn("  transformers not installed — skipping VQA eval")
+        return None
+
+    info("  Running VQA accuracy eval...")
+    rows = [json.loads(l) for l in val_jsonl.read_text().splitlines() if l.strip()]
+    vqa_rows = [r for r in rows if r.get("image") and "messages" in r]
+    if not vqa_rows:
+        warn("  No image-QA rows in val split — skipping VQA eval")
+        return None
+
+    info(f"  VQA rows: {len(vqa_rows)}")
+
+    try:
+        # Resolve model: merged export preferred, else LoRA adapter + base
+        model_args, peft_path = resolve_model_args(ckpt_dir, root)
+        model_path = model_args.split(",")[0].split("=", 1)[1]
+
+        processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+        load_kw: dict = {"trust_remote_code": True, "device_map": {"": "cuda:0"}}
+        if peft_path:
+            from peft import PeftModel
+            base_model = AutoModelForCausalLM.from_pretrained(model_path, **load_kw)
+            model = PeftModel.from_pretrained(base_model, peft_path)
+        else:
+            model = AutoModelForCausalLM.from_pretrained(model_path, **load_kw)
+        model.eval()
+    except Exception as e:
+        warn(f"  VQA eval: model load failed — {e}")
+        return None
+
+    exact_match = 0
+    total       = 0
+
+    for row in vqa_rows[:200]:  # cap at 200 samples for speed
+        try:
+            from PIL import Image as _PIL
+            msgs = row["messages"]
+            img_path = row.get("image", "")
+            ground_truth = next(
+                (m["content"] for m in msgs if m.get("role") == "assistant"), ""
+            ).strip().lower()
+
+            prompt_msgs = [m for m in msgs if m.get("role") != "assistant"]
+            text = processor.apply_chat_template(
+                prompt_msgs, tokenize=False, add_generation_prompt=True
+            )
+            img = None
+            if img_path and Path(img_path).exists():
+                img = _PIL.open(img_path).convert("RGB")
+
+            with torch.no_grad():
+                if img is not None:
+                    inputs = processor(text=text, images=[img], return_tensors="pt").to("cuda:0")
+                else:
+                    inputs = processor(text=text, return_tensors="pt").to("cuda:0")
+                out_ids = model.generate(**inputs, max_new_tokens=64, do_sample=False)
+                start = inputs["input_ids"].shape[1]
+                reply = processor.tokenizer.decode(
+                    out_ids[0][start:], skip_special_tokens=True
+                ).strip().lower()
+
+            # Exact-match normalised (strip punctuation + spaces)
+            import re as _re
+            def _norm(s): return _re.sub(r"[^\w\s]", "", s).strip()
+            if _norm(reply) == _norm(ground_truth):
+                exact_match += 1
+            total += 1
+        except Exception as e:
+            warn(f"  VQA row error: {e}")
+
+    if total == 0:
+        return None
+
+    accuracy = exact_match / total
+    result = {"vqa_exact_match": accuracy, "vqa_total": total, "vqa_correct": exact_match}
+    out_file = output_dir / "vqa_accuracy.json"
+    out_file.write_text(json.dumps(result, indent=2))
+    ok(f"  VQA accuracy: {accuracy:.3f} ({exact_match}/{total})")
+
+    # Free GPU memory
+    try:
+        del model
+        import gc; gc.collect()
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+    return result
+
+
 def contamination_check(train_path: Path, ngram: int = 13) -> dict:
     """Simple 13-gram overlap check between training data and eval set names."""
     if not train_path.exists():
@@ -211,6 +317,15 @@ def write_summary(results: dict, output_dir: Path, ckpt_name: str) -> Path:
                         if isinstance(val, float):
                             summary_lines.append(f"- {task} / {metric}: {val:.4f}")
             summary_lines.append("")
+
+    if "vqa" in results and results["vqa"]:
+        v = results["vqa"]
+        summary_lines.append("## VQA Accuracy")
+        summary_lines.append(
+            f"- Exact-match: {v.get('vqa_exact_match', 0):.3f} "
+            f"({v.get('vqa_correct', 0)}/{v.get('vqa_total', 0)} samples)"
+        )
+        summary_lines.append("")
 
     if "contamination" in results:
         summary_lines.append("## Contamination")
@@ -323,6 +438,22 @@ def main():
             ok(f"Base model results saved to {base_out}")
         else:
             warn("Base model not found — skipping comparison. Pass --base <path> to specify.")
+
+    # -- H-4: VQA accuracy eval --
+    info("Running VQA accuracy eval (image-QA val split)...")
+    vqa_result: dict | None = None
+    for card_file in (root / "data_cards").glob("*.json"):
+        try:
+            card = json.loads(card_file.read_text())
+            val_path = root / f"datasets/{card['name']}/val.jsonl"
+            vqa_result = vqa_accuracy_eval(ckpt_dir, val_path, eval_out, root)
+            if vqa_result:
+                all_results["vqa"] = vqa_result
+                break
+        except Exception:
+            pass
+    if not vqa_result:
+        warn("VQA eval skipped (no image-QA val data found)")
 
     # -- Contamination check --
     info("Running contamination check (13-gram overlap)...")

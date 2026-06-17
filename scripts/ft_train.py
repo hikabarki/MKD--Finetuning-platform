@@ -292,6 +292,15 @@ def main():
     ok(f"Training complete in {h}h {m}m")
     ok(f"Output: {output_dir}")
 
+    # LOW: Archive completed run config so configs/ doesn't fill up indefinitely
+    archive_dir = root / "configs" / "archive"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copy2(str(recipe_path), str(archive_dir / recipe_path.name))
+        info(f"Recipe archived to {archive_dir / recipe_path.name}")
+    except Exception as _ae:
+        warn(f"Could not archive recipe: {_ae}")
+
     update_state(
         phase="5 / Training complete",
         status=f"✓ Training finished: {output_dir.name} ({h}h {m}m)",
