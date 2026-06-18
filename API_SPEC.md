@@ -1,5 +1,8 @@
 # MKD Fine-Tuning Platform — API Specification
 
+> **Last updated:** 2026-06-18
+> **Gradio UI (live API explorer):** `https://adfd77dcdc7ed6c00b.gradio.live/?view=api`
+
 Base URL: `http://localhost:8000`
 All responses use the envelope:
 ```json
@@ -190,6 +193,12 @@ Returns `202 Accepted`.
 }
 ```
 
+### `GET /api/eval/runs`
+Returns all runs visible in the Evaluation Dashboard. Every completed training run (Quick Start, Custom Mix, Expert) is **automatically registered** — no manual eval step needed.
+```json
+{"ok":true,"data":{"runs":["run_2026-06-18_0900","vl_nvidia__nvidia-nemotron-nano-12b-v2-vl-bf16_20260618_090512"]}}
+```
+
 ### `GET /api/eval/results/{run_id}`
 ```json
 {
@@ -232,6 +241,8 @@ Returns `202 Accepted`.
 ---
 
 ## Inference / Chat
+
+> **Image format:** `image_base64` is a plain base64 string — **no** `data:image/...;base64,` prefix. Strip it before sending.
 
 ### `POST /api/chat/load`
 Load a model into GPU memory.
