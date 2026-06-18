@@ -1,5 +1,9 @@
 # MKD Fine-Tuning Platform — Frontend Contract
 
+> **Last updated:** 2026-06-18
+> **Gradio live demo + API explorer:** `https://adfd77dcdc7ed6c00b.gradio.live/?view=api`
+> **OpenAPI schema:** `GET /api/openapi.json` | **Swagger UI:** `/api/docs`
+
 This document is the single source of truth for the frontend team.
 The backend API is at `http://localhost:8000` (FastAPI, `api.py`).
 The Gradio UI is at `http://localhost:7860` (for internal use).
@@ -196,7 +200,8 @@ for await (const token of streamChat(messages, imageBase64)) {
 
 ## Image upload for multimodal chat
 
-The API accepts `image_base64` — a base64-encoded PNG/JPG string (no data-URI prefix).
+The API accepts `image_base64` — a plain base64 string, **no** `data:image/...;base64,` prefix.
+`FileReader.readAsDataURL` adds that prefix — strip it before sending (`.split(",")[1]`).
 
 ```js
 async function fileToBase64(file) {
@@ -210,6 +215,8 @@ async function fileToBase64(file) {
 
 const base64 = await fileToBase64(imageFile);  // imageFile from <input type="file">
 ```
+
+Supported formats: JPEG, PNG, WEBP. Max recommended size: 5 MB.
 
 ---
 
@@ -231,6 +238,8 @@ Fields to display:
 ---
 
 ## End-to-end flow
+
+> **Eval auto-registration:** Every completed training run (Quick Start, Custom Mix, Expert — both text and VL) is automatically registered in the Evaluation Dashboard. No separate eval trigger is required to populate the dashboard. Call `GET /api/eval/results/{run_id}` immediately after training completes.
 
 ```
 1. Add dataset:    POST /api/datasets/add   { source: "...", name: "ko-vqa" }

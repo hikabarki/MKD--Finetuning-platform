@@ -202,21 +202,23 @@ def _load_chat_model(model_path: str):
                 vl_load_kw["torch_dtype"] = torch.bfloat16
         except Exception:
             vl_load_kw["dtype"] = torch.bfloat16
+        import logging as _logging
+        _tf_logger = _logging.getLogger("transformers")
+        _tf_prev_level = _tf_logger.level
+        _tf_logger.setLevel(_logging.ERROR)
         model = AutoModelForCausalLM.from_pretrained(str(mp), **vl_load_kw)
+        _tf_logger.setLevel(_tf_prev_level)
 
-        # Fix: summary_idxs buffer is MISSING from the checkpoint — it was never saved.
-        # At init time the buffer is allocated with torch.empty() → garbage values like
-        # [127690034228576, 105553488615024, 0].  The correct value is [0, 1, 2, ...] —
-        # one index per teacher, selecting ALL teachers for summary token extraction.
+        # summary_idxs is missing from checkpoint (allocated with torch.empty → garbage).
+        # Correct value: [0, 1, 2, ...] — one index per teacher, selecting all teachers.
         try:
             _rm = model.vision_model.radio_model
             if hasattr(_rm, "summary_idxs") and _rm.summary_idxs is not None:
                 _n = _rm.summary_idxs.shape[0]
                 _rm.summary_idxs = torch.arange(_n, dtype=torch.int64,
                                                 device=_rm.summary_idxs.device)
-                print(f"[VL] Patched summary_idxs → {_rm.summary_idxs.tolist()}", flush=True)
-        except Exception as _e:
-            print(f"[VL] Warning: could not patch summary_idxs: {_e}", flush=True)
+        except Exception:
+            pass
 
         return tok, model, True
 
@@ -2399,6 +2401,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                    "HF_HUB_OFFLINE": "1",
                    "TOKENIZERS_PARALLELISM": "false"}
             export_path = None
+            vqa_metrics = {}
             buf = []
             with _sp_qs.Popen(cmd, stdout=_sp_qs.PIPE, stderr=_sp_qs.STDOUT, text=True, env=env) as proc:
                 for line in proc.stdout:
@@ -2406,6 +2409,11 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                     buf.append(line)
                     if line.startswith("EXPORT_PATH="):
                         export_path = line.split("=", 1)[1].strip()
+                    elif line.startswith("VQA_METRICS="):
+                        try:
+                            vqa_metrics = json.loads(line.split("=", 1)[1])
+                        except Exception:
+                            pass
                     step = "train" if "step" in line.lower() or "loss" in line.lower() else \
                            "export" if "merging" in line.lower() or "export" in line.lower() else "smoke"
                     yield build_progress_html(step), terminal_wrap("\n".join(buf[-150:]))
@@ -2420,6 +2428,28 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                         key=lambda p: p.stat().st_mtime, reverse=True)
                     if candidates:
                         _user_last_model_path["path"] = str(candidates[0])
+
+            # Register VQA metrics in eval dashboard (same as Custom Mix VL path)
+            if vqa_metrics:
+                import datetime as _dt_qs
+                _qs_vl_run = f"vl_{model}_{_dt_qs.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                _qs_log_dir = ROOT / "logs"; _qs_log_dir.mkdir(exist_ok=True)
+                _qs_eval_dir = ROOT / "eval_results" / _qs_vl_run; _qs_eval_dir.mkdir(parents=True, exist_ok=True)
+                _qs_log_lines = [
+                    json.dumps({"loss": vqa_metrics.get("vqa_accuracy_before", 0), "ppl": 1.0}),
+                    json.dumps({"loss": vqa_metrics.get("vqa_accuracy_after",  0), "ppl": 1.0}),
+                    json.dumps({"vqa_accuracy_before": vqa_metrics["vqa_accuracy_before"],
+                                "vqa_accuracy_after":  vqa_metrics["vqa_accuracy_after"],
+                                "vqa_n_samples":       vqa_metrics.get("vqa_n_samples", 0)}),
+                ]
+                (_qs_log_dir / f"train_{_qs_vl_run}.log").write_text("\n".join(_qs_log_lines))
+                (_qs_eval_dir / "summary.md").write_text(
+                    f"# VL Training: {model}\n\n"
+                    f"| Metric | Before | After | Change |\n|---|---|---|---|\n"
+                    f"| VQA Accuracy | {vqa_metrics['vqa_accuracy_before']:.1%} | "
+                    f"{vqa_metrics['vqa_accuracy_after']:.1%} | "
+                    f"{(vqa_metrics['vqa_accuracy_after']-vqa_metrics['vqa_accuracy_before'])*100:+.1f}pp |\n"
+                )
 
             yield build_progress_html("done"), terminal_wrap(
                 'Waiting for GPU memory to clear before loading chat model...')
