@@ -630,6 +630,8 @@ def main():
     root = project_root()
     kind, ident = classify_source(args.source)
     name = args.name or _derive_name(kind, ident)
+    if not name or "/" in name or ".." in name or "\x00" in name:
+        err(f"Invalid dataset name: {name!r}"); sys.exit(1)
     info(f"Source kind: {kind}    name: {name}")
 
     out_dir = root / "datasets" / name

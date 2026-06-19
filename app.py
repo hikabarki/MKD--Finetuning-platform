@@ -36,7 +36,8 @@ _vllm_client    = None   # openai.OpenAI pointing at local vLLM server
 _vllm_model_id  = None   # model path string passed to vLLM
 
 # H-5: Locks for shared mutable state accessed from multiple Gradio threads
-_vllm_lock             = threading.Lock()
+_chat_lock             = threading.Lock()   # guards _chat_model/tok/name/is_vision
+_vllm_lock             = threading.Lock()   # guards _vllm_proc/client/model_id
 _user_model_path_lock  = threading.Lock()
 _user_training_lock    = threading.Lock()
 
@@ -126,7 +127,6 @@ def _load_chat_model(model_path: str):
             raise RuntimeError(
                 "vLLM server failed to start. Check that "
                 f"{VLLM_PYTHON} is available and the model path is correct.")
-        _chat_is_vision = True
         return None, None, True
 
     import torch
@@ -328,10 +328,12 @@ def _start_vllm_server(model_path: str) -> bool:
         "--gpu-memory-utilization", "0.85",
         "--enforce-eager",
     ]
-    _vllm_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    _vllm_model_id = model_path
+    _proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    with _vllm_lock:
+        _vllm_proc = _proc
+        _vllm_model_id = model_path
 
-    # Wait up to 180 s for server to be ready
+    # Wait up to 180 s for server to be ready (outside lock)
     health_url = f"http://localhost:{VLLM_PORT}/health"
     for _ in range(180):
         time.sleep(1)
@@ -339,19 +341,21 @@ def _start_vllm_server(model_path: str) -> bool:
             urllib.request.urlopen(health_url, timeout=2)
             break
         except Exception:
-            if _vllm_proc.poll() is not None:
+            if _proc.poll() is not None:
                 return False
     else:
         return False
 
     try:
         from openai import OpenAI
-        _vllm_client = OpenAI(base_url=f"http://localhost:{VLLM_PORT}/v1", api_key="none")
+        _client = OpenAI(base_url=f"http://localhost:{VLLM_PORT}/v1", api_key="none")
     except ImportError:
         import subprocess as _sp
         _sp.run([VLLM_PYTHON, "-m", "pip", "install", "openai", "-q"])
         from openai import OpenAI
-        _vllm_client = OpenAI(base_url=f"http://localhost:{VLLM_PORT}/v1", api_key="none")
+        _client = OpenAI(base_url=f"http://localhost:{VLLM_PORT}/v1", api_key="none")
+    with _vllm_lock:
+        _vllm_client = _client
     return True
 
 
@@ -359,23 +363,26 @@ def _stop_vllm_server():
     """Terminate the running vLLM server process AND any orphaned vLLM processes."""
     import subprocess as _sp_vllm, time as _t_vllm
     global _vllm_proc, _vllm_client, _vllm_model_id
-    if _vllm_proc is not None:
+    with _vllm_lock:
+        _proc = _vllm_proc
+        _vllm_proc = None
+    if _proc is not None:
         try:
-            _vllm_proc.terminate()
-            _vllm_proc.wait(timeout=10)
+            _proc.terminate()
+            _proc.wait(timeout=10)
         except Exception:
             try:
-                _vllm_proc.kill()
+                _proc.kill()
             except Exception:
                 pass
-        _vllm_proc = None
     # Kill any orphaned vLLM processes left over from previous sessions
     _sp_vllm.run(["pkill", "-9", "-f", "vllm.entrypoints"], capture_output=True)
     _sp_vllm.run(["pkill", "-9", "-f", "EngineCore"], capture_output=True)
     _sp_vllm.run(["pkill", "-9", "-f", "VllmWorker"], capture_output=True)
     _t_vllm.sleep(3)  # Give OS time to reclaim VRAM
-    _vllm_client = None
-    _vllm_model_id = None
+    with _vllm_lock:
+        _vllm_client = None
+        _vllm_model_id = None
 
 
 def _generate_reply(msgs: list, max_tokens: int = 256, image=None) -> str:
@@ -383,7 +390,12 @@ def _generate_reply(msgs: list, max_tokens: int = 256, image=None) -> str:
     global _vllm_client, _vllm_model_id, _chat_model, _chat_tok
     import re as _re
 
-    if _vllm_client is not None:
+    # Snapshot vLLM state under lock — avoids TOCTOU if another thread stops the server.
+    with _vllm_lock:
+        _client    = _vllm_client
+        _model_id  = _vllm_model_id
+
+    if _client is not None:
         # Build OpenAI-format messages with optional image
         api_msgs = []
         for m in msgs[:-1]:
@@ -403,8 +415,8 @@ def _generate_reply(msgs: list, max_tokens: int = 256, image=None) -> str:
             content = last["content"]
         api_msgs.append({"role": last["role"], "content": content})
 
-        resp = _vllm_client.chat.completions.create(
-            model=_vllm_model_id,
+        resp = _client.chat.completions.create(
+            model=_model_id,
             messages=api_msgs,
             max_tokens=max_tokens,
             temperature=0.7,
@@ -1596,9 +1608,11 @@ pre, code {
 [data-testid="upload"]:hover { border-color: #58a6ff !important; }
 """
 
-# ── Developer credentials (change these) ─────────────────────────────────────
+# ── Developer credentials ─────────────────────────────────────────────────────
 DEV_USERNAME = os.environ.get("DEV_USERNAME", "mkd-dev")
-DEV_PASSWORD = os.environ.get("DEV_PASSWORD", "mkd2026!")
+DEV_PASSWORD = os.environ.get("DEV_PASSWORD")   # None = dev tab disabled
+if not DEV_PASSWORD:
+    print("WARNING: DEV_PASSWORD env var not set — developer tab is disabled.", flush=True)
 
 # ── App ───────────────────────────────────────────────────────────────────────
 with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
@@ -2189,12 +2203,13 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
         return _g(False), _g(True),  _g(False), _g(False), _g(False), _g(False)
 
     def do_dev_login(username, password):
-        if username.strip() == DEV_USERNAME and password.strip() == DEV_PASSWORD:
+        if DEV_PASSWORD and username.strip() == DEV_USERNAME and password.strip() == DEV_PASSWORD:
             return (_g(False), _g(False), _g(True),  _g(False), _g(True),  _g(False),
                     gr.HTML(""))
         else:
+            msg = "Developer access is disabled (DEV_PASSWORD not set)." if not DEV_PASSWORD else "Incorrect username or password."
             return (_g(False), _g(True),  _g(False), _g(False), _g(False), _g(False),
-                    gr.HTML('<div style="color:#f85149;font-size:13px;padding:8px 0;">Incorrect username or password.</div>'))
+                    gr.HTML(f'<div style="color:#f85149;font-size:13px;padding:8px 0;">{msg}</div>'))
 
     def go_user():
         return _g(False), _g(False), _g(False), _g(True),  _g(False), _g(False)
@@ -2909,7 +2924,9 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
             yield history or [], "", "No errors yet." if not _user_error_log_lines else "\n\n".join(_user_error_log_lines[:10]), None
             return
         history = list(history or [])
-        if _chat_model is None:
+        with _chat_lock:
+            _model_ready = _chat_model is not None
+        if not _model_ready:
             def _is_valid_model(p):
                 mp = Path(p) if p else None
                 return mp and mp.exists() and (mp / "tokenizer.json").exists() and (mp / "config.json").exists()
@@ -2968,8 +2985,10 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
             ]
             yield _loading_hist, "", "No errors yet.", None
             try:
-                _chat_tok, _chat_model, _chat_is_vision = _load_chat_model(model_path)
-                _chat_name = model_path
+                _new_tok, _new_model, _new_is_vision = _load_chat_model(model_path)
+                with _chat_lock:
+                    _chat_tok, _chat_model, _chat_is_vision = _new_tok, _new_model, _new_is_vision
+                    _chat_name = model_path
                 _loading_hist[-1]["content"] = "✓ Model loaded. Now answering your message..."
                 yield _loading_hist, "", "No errors yet.", None
             except Exception as e:
@@ -4159,8 +4178,11 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                     global _chat_model, _chat_tok, _chat_name, _chat_is_vision
                     if not model_name:
                         return '<div style="color:#f85149;padding:8px;">Select a model first.</div>'
-                    if _chat_model is not None:
-                        del _chat_model; _chat_model = None
+                    with _chat_lock:
+                        _old_model = _chat_model
+                        _chat_model = None
+                    if _old_model is not None:
+                        del _old_model
                         import gc; gc.collect()
                         try:
                             import torch; torch.cuda.empty_cache()
@@ -4176,12 +4198,18 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                         return f'<div style="color:#f85149;padding:8px;">Path not found: {resolved}</div>'
 
                     try:
-                        _chat_tok, _chat_model, _chat_is_vision = _load_chat_model(str(model_path))
-                        _chat_name = model_name
+                        _new_tok, _new_model, _new_is_vision = _load_chat_model(str(model_path))
+                        with _chat_lock:
+                            _chat_tok, _chat_model, _chat_is_vision = _new_tok, _new_model, _new_is_vision
+                            _chat_name = model_name
+                        with _vllm_lock:
+                            _client = _vllm_client
+                        with _chat_lock:
+                            _is_vis = _chat_is_vision
                         label = model_name.split("  [")[0]
-                        if _vllm_client is not None:
+                        if _client is not None:
                             tag = " (vLLM · omni)"
-                        elif _chat_is_vision:
+                        elif _is_vis:
                             tag = " (vision)"
                         else:
                             tag = ""
@@ -4193,15 +4221,21 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                 def unload_model():
                     global _chat_model, _chat_tok, _chat_name
                     _stop_vllm_server()
-                    if _chat_model is not None:
-                        del _chat_model; _chat_model = None
-                        del _chat_tok;   _chat_tok = None
-                        _chat_name = None
-                        import gc; gc.collect()
-                        try:
-                            import torch; torch.cuda.empty_cache()
-                        except Exception:
-                            pass
+                    with _chat_lock:
+                        _old_model = _chat_model
+                        _old_tok   = _chat_tok
+                        _chat_model = None
+                        _chat_tok   = None
+                        _chat_name  = None
+                    if _old_model is not None:
+                        del _old_model
+                    if _old_tok is not None:
+                        del _old_tok
+                    import gc; gc.collect()
+                    try:
+                        import torch; torch.cuda.empty_cache()
+                    except Exception:
+                        pass
                     return '<div style="color:#8b949e;padding:8px;">Model unloaded. GPU memory freed.</div>'
     
                 def chat_respond(message, history, system_prompt, max_tokens, image=None):
@@ -4284,6 +4318,8 @@ if __name__ == "__main__":
     print(f" URL     : http://{args.host}:{args.port}")
     if _auth:
         print(" Auth    : basic auth enabled (username: admin)")
+    else:
+        print(" Auth    : WARNING — ADMIN_PASSWORD not set, UI is unprotected.")
     print()
 
     theme = gr.themes.Base(

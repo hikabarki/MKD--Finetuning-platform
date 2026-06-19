@@ -89,6 +89,13 @@ def require_auth(request: Request):
 
 # ── Response helpers ──────────────────────────────────────────────────────────
 
+def _safe_name(s: str) -> str:
+    """Reject names that could escape the project root via path traversal."""
+    if not s or "/" in s or ".." in s or "\x00" in s:
+        raise HTTPException(status_code=400, detail=f"Invalid name: {s!r}")
+    return s
+
+
 def ok_resp(data: Any) -> dict:
     return {"ok": True, "data": data}
 
@@ -322,6 +329,7 @@ class DatasetCleanRequest(BaseModel):
 
 @app.post("/api/datasets/clean", dependencies=[Depends(require_auth)])
 def dataset_clean(req: DatasetCleanRequest):
+    _safe_name(req.name)
     cmd = [PYTHON, str(SCRIPTS / "ft_clean_dataset.py"), req.name,
            f"--max-chars={req.max_chars}", f"--val-ratio={req.val_ratio}"]
     if req.lang:
@@ -339,6 +347,7 @@ def datasets_list():
 
 @app.get("/api/datasets/{name}/sample", dependencies=[Depends(require_auth)])
 def dataset_sample(name: str):
+    _safe_name(name)
     p = ROOT / "datasets" / name / "sample_100.jsonl"
     if not p.exists():
         raise HTTPException(404, f"No sample found for dataset '{name}'")
@@ -348,6 +357,7 @@ def dataset_sample(name: str):
 
 @app.get("/api/datasets/{name}/card", dependencies=[Depends(require_auth)])
 def dataset_card(name: str):
+    _safe_name(name)
     p = ROOT / "data_cards" / f"{name}.json"
     if not p.exists():
         raise HTTPException(404, f"No data card for '{name}'")
@@ -356,6 +366,7 @@ def dataset_card(name: str):
 
 @app.delete("/api/datasets/{name}", dependencies=[Depends(require_auth)])
 def dataset_delete(name: str):
+    _safe_name(name)
     import shutil as _sh
     ds_dir = ROOT / "datasets" / name
     if not ds_dir.exists():
@@ -392,6 +403,7 @@ def models_list():
 
 @app.delete("/api/models/{name}", dependencies=[Depends(require_auth)])
 def model_delete(name: str):
+    _safe_name(name)
     import shutil as _sh
     p = ROOT / "models" / name
     if not p.exists():
@@ -431,6 +443,9 @@ def training_start(req: TrainingStartRequest):
     run_id = f"run_{ts}"
     log_path = ROOT / "logs" / f"train_{run_id}.log"
 
+    if "/" not in req.model:
+        _safe_name(req.model)
+    _safe_name(req.dataset)
     model_path = str(ROOT / "models" / req.model) if "/" not in req.model else req.model
     ds_path    = str(ROOT / "datasets" / req.dataset)
 
@@ -520,6 +535,7 @@ async def training_logs(request: Request, run_id: str = "", offset: int = 0):
 
     log_path: Path | None = None
     if run_id:
+        _safe_name(run_id)
         log_path = ROOT / "logs" / f"train_{run_id}.log"
     elif job:
         log_path = job.log_path
@@ -582,6 +598,7 @@ def eval_start(req: EvalStartRequest):
 
 @app.get("/api/eval/results/{run_id}", dependencies=[Depends(require_auth)])
 def eval_results(run_id: str):
+    _safe_name(run_id)
     eval_out = ROOT / "eval_results" / run_id
     if not eval_out.exists():
         raise HTTPException(404, f"Eval results for '{run_id}' not found")
@@ -648,15 +665,17 @@ def export_status():
 class PublishRequest(BaseModel):
     export_dir:  str
     hf_repo:     str
-    hf_token:    str
     license:     str = "apache-2.0"
     description: str = ""
 
 
 @app.post("/api/publish", dependencies=[Depends(require_auth)])
 def publish(req: PublishRequest):
+    hf_token = os.environ.get("HF_TOKEN", "").strip()
+    if not hf_token:
+        raise HTTPException(status_code=503, detail="HF_TOKEN env var not set on server")
     import huggingface_hub as _hfhub
-    _hfhub.login(token=req.hf_token, add_to_git_credential=False)
+    _hfhub.login(token=hf_token, add_to_git_credential=False)
     cmd = [PYTHON, str(SCRIPTS / "ft_publish.py"), req.export_dir,
            "--hf-repo", req.hf_repo,
            "--acknowledge-contamination", "--accept-base-license"]
