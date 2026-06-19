@@ -1,0 +1,23 @@
+[run]
+omit =
+    # GPU-dependent — requires torch + CUDA hardware, untestable in CI
+    inference/chat.py
+    vl_trainer.py
+    # Gradio-dependent — requires Gradio to be importable and a display
+    ui/layout.py
+    # Entry-point bootstrap only
+    app.py
+    # Standalone scripts — not imported by the platform
+    pdf_utils.py
+    sanity_check.py
+    # Vendored / generated
+    */venv/*
+    tests/*
+    setup.py
+
+[report]
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
+    raise NotImplementedError
+    \.\.\.

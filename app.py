@@ -46,10 +46,10 @@ from ui.components import (
     read_sample, read_data_card, read_config_file, read_log,
     read_eval_summary, read_model_card, save_model_card,
 )
-from platform.log_parser import (
+from ft_platform.log_parser import (
     list_eval_runs, get_loss_df, get_metrics_html, parse_training_log,
 )
-from platform.eval_dashboard import (
+from ft_platform.eval_dashboard import (
     build_loss_chart, build_ppl_chart, build_summary_chart,
     build_metrics_df, load_eval_run,
 )
