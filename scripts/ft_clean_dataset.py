@@ -190,13 +190,27 @@ _SSN_LIKE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
 _CC_LIKE  = re.compile(r"\b(?:\d[ -]*?){13,16}\b")
 
 
-def _make_presidio_scrubber():
+def _make_presidio_scrubber(lang: str = "en"):
     """Return a Presidio-based scrub function, or None if Presidio is not installed.
 
     M-7: If presidio_analyzer + presidio_anonymizer are available use them for
     production-grade NER-based PII detection.  The regex fallback remains for
     environments without Presidio.
+
+    For Korean (ko) Presidio lacks a native model — fall back to regex-only scrub
+    so that Korean PII is still partially detected rather than silently skipped.
     """
+    # Korean has no Presidio NLP model; use regex path which handles phone/email/ID patterns.
+    if lang == "ko":
+        warn(
+            "Korean (ko) detected — Presidio has no Korean NLP model. "
+            "Using regex-only PII scrub. For production, add a custom Korean recognizer."
+        )
+        return None
+
+    # Normalise language code (e.g. "en-US" → "en")
+    presidio_lang = lang.split("-")[0] if lang else "en"
+
     try:
         from presidio_analyzer import AnalyzerEngine
         from presidio_anonymizer import AnonymizerEngine
@@ -205,7 +219,7 @@ def _make_presidio_scrubber():
         _anonymizer = AnonymizerEngine()
 
         def _scrub_presidio(text: str) -> tuple[str, bool]:
-            results = _analyzer.analyze(text=text, language="en")
+            results = _analyzer.analyze(text=text, language=presidio_lang)
             had_cc  = any(r.entity_type == "CREDIT_CARD" for r in results)
             anon    = _anonymizer.anonymize(text=text, analyzer_results=results)
             return anon.text, had_cc
@@ -221,7 +235,7 @@ def _make_presidio_scrubber():
         return None
 
 
-_presidio_scrubber = _make_presidio_scrubber()
+_presidio_scrubber = None   # set in main() once --lang is known
 
 
 def scrub_pii(row: dict, report: dict) -> dict | None:
@@ -337,6 +351,12 @@ def main():
                     help="skip quality heuristic filtering")
     args = ap.parse_args()
 
+    # Initialise Presidio scrubber with the dataset's primary language.
+    # Korean (ko) has no Presidio model — falls back to regex-only scrub.
+    global _presidio_scrubber
+    pii_lang = (args.lang.split(",")[0].strip() if args.lang else "en") or "en"
+    _presidio_scrubber = _make_presidio_scrubber(pii_lang)
+
     root = project_root()
     ds_dir = root / "datasets" / args.name
     norm = ds_dir / "normalized.jsonl"
@@ -428,6 +448,18 @@ def main():
     # against the actual eval sets; here we just record that it was deferred.
     card["rows_after_decontam"] = len(rows)
     card["decontamination_note"] = "13-gram overlap check deferred to `ft eval` (see 06_eval_plan.md)"
+
+    if len(rows) == 0:
+        # Build a diagnostic showing which filter reduced the count the most.
+        counts = {k: v for k, v in card.items() if k.startswith("rows_after_") or k == "rows_raw"}
+        ordered = sorted(counts.items(), key=lambda x: x[1] if isinstance(x[1], int) else 999999)
+        worst = ordered[0][0] if ordered else "unknown filter"
+        err(
+            "No rows remaining after filtering — training would fail.\n"
+            f"  Biggest drop: {worst} = {ordered[0][1] if ordered else '?'} rows.\n"
+            "  Try relaxing --min-response-chars, --max-chars, or --lang."
+        )
+        sys.exit(1)
 
     # Split
     train, val = split_train_val(rows, args.val_ratio)
