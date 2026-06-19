@@ -212,6 +212,21 @@ Returns all runs visible in the Evaluation Dashboard. Every completed training r
 }
 ```
 
+### `GET /api/eval/status`
+Poll progress of a running evaluation job.
+```json
+{
+  "ok": true,
+  "data": {
+    "run_id":   "run_2026-06-16_0543",
+    "status":   "running",
+    "progress": 0.42,
+    "message":  "Evaluating VQA samples (21/50)"
+  }
+}
+```
+`status` values: `"idle"` | `"running"` | `"done"` | `"failed"`
+
 ---
 
 ## Export & Publish
@@ -228,11 +243,11 @@ Returns `202 Accepted`.
 ```
 
 ### `POST /api/publish`
+`hf_token` is **not** accepted in the request body. Set the `HF_TOKEN` environment variable on the server.
 ```json
 {
   "export_dir":  "exports/run_2026-06-16_0543/merged",
   "hf_repo":     "mkd-hika/nemotron-ko-vqa",
-  "hf_token":    "hf_...",
   "license":     "apache-2.0",
   "description": "Korean VQA fine-tune of Nemotron Nano VL"
 }
@@ -291,9 +306,11 @@ data: {"token": "", "done": true}
 
 | HTTP | Meaning | Frontend action |
 |------|---------|-----------------|
-| 400  | Bad request / operation failed | Show `data.error` to user |
-| 401  | Missing auth token | Prompt user to configure API key |
-| 403  | Wrong token | Show auth error |
+| 200  | Success | Consume `data` |
+| 202  | Job accepted (async) | Begin polling the endpoint's `/status` sibling |
+| 400  | Bad request / validation error | Show `data.error` to user |
+| 401  | Missing `Authorization` header | Prompt user to configure API key |
+| 403  | Invalid Bearer token | Show auth error |
 | 404  | Resource not found | Show not-found message |
-| 202  | Job started (async) | Begin polling `/status` |
+| 422  | Pydantic validation failure | Show field-level error from `detail` array |
 | 500  | Server error | Show generic error + suggest checking logs |

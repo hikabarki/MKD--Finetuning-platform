@@ -30,6 +30,7 @@ from typing import Any, AsyncGenerator
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -59,12 +60,21 @@ CORS_ORIGINS = (
     else ["http://localhost:3000", "http://localhost:5173"]
 )
 
+_allowed_hosts_env = os.environ.get("ALLOWED_HOSTS", "")
+ALLOWED_HOSTS = (
+    [h.strip() for h in _allowed_hosts_env.split(",") if h.strip()]
+    if _allowed_hosts_env
+    else ["localhost", "127.0.0.1", "*.mkd.kr"]
+)
+
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept"],
 )
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -299,10 +309,10 @@ def api_status():
 # ── Datasets ──────────────────────────────────────────────────────────────────
 
 class DatasetAddRequest(BaseModel):
-    source: str
-    name: str | None = None
-    instruction_col: str = ""
-    response_col:    str = ""
+    source:          str           = Field(..., max_length=500)
+    name:            str | None    = Field(None, max_length=100)
+    instruction_col: str           = Field("",   max_length=100)
+    response_col:    str           = Field("",   max_length=100)
 
 
 @app.post("/api/datasets/add", dependencies=[Depends(require_auth)])
@@ -321,10 +331,10 @@ def dataset_add(req: DatasetAddRequest):
 
 
 class DatasetCleanRequest(BaseModel):
-    name: str
-    max_chars: int = 32768
-    val_ratio: float = 0.01
-    lang: str = ""
+    name:      str   = Field(...,   max_length=100)
+    max_chars: int   = Field(32768, ge=1, le=2_000_000)
+    val_ratio: float = Field(0.01,  ge=0.0, le=1.0)
+    lang:      str   = Field("",   max_length=10)
 
 
 @app.post("/api/datasets/clean", dependencies=[Depends(require_auth)])
@@ -381,8 +391,8 @@ def dataset_delete(name: str):
 # ── Models ────────────────────────────────────────────────────────────────────
 
 class ModelAddRequest(BaseModel):
-    hf_model_id: str
-    local_name: str | None = None
+    hf_model_id: str        = Field(...,  max_length=200)
+    local_name:  str | None = Field(None, max_length=100)
 
 
 @app.post("/api/models/add", dependencies=[Depends(require_auth)])
@@ -415,19 +425,19 @@ def model_delete(name: str):
 # ── Training ──────────────────────────────────────────────────────────────────
 
 class TrainingStartRequest(BaseModel):
-    model:         str
-    dataset:       str
-    mode:          str = "vl"        # "vl" | "text"
-    quant:         str = "bf16"      # "bf16" | "4bit" | "8bit"
-    lora_r:        int = 16
-    lora_alpha:    int = 32
-    epochs:        int = 3
-    batch_size:    int = 1
-    learning_rate: float = 2e-4
-    max_steps:     int = 0
-    wandb_project: str = ""
-    wandb_entity:  str = ""
-    smoke:         bool = False
+    model:         str   = Field(...,   max_length=200)
+    dataset:       str   = Field(...,   max_length=100)
+    mode:          str   = Field("vl",  pattern=r"^(vl|text)$")
+    quant:         str   = Field("bf16",pattern=r"^(bf16|4bit|8bit)$")
+    lora_r:        int   = Field(16,    ge=1,   le=256)
+    lora_alpha:    int   = Field(32,    ge=1,   le=512)
+    epochs:        int   = Field(3,     ge=1,   le=100)
+    batch_size:    int   = Field(1,     ge=1,   le=32)
+    learning_rate: float = Field(2e-4,  ge=1e-7, le=1.0)
+    max_steps:     int   = Field(0,     ge=0,   le=1_000_000)
+    wandb_project: str   = Field("",   max_length=100)
+    wandb_entity:  str   = Field("",   max_length=100)
+    smoke:         bool  = False
 
 
 @app.post("/api/training/start", status_code=202, dependencies=[Depends(require_auth)])
@@ -742,11 +752,11 @@ class ChatMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    model_path:   str = ""
+    model_path:   str           = Field("",  max_length=500)
     messages:     list[ChatMessage]
-    image_base64: str | None = None
-    max_tokens:   int = 256
-    stream:       bool = False
+    image_base64: str | None    = Field(None, max_length=10_000_000)
+    max_tokens:   int           = Field(256,  ge=1, le=4096)
+    stream:       bool          = False
 
 
 @app.post("/api/chat", dependencies=[Depends(require_auth)])

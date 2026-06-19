@@ -44,6 +44,10 @@ DEFAULT_BASE_DIR   = "nvidia__nvidia-nemotron-nano-12b-v2-vl-bf16"
 _FALLBACK_BASE_DIR = "nvidia__nvidia-nemotron-3-nano-4b-bf16"
 NEMOTRON_HF_ID     = "nvidia/NVIDIA-Nemotron-Nano-VL-12B-v2"
 
+# Pin to a specific HF Hub commit to prevent silent supply-chain updates.
+# Set NEMOTRON_REVISION_SHA env var to a full 40-char commit SHA; None = "main".
+REVISION_SHA: str | None = os.environ.get("NEMOTRON_REVISION_SHA")
+
 _MODEL_DISPLAY_INFO: dict = {
     "nvidia__nvidia-nemotron-nano-12b-v2-vl-bf16": "Nemotron VL 12B · image+text  (25 GB VRAM)",
     "nvidia__nvidia-nemotron-3-nano-4b-bf16":       "Nemotron 4B · BF16  (4.3 GB VRAM)",

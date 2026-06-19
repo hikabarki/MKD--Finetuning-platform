@@ -112,7 +112,8 @@ def _load_chat_model(model_path: str):
                         if not os.path.exists(dest):
                             _sh.copy2(pyf, dest)
 
-        tok = AutoProcessor.from_pretrained(str(mp), trust_remote_code=True, local_files_only=True)
+        tok = AutoProcessor.from_pretrained(str(mp), trust_remote_code=True, local_files_only=True,
+                                             revision=_state.REVISION_SHA)
         try:
             import flash_attn  # noqa: F401
             _attn_impl = "flash_attention_2"
@@ -128,6 +129,7 @@ def _load_chat_model(model_path: str):
             trust_remote_code=True,
             local_files_only=True,
             attn_implementation=_attn_impl,
+            revision=_state.REVISION_SHA,
         )
         try:
             import transformers as _tf
@@ -158,7 +160,8 @@ def _load_chat_model(model_path: str):
         return tok, model, True
 
     bnb_cfg = _nvfp4_quant_config()
-    load_kw: dict = dict(device_map="auto", trust_remote_code=True, local_files_only=True)
+    load_kw: dict = dict(device_map="auto", trust_remote_code=True, local_files_only=True,
+                         revision=_state.REVISION_SHA)
     if bnb_cfg:
         load_kw["quantization_config"] = bnb_cfg
     else:
@@ -171,13 +174,15 @@ def _load_chat_model(model_path: str):
         load_kw[dtype_key] = torch.bfloat16
 
     if is_vision:
-        tok = AutoProcessor.from_pretrained(str(mp), trust_remote_code=True, local_files_only=True)
+        tok = AutoProcessor.from_pretrained(str(mp), trust_remote_code=True, local_files_only=True,
+                                             revision=_state.REVISION_SHA)
         try:
             model = _VLMClass.from_pretrained(str(mp), **load_kw)
         except Exception:
             model = AutoModelForCausalLM.from_pretrained(str(mp), **load_kw)
     else:
-        tok = AutoTokenizer.from_pretrained(str(mp), trust_remote_code=True, local_files_only=True)
+        tok = AutoTokenizer.from_pretrained(str(mp), trust_remote_code=True, local_files_only=True,
+                                             revision=_state.REVISION_SHA)
         model = AutoModelForCausalLM.from_pretrained(str(mp), **load_kw)
     return tok, model, is_vision
 
