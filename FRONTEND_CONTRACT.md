@@ -253,7 +253,8 @@ Fields to display:
 6. Export:         POST /api/export          { checkpoint: "...", merge: true }
 7. Load model:     POST /api/chat/load       { model_path: "exports/run_.../merged" }
 8. Chat:           POST /api/chat            { messages: [...], image_base64: "..." }
-9. Publish:        POST /api/publish         { export_dir: "...", hf_repo: "...", hf_token: "..." }
+9. Publish:        POST /api/publish         { export_dir: "...", hf_repo: "..." }
+   ↳ status:       GET  /api/eval/status     (poll running eval job)
 ```
 
 ---

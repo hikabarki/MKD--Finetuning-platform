@@ -56,12 +56,6 @@ from platform.eval_dashboard import (
 from ui.styles import CSS
 
 
-# ── Developer credentials ─────────────────────────────────────────────────────
-DEV_USERNAME = os.environ.get("DEV_USERNAME", "mkd-dev")
-DEV_PASSWORD = os.environ.get("DEV_PASSWORD")   # None = dev tab disabled
-if not DEV_PASSWORD:
-    print("WARNING: DEV_PASSWORD env var not set — developer tab is disabled.", flush=True)
-
 # ── App ───────────────────────────────────────────────────────────────────────
 with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
 
@@ -130,28 +124,6 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
             land_dev_btn  = gr.Button("Enter as Developer",    variant="secondary", scale=1, elem_id="land_dev_btn")
             land_user_btn = gr.Button("Enter as General User", variant="primary",   scale=1)
             land_eval_btn = gr.Button("View Evaluation",       variant="secondary", scale=1)
-
-    # ── Developer login screen ────────────────────────────────────────────────
-    with gr.Group(visible=False) as dev_login_group:
-        gr.HTML("""
-        <div style="max-width:380px;margin:60px auto;padding:0 20px;text-align:center;">
-          <div style="width:48px;height:48px;background:#1f6feb;border-radius:10px;
-                      display:inline-flex;align-items:center;justify-content:center;
-                      font-size:18px;font-weight:700;color:#fff;margin-bottom:20px;">MKD</div>
-          <h2 style="color:#e6edf3;margin:0 0 6px;font-size:22px;">Developer Access</h2>
-          <p style="color:#8b949e;font-size:14px;margin:0 0 28px;">
-            Enter your credentials to continue
-          </p>
-        </div>
-        """)
-        with gr.Column(elem_id="login-box"):
-            dev_login_user = gr.Textbox(label="Username", placeholder="username")
-            dev_login_pass = gr.Textbox(label="Password", placeholder="password",
-                                        type="password")
-            dev_login_err  = gr.HTML("")
-            with gr.Row():
-                dev_login_back_btn = gr.Button("← Back",  variant="secondary", scale=1)
-                dev_login_btn      = gr.Button("Login",    variant="primary",   scale=2)
 
     # ── Developer mode ────────────────────────────────────────────────────────
     dev_content_group = gr.Group(visible=False)
@@ -642,28 +614,19 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
     # Hiding landing_group reveals the developer dashboard underneath.
     # user_group shows the simplified interface on top.
 
-    # All group outputs: landing, dev_login, dev_group, user_group, dev_content, eval_group
-    _outs = [landing_group, dev_login_group, dev_group, user_group, dev_content_group, eval_group]
+    # All group outputs: landing, dev_group, user_group, dev_content, eval_group
+    _outs = [landing_group, dev_group, user_group, dev_content_group, eval_group]
 
     def _g(v): return gr.Group(visible=v)
 
-    def go_to_login():
-        return _g(False), _g(True),  _g(False), _g(False), _g(False), _g(False)
-
-    def do_dev_login(username, password):
-        if DEV_PASSWORD and username.strip() == DEV_USERNAME and password.strip() == DEV_PASSWORD:
-            return (_g(False), _g(False), _g(True),  _g(False), _g(True),  _g(False),
-                    gr.HTML(""))
-        else:
-            msg = "Developer access is disabled (DEV_PASSWORD not set)." if not DEV_PASSWORD else "Incorrect username or password."
-            return (_g(False), _g(True),  _g(False), _g(False), _g(False), _g(False),
-                    gr.HTML(f'<div style="color:#f85149;font-size:13px;padding:8px 0;">{msg}</div>'))
+    def go_to_dev():
+        return _g(False), _g(True), _g(False), _g(True), _g(False)
 
     def go_user():
-        return _g(False), _g(False), _g(False), _g(True),  _g(False), _g(False)
+        return _g(False), _g(False), _g(True), _g(False), _g(False)
 
     def go_home():
-        return _g(True),  _g(False), _g(False), _g(False), _g(False), _g(False)
+        return _g(True), _g(False), _g(False), _g(False), _g(False)
 
     def go_eval():
         runs = list_eval_runs()
@@ -671,31 +634,20 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
         loss_fig, ppl_fig, summary_fig, df = load_eval_run(default)
         has_data = bool(default)
         return (
-            _g(False), _g(False), _g(False), _g(False), _g(False), _g(True),
+            _g(False), _g(False), _g(False), _g(False), _g(True),
             gr.Dropdown(choices=runs, value=default),
             loss_fig, ppl_fig, summary_fig, df,
             gr.HTML(visible=not has_data),
             gr.Group(visible=has_data),
         )
 
-    land_dev_btn.click(go_to_login, outputs=_outs)
-    land_user_btn.click(go_user,    outputs=_outs)
-    land_eval_btn.click(go_eval,    outputs=_outs + [
+    land_dev_btn.click(go_to_dev,  outputs=_outs)
+    land_user_btn.click(go_user,   outputs=_outs)
+    land_eval_btn.click(go_eval,   outputs=_outs + [
         eval_run_dd, eval_loss_plot, eval_ppl_plot, eval_summary_plot,
         eval_table, eval_no_data, eval_charts_group,
     ])
 
-    dev_login_btn.click(do_dev_login,
-                        inputs=[dev_login_user, dev_login_pass],
-                        outputs=_outs + [dev_login_err])
-    dev_login_user.submit(do_dev_login,
-                          inputs=[dev_login_user, dev_login_pass],
-                          outputs=_outs + [dev_login_err])
-    dev_login_pass.submit(do_dev_login,
-                          inputs=[dev_login_user, dev_login_pass],
-                          outputs=_outs + [dev_login_err])
-
-    dev_login_back_btn.click(go_home, outputs=_outs)
     back_dev_btn.click(go_home,       outputs=_outs)
     back_user_btn.click(go_home,      outputs=_outs)
     back_eval_btn.click(go_home,      outputs=_outs)

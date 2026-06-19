@@ -223,6 +223,7 @@ def _compute_vqa_accuracy(model, processor, jsonl_path: str, n_samples: int = 50
     rows = rows[:n_samples]
     correct = 0
     total = 0
+    failures = 0
 
     model.eval()
     import torch as _torch
@@ -267,9 +268,16 @@ def _compute_vqa_accuracy(model, processor, jsonl_path: str, n_samples: int = 50
                     correct += 1
                 total += 1
             except Exception:
+                failures += 1
                 continue
 
     model.train()
+    attempted = total + failures
+    if attempted > 0 and failures > attempted * 0.5:
+        raise RuntimeError(
+            f"VQA eval aborted: {failures}/{attempted} samples failed — "
+            "check model outputs and dataset format"
+        )
     return (correct / total if total > 0 else 0.0), total
 
 

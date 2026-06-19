@@ -1,0 +1,66 @@
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  api:
+    build: .
+    command: uvicorn api:app --host 0.0.0.0 --port 8000 --workers 2
+    ports:
+      - "8000:8000"
+    environment:
+      FT_PROJECT: /workspace
+      API_SECRET: ${API_SECRET:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:7860}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-localhost,127.0.0.1}
+      HF_TOKEN: ${HF_TOKEN:-}
+      NEMOTRON_REVISION_SHA: ${NEMOTRON_REVISION_SHA:-}
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./datasets:/workspace/datasets
+      - ./models:/workspace/models
+      - ./checkpoints:/workspace/checkpoints
+      - ./logs:/workspace/logs
+      - ./exports:/workspace/exports
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  ui:
+    build: .
+    command: python3.11 app.py --server-port 7860 --server-name 0.0.0.0
+    ports:
+      - "7860:7860"
+    environment:
+      FT_PROJECT: /workspace
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      NEMOTRON_REVISION_SHA: ${NEMOTRON_REVISION_SHA:-}
+    volumes:
+      - ./datasets:/workspace/datasets
+      - ./models:/workspace/models
+      - ./checkpoints:/workspace/checkpoints
+      - ./logs:/workspace/logs
+      - ./exports:/workspace/exports
+    depends_on:
+      - api
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
