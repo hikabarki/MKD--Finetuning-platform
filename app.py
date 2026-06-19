@@ -269,6 +269,14 @@ def _build_chat_inputs(messages: list, image=None):
         # pixel_values + img_context_token_id to inject visual features directly.
         inputs.pop("num_patches", None)
         inputs.pop("image_flags", None)
+        try:
+            with open("/tmp/vl_debug.log", "a") as _vd2:
+                _pv = inputs.get("pixel_values")
+                _ids = inputs.get("input_ids")
+                _vd2.write(f"[inputs] keys={list(inputs.keys())} pv={'None' if _pv is None else str(_pv.shape)} ids={'None' if _ids is None else str(_ids.shape)}\n")
+                _vd2.write(f"[text] {repr(text[:300])}\n---\n")
+        except Exception:
+            pass
     else:
         text = _chat_tok.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True)
@@ -406,6 +414,7 @@ def _generate_reply(msgs: list, max_tokens: int = 256, image=None) -> str:
 
     # Transformers path
     import torch
+    torch.cuda.empty_cache()  # free fragmented VRAM before building the causal mask
     inputs = _build_chat_inputs(msgs, image=image)
     ids = inputs.get("input_ids")
     _prompt_len = ids.shape[1] if ids is not None else 0
@@ -1817,6 +1826,13 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                     info="Number of steps for the quick test. More steps = better evaluation metrics.",
                     visible=True,
                 )
+                user_qs_max_steps = gr.Number(
+                    label="Max training steps",
+                    value=0,
+                    precision=0,
+                    minimum=0,
+                    info="Cap the full training run (0 = no limit, runs full epochs).",
+                )
 
                 gr.HTML('<div style="height:20px;"></div>')
 
@@ -2327,7 +2343,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
     _user_last_model_path = {"path": None}   # shared state for inline chat
     _user_training_proc   = {"proc": None}   # track subprocess for cancellation
 
-    def run_user_quickstart(dataset_choice, upload_file, model_name, test_mode=True, test_steps=50):
+    def run_user_quickstart(dataset_choice, upload_file, model_name, test_mode=True, test_steps=50, max_steps=0):
         dataset = "alpaca"
         # Priority: VL 12B → Nemotron 4B BF16 → Qwen 7B → Qwen 3B
         _model_priority = [
@@ -2340,6 +2356,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                 model = _m
                 break
         test_steps = int(test_steps or 50)
+        max_steps  = int(max_steps  or 0)
 
         # If customer uploaded their own file, prepare it first (add → clean)
         if dataset_choice != "Use the built-in example dataset" and upload_file is not None:
@@ -2392,6 +2409,8 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
             ]
             if test_mode:
                 cmd += ["--max-steps", str(test_steps)]
+            elif max_steps > 0:
+                cmd += ["--max-steps", str(max_steps)]
 
             yield build_progress_html("configure"), terminal_wrap("Setting up VL training...")
             yield build_progress_html("smoke"), terminal_wrap("Starting VL trainer (smoke + train + merge)...")
@@ -2500,13 +2519,16 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
         for chunk in run_ft(["smoke-test", latest_cfg, f"--steps={test_steps}"]):
             yield build_progress_html("smoke"), chunk
 
-        # Remove the test-only max_steps cap so full training runs all epochs
-        if test_mode:
+        # Remove smoke-test cap; optionally inject user's max_steps for full training
+        if test_mode or max_steps > 0:
             cfg_path = ROOT / "configs" / configs[0]
             if cfg_path.exists():
                 import re as _re2
                 txt = cfg_path.read_text()
                 txt = _re2.sub(r'^max_steps:.*\n?', '', txt, flags=_re2.MULTILINE)
+                if max_steps > 0:
+                    txt = _re2.sub(r'^num_epochs:', f'max_steps: {max_steps}\nnum_epochs:',
+                                   txt, flags=_re2.MULTILINE)
                 cfg_path.write_text(txt)
 
         yield build_progress_html("train"), terminal_wrap("Starting training...")
@@ -2796,7 +2818,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
     ).then(show_cancel_btn, outputs=_btn_outs
     ).then(
         run_user_quickstart,
-        inputs=[user_qs_dataset, user_qs_file, user_qs_name, user_qs_test_mode, user_qs_test_steps],
+        inputs=[user_qs_dataset, user_qs_file, user_qs_name, user_qs_test_mode, user_qs_test_steps, user_qs_max_steps],
         outputs=[user_progress_html, user_progress_out],
         show_progress=False,
     ).then(show_home_btn, outputs=_btn_outs
@@ -2932,21 +2954,30 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                 history.append({"role": "assistant", "content": "No model found. Please complete the training step or add a model to the models/ directory."})
                 yield history, "", "No errors yet.", None
                 return
+            try:
+                with open("/tmp/vl_debug.log", "a") as _vd_mp:
+                    _vd_mp.write(f"[model_load] path={model_path} is_vl={_is_vl_model(model_path)}\n")
+            except Exception:
+                pass
+            # Show loading state WITHOUT mutating `history` — loading messages must NOT
+            # end up in the conversation context fed to the model (they confuse it).
             _user_content = _build_chat_content(message, image)
-            history.append({"role": "user", "content": _user_content})
-            history.append({"role": "assistant", "content": "⏳ Loading your model, please wait (~30–60 s)..."})
-            yield history, "", "No errors yet.", None
+            _loading_hist = list(history) + [
+                {"role": "user", "content": _user_content},
+                {"role": "assistant", "content": "⏳ Loading your model, please wait (~30–60 s)..."},
+            ]
+            yield _loading_hist, "", "No errors yet.", None
             try:
                 _chat_tok, _chat_model, _chat_is_vision = _load_chat_model(model_path)
                 _chat_name = model_path
-                history[-1]["content"] = "✓ Model loaded. Now answering your message..."
-                yield history, "", "No errors yet.", None
+                _loading_hist[-1]["content"] = "✓ Model loaded. Now answering your message..."
+                yield _loading_hist, "", "No errors yet.", None
             except Exception as e:
                 import traceback as _tb_load
                 _tb_str = _tb_load.format_exc()
                 err_log = _append_error_log(f"Model load failed: {e}\n{_tb_str}")
-                history[-1]["content"] = f"Failed to load model: {e}\n\nSee Error Log for details."
-                yield history, "", err_log, None
+                _loading_hist[-1]["content"] = f"Failed to load model: {e}\n\nSee Error Log for details."
+                yield _loading_hist, "", err_log, None
                 return
         err_log_val = "No errors yet." if not _user_error_log_lines else "\n\n".join(_user_error_log_lines[:10])
         try:
@@ -2954,15 +2985,22 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                 reply = ("⚠️ This model is text-only and cannot process images. "
                          "Load a vision-language model (e.g. Nemotron 12B VL) to use image input.")
             else:
+                import re as _re_hist
                 msgs = [{"role": "system", "content": "You are a helpful assistant."}]
-                for t in history:
+                # Only keep last 6 history messages to avoid unbounded context growth.
+                # Strip <img> base64 HTML from history — passing raw base64 as text
+                # tokenises into ~60K tokens and causes CUDA OOM on the causal mask.
+                for t in list(history)[-6:]:
                     if isinstance(t, dict):
                         content = t.get("content", "")
                         if isinstance(content, list):
                             content = " ".join(i.get("text", str(i)) for i in content)
-                        msgs.append({"role": t["role"], "content": str(content)})
+                        content = _re_hist.sub(r'<img\b[^>]*>', '[image]', str(content)).strip()
+                        if content:
+                            msgs.append({"role": t["role"], "content": content})
                 msgs.append({"role": "user", "content": message})
-                _max_tok = 1024 if (image is not None and _chat_is_vision) else 256
+                # 512 for VL (image present) keeps causal mask under ~2 GiB; 256 for text
+                _max_tok = 512 if (image is not None and _chat_is_vision) else 256
                 reply = _generate_reply(msgs, max_tokens=_max_tok, image=image)
         except Exception as e:
             import traceback as _tb_gen
