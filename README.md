@@ -1,60 +1,140 @@
-# MKD Fine-Tuning Platform — Multimodal
+# MKD Fine-Tuning Platform v1.0.0
 
-A production-grade fine-tuning platform for NVIDIA GPUs supporting both **text** and **vision-language (VL)** models. Built with a Gradio UI for rapid prototyping and a clean CLI backend designed for frontend integration.
-
----
-
-## Features
-
-- **Multimodal training** — fine-tune vision-language models (NVIDIA Nemotron-Nano-12B-VL) on image+text datasets
-- **Text fine-tuning** — LoRA/QLoRA fine-tuning via Axolotl on any JSONL/CSV instruction dataset
-- **General User Mode** — Quick Start and Custom Mix flows for non-technical users
-- **Expert Mode** — full control over model, dataset, quantization, learning rate, epochs, and evaluation
-- **Model Evaluation Dashboard** — training loss, perplexity, before/after comparison charts for every run
-- **Multimodal Chat** — test your fine-tuned model with image + text inputs directly in the UI
-- **Export & Publish** — merged checkpoint export with LoRA adapter merge
-- **Automatic eval registration** — every completed training run appears in the Evaluation Dashboard automatically
+Production-grade fine-tuning platform for **NVIDIA GPUs** supporting text and vision-language (VL) models. Gradio 6.x UI + FastAPI REST API, containerised with Docker.
 
 ---
 
-## Stack
+## Architecture
 
-| Layer | Technology |
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        app.py (entry)                        │
+│   Gradio 6.x  ──►  ui/layout.py  ──►  ui/components.py     │
+│                         ui/styles.py (CSS)                   │
+└──────────────────────────────┬──────────────────────────────┘
+                               │ HTTP
+┌──────────────────────────────▼──────────────────────────────┐
+│                      api.py (FastAPI)                        │
+│  TrustedHostMiddleware ► CORS ► Auth ► Pydantic validators  │
+│                                                              │
+│  /api/datasets   /api/models   /api/training                 │
+│  /api/eval       /api/export   /api/publish                  │
+│  /api/chat       /api/health   /api/status                   │
+└─────────┬──────────────────────────────────┬────────────────┘
+          │                                  │
+┌─────────▼──────────┐            ┌──────────▼──────────┐
+│   ft_platform/     │            │    inference/        │
+│   log_parser.py    │            │    state.py          │
+│   eval_dashboard.py│            │    vllm_server.py    │
+│   training.py      │            │    chat.py           │
+└────────────────────┘            └─────────────────────┘
+          │                                  │
+┌─────────▼──────────────────────────────────▼────────────────┐
+│                  scripts/  (CLI entry points)                 │
+│  ft  ft_train.py  ft_eval.py  ft_export.py  ft_configure.py │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Security Model
+
+| Layer | Mechanism |
 |-------|-----------|
-| UI | Gradio 6.x |
-| VL Training | Custom `vl_trainer.py` (HuggingFace Transformers + PEFT) |
-| Text Training | [Axolotl](https://github.com/axolotl-ai-cloud/axolotl) |
-| Quantization | bitsandbytes (4-bit QLoRA), BF16 |
-| Inference | vLLM (text), direct HF (VL) |
-| GPU | NVIDIA RTX 5090 / B200 (CUDA 12.8, PyTorch 2.11) |
+| UI access | `ADMIN_PASSWORD` env var → Gradio HTTP basic auth |
+| API access | `API_SECRET` env var → `Authorization: Bearer <token>` header |
+| Host validation | `TrustedHostMiddleware`; `ALLOWED_HOSTS` env var |
+| Input sanitisation | `_safe_name()` rejects `..`, `/`, null bytes on every file-access endpoint |
+| Request validation | Pydantic `Field(max_length=…, ge=…, le=…, pattern=…)` on all request models |
+| HF token | `HF_TOKEN` read from server env only — never accepted in request bodies |
+| Supply-chain | `REVISION_SHA` pins the HF Hub commit SHA passed to every `from_pretrained` |
+| Container | Non-root `mkd` user; NVIDIA base image |
+
+### Auth flow
+
+```
+Browser ──► ADMIN_PASSWORD (HTTP basic) ──► Gradio UI
+REST client ──► Authorization: Bearer $API_SECRET ──► FastAPI
+```
+
+Both are optional in development (`""` disables the check).
 
 ---
 
-## Supported Models
+## Deployment
 
-- **NVIDIA Nemotron-Nano-12B-VL BF16** (vision-language, default)
-- **NVIDIA Nemotron-3-Nano-4B BF16** (text, fallback)
-- Any HuggingFace-compatible causal LM
+### Docker (recommended)
+
+```bash
+# Build
+docker build -t ft-platform:v1.0.0 .
+
+# Run (single container)
+docker run --gpus all -p 7860:7860 -p 8000:8000 \
+  -e ADMIN_PASSWORD=<secret> \
+  -e API_SECRET=<secret> \
+  -e HF_TOKEN=<hf_token> \
+  -e ALLOWED_HOSTS="localhost,*.mkd.kr" \
+  -v /data/ft-projects:/workspace/ft-projects \
+  ft-platform:v1.0.0
+
+# Full stack (api + ui + redis)
+docker compose up
+```
+
+### Bare metal
+
+```bash
+# Install Python ≥ 3.10 + CUDA 12.4+ runtime first
+pip install -e ".[api,dev]"
+
+# Launch API (port 8000)
+ADMIN_PASSWORD=<secret> API_SECRET=<secret> uvicorn api:app --host 0.0.0.0 --port 8000
+
+# Launch UI (port 7860)
+python app.py
+```
+
+---
+
+## Environment Variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `ADMIN_PASSWORD` | No | `""` | Gradio HTTP basic auth password (unprotected if empty) |
+| `API_SECRET` | No | `""` | FastAPI Bearer token (unprotected if empty) |
+| `HF_TOKEN` | For publish | — | Hugging Face write token for model publishing |
+| `ALLOWED_HOSTS` | Prod | `localhost,127.0.0.1,*.mkd.kr` | Comma-separated allowed `Host` headers |
+| `FT_PROJECT` | No | CWD | Root directory for datasets, models, checkpoints, logs |
+| `NEMOTRON_REVISION_SHA` | No | `None` (main) | Pinned HF Hub commit SHA for supply-chain protection |
+| `REDIS_URL` | No | — | Redis URL for job queuing in multi-worker deployments |
+| `CUDA_VISIBLE_DEVICES` | No | all | GPU device selection |
 
 ---
 
 ## Quick Start
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt   # or: bash install.sh
+# 1. Install
+pip install -e ".[api]"
 
-# Launch the UI
-python app.py
+# 2. Launch
+python app.py            # Gradio UI  → http://localhost:7860
+uvicorn api:app          # REST API   → http://localhost:8000
 
-# With public share link
-python app.py --share
+# 3. Add a model
+curl -X POST http://localhost:8000/api/models/add \
+  -H "Authorization: Bearer $API_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"hf_model_id": "nvidia/Nemotron-Nano-12B-VL"}'
 
-# CLI usage
-ft configure --model=<model> --dataset=<dataset>
-ft train configs/<run>.yml
-ft eval checkpoints/<run>
-ft export checkpoints/<run> --merge
+# 4. Add a dataset
+curl -X POST http://localhost:8000/api/datasets/add \
+  -d '{"source": "hf://my-org/my-dataset"}'
+
+# 5. Start training
+curl -X POST http://localhost:8000/api/training/start \
+  -d '{"model": "Nemotron-Nano-12B-VL", "dataset": "my-dataset"}'
 ```
 
 ---
@@ -62,37 +142,80 @@ ft export checkpoints/<run> --merge
 ## Project Structure
 
 ```
-ft-platform-multimodal/
-├── app.py                  # Gradio UI (General User + Expert Mode)
-├── vl_trainer.py           # Vision-language fine-tuning trainer
-├── api.py                  # REST API layer
-├── setup.py                # Package setup
-├── install.sh              # Dependency installer
-├── scripts/
-│   ├── ft                  # CLI entry point
-│   ├── ft_train.py         # Training orchestration
-│   ├── ft_eval.py          # Evaluation (lm-eval-harness)
-│   ├── ft_configure.py     # Recipe/config generation
-│   ├── ft_export.py        # Checkpoint export + LoRA merge
-│   ├── ft_add_dataset.py   # Dataset ingestion
-│   ├── ft_clean_dataset.py # Dataset cleaning + PII scrub
-│   └── ft_common.py        # Shared utilities
-├── configs/                # Generated training recipes (gitignored: run_*)
-├── data_cards/             # Dataset metadata
-└── eval_results/           # Per-run evaluation results
+ft-platform-refactor/
+├── app.py                      # Entry point — Gradio UI launcher
+├── api.py                      # FastAPI REST API (port 8000)
+├── vl_trainer.py               # Vision-language fine-tuning trainer
+├── pyproject.toml              # PEP 621 package metadata
+├── Dockerfile                  # Multi-stage NVIDIA CUDA image
+├── docker-compose.yml          # api + ui + redis services
+├── Makefile                    # test / lint / format / docker targets
+│
+├── inference/
+│   ├── state.py                # Global state, locks, env constants
+│   ├── vllm_server.py          # vLLM server lifecycle management
+│   └── chat.py                 # Model loading + generation (GPU-required)
+│
+├── ft_platform/
+│   ├── log_parser.py           # Training log → structured metrics
+│   ├── eval_dashboard.py       # Matplotlib eval charts
+│   └── training.py             # Subprocess wrapper for training runs
+│
+├── ui/
+│   ├── layout.py               # Gradio Blocks definition
+│   ├── components.py           # HTML panels, file readers, GPU stats
+│   └── styles.py               # Global CSS
+│
+├── scripts/                    # CLI entry points (ft, ft_train, ft_eval, …)
+├── tests/                      # pytest suite (177 tests, 81 % coverage)
+│   ├── conftest.py
+│   ├── inference/
+│   ├── platform/
+│   ├── ui/
+│   ├── integration/
+│   ├── security/
+│   └── performance/
+│
+├── API_SPEC.md                 # Full REST API reference
+├── FRONTEND_CONTRACT.md        # Request/response contract for UI integration
+├── CHANGELOG.md                # All changes from the original monolith
+└── PRODUCTION_CHECKLIST.md     # Pre-launch validation checklist
 ```
 
 ---
 
-## API
+## Migration Guide
 
-The Gradio UI exposes a full REST API automatically. With the server running:
+### From the original monolithic `app.py`
 
+| Old | New |
+|-----|-----|
+| `from platform.log_parser import …` | `from ft_platform.log_parser import …` |
+| `from platform.eval_dashboard import …` | `from ft_platform.eval_dashboard import …` |
+| `from platform.training import …` | `from ft_platform.training import …` |
+| `POST /api/publish` with `hf_token` in body | Remove `hf_token` from body; set `HF_TOKEN` env var |
+| `DEV_PASSWORD` env var | Removed — use `ADMIN_PASSWORD` only |
+| Gradio Developer login screen | Removed — Developer button routes directly |
+
+---
+
+## Development
+
+```bash
+# Install dev extras
+pip install -e ".[api,dev]"
+
+# Run tests
+make test
+# or:
+/path/to/venv/bin/pytest tests/ --cov=. --cov-config=.coveragerc -q
+
+# Lint + format
+make lint
+
+# Security scan
+make security
 ```
-http://localhost:7860/?view=api
-```
-
-See `API_SPEC.md` and `FRONTEND_CONTRACT.md` for the frontend integration contract.
 
 ---
 
@@ -101,25 +224,22 @@ See `API_SPEC.md` and `FRONTEND_CONTRACT.md` for the frontend integration contra
 | Component | Minimum | Recommended |
 |-----------|---------|-------------|
 | GPU | 24 GB VRAM | 32 GB+ (RTX 5090 / B200) |
-| CUDA | 12.8 | 12.8 |
+| CUDA | 12.4 | 12.4+ |
 | RAM | 32 GB | 64 GB |
 | Storage | 100 GB | 500 GB |
 
-> **Note:** NVFP4 quantization is inference-only. Training uses BF16 or 4-bit QLoRA.
+> **NVFP4 is inference-only.** Training uses BF16 or 4-bit QLoRA.
 
 ---
 
-## Evaluation Dashboard
+## Supported Models
 
-Every training run (Quick Start, Custom Mix, Expert) is automatically registered in the Evaluation Dashboard after completion. The dashboard shows:
-
-- Training loss curve
-- Perplexity over steps
-- Before vs After comparison (loss + perplexity)
-- Summary table with % improvement
+- **NVIDIA Nemotron-Nano-12B-VL BF16** — vision-language (default)
+- **NVIDIA Nemotron-3-Nano-4B BF16** — text-only (fallback)
+- Any HuggingFace-compatible causal LM
 
 ---
 
 ## License
 
-Internal use — MKD © 2026
+Internal use — MKD Co., Ltd. © 2026
