@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import pandas as pd
 
-from platform.log_parser import parse_training_log
+from ft_platform.log_parser import parse_training_log
 
 # ── Chart palette ─────────────────────────────────────────────────────────────
 _FIG_BG    = "#0d1117"
