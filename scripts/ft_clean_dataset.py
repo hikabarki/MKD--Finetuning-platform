@@ -34,7 +34,19 @@ from ft_common import (
 
 
 def load_jsonl(path: Path) -> list[dict]:
-    return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+    rows, errors = [], 0
+    for i, line in enumerate(path.read_text().splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError as e:
+            errors += 1
+            print(f"WARNING: Skipping malformed JSON on line {i}: {e}", flush=True)
+            if errors > 100:
+                print("ERROR: More than 100 JSON parse errors — aborting.", flush=True)
+                sys.exit(1)
+    return rows
 
 
 def write_jsonl(path: Path, rows: list[dict]) -> None:

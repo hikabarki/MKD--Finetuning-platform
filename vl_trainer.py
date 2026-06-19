@@ -480,6 +480,7 @@ def main():
     from functools import partial
 
     # H-1: Determine device placement based on GPU environment
+    device     = "cuda" if torch.cuda.is_available() else "cpu"
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
     n_gpus     = torch.cuda.device_count()
 
