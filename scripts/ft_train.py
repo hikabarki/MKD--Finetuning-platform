@@ -40,19 +40,8 @@ def load_yaml_str(path: Path) -> str:
 
 
 def load_yaml(path: Path) -> dict:
-    try:
-        import yaml
-        return yaml.safe_load(path.read_text())
-    except ImportError:
-        cfg = {}
-        for line in path.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if ": " in line and not line.startswith("-"):
-                k, _, v = line.partition(": ")
-                cfg[k.strip()] = v.strip()
-        return cfg
+    import yaml
+    return yaml.safe_load(path.read_text())
 
 
 def count_gpus() -> int:
@@ -221,8 +210,11 @@ def main():
                           txt, flags=_re.MULTILINE)
         else:
             txt = _re.sub(r'^max_steps:.*', f'max_steps: {parsed.max_steps}', txt, flags=_re.MULTILINE)
-        tmp = Path(tempfile.mktemp(suffix=".yaml", prefix="ft_train_"))
-        tmp.write_text(txt)
+        import tempfile as _tf
+        with _tf.NamedTemporaryFile(suffix=".yaml", prefix="ft_train_",
+                                    mode="w", delete=False) as _fh:
+            _fh.write(txt)
+            tmp = Path(_fh.name)
         info(f"max_steps={parsed.max_steps} → using patched config {tmp.name}")
         recipe_path = tmp
 

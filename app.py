@@ -270,11 +270,14 @@ def _build_chat_inputs(messages: list, image=None):
         inputs.pop("num_patches", None)
         inputs.pop("image_flags", None)
         try:
-            with open("/tmp/vl_debug.log", "a") as _vd2:
+            import os as _os_dbg
+            _os_dbg.makedirs("logs", exist_ok=True)
+            with open("logs/vl_debug.log", "a") as _vd2:
                 _pv = inputs.get("pixel_values")
                 _ids = inputs.get("input_ids")
                 _vd2.write(f"[inputs] keys={list(inputs.keys())} pv={'None' if _pv is None else str(_pv.shape)} ids={'None' if _ids is None else str(_ids.shape)}\n")
-                _vd2.write(f"[text] {repr(text[:300])}\n---\n")
+                if _os_dbg.environ.get("VL_DEBUG"):
+                    _vd2.write(f"[text] {repr(text[:300])}\n---\n")
         except Exception:
             pass
     else:
@@ -456,7 +459,8 @@ def _generate_reply(msgs: list, max_tokens: int = 256, image=None) -> str:
             import traceback as _tb_inner
             _tb_inner_str = _tb_inner.format_exc()
             try:
-                with open("/tmp/ft_chat_errors.log", "a") as _ef2:
+                import os as _os_e; _os_e.makedirs("logs", exist_ok=True)
+                with open("logs/ft_chat_errors.log", "a") as _ef2:
                     _ef2.write(f"[_generate_reply] {type(_gen_exc).__name__}: {_gen_exc}\n{_tb_inner_str}\n---\n")
             except Exception:
                 pass
@@ -467,7 +471,7 @@ def _generate_reply(msgs: list, max_tokens: int = 256, image=None) -> str:
     reply_raw = _tokenizer.decode(out[0], skip_special_tokens=False,
                                   clean_up_tokenization_spaces=False)
     try:
-        with open("/tmp/vl_debug.log", "a") as _vd:
+        with open("logs/vl_debug.log", "a") as _vd:
             _vd.write(f"[gen] prompt_len={_prompt_len} out_len={out[0].shape[0]} start=0 image={'yes' if image is not None else 'no'}\n")
             _vd.write(f"[raw] {repr(reply_raw[:400])}\n---\n")
     except Exception:
@@ -2822,7 +2826,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                 _user_last_model_path["path"] = model_path
         except Exception as _gtc_exc:
             import traceback as _gtc_tb
-            with open("/tmp/ft_chat_errors.log", "a") as _ef:
+            with open("logs/ft_chat_errors.log", "a") as _ef:
                 _ef.write(f"[go_to_chat] {_gtc_exc}\n{_gtc_tb.format_exc()}\n---\n")
         return show_screen4(False, False, False, False, True)
 
@@ -2896,7 +2900,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
         entry = "\n\n".join(_user_error_log_lines[:10])
         # Also write to disk for persistent inspection
         try:
-            with open("/tmp/ft_chat_errors.log", "a") as _ef:
+            with open("logs/ft_chat_errors.log", "a") as _ef:
                 _ef.write(f"[{ts}] {text}\n---\n")
         except Exception:
             pass
@@ -2972,7 +2976,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                 yield history, "", "No errors yet.", None
                 return
             try:
-                with open("/tmp/vl_debug.log", "a") as _vd_mp:
+                with open("logs/vl_debug.log", "a") as _vd_mp:
                     _vd_mp.write(f"[model_load] path={model_path} is_vl={_is_vl_model(model_path)}\n")
             except Exception:
                 pass

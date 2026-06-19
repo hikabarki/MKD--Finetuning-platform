@@ -137,6 +137,13 @@ def pdf_dataset_to_jsonl(
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     print(f"[pdf_utils] JSONL written to: {jsonl_path}", flush=True)
+    print(
+        "\n⚠  WARNING: All assistant labels are empty strings.\n"
+        "   Edit the output JSONL and fill in the 'content' field for each\n"
+        "   assistant turn before training, or training will produce a broken model.\n"
+        f"   File: {jsonl_path}\n",
+        flush=True,
+    )
     return jsonl_path
 
 

@@ -434,11 +434,6 @@ class TrainingStartRequest(BaseModel):
 def training_start(req: TrainingStartRequest):
     global _active_job
 
-    with _active_job_lock:
-        if _active_job and _active_job.is_running():
-            return err_resp("A training job is already running",
-                            f"run_id={_active_job.run_id}")
-
     ts = datetime.now().strftime("%Y-%m-%d_%H%M")
     run_id = f"run_{ts}"
     log_path = ROOT / "logs" / f"train_{run_id}.log"
@@ -480,15 +475,17 @@ def training_start(req: TrainingStartRequest):
            "TOKENIZERS_PARALLELISM": "false",
            "PYTHONUNBUFFERED": "1"}
 
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, cwd=str(ROOT), env=env,
-    )
-
-    job = _Job(run_id=run_id, proc=proc, log_path=log_path)
-    job.start_monitor()
-
+    # C2: check + Popen + assign all under one lock — eliminates TOCTOU window.
     with _active_job_lock:
+        if _active_job and _active_job.is_running():
+            return err_resp("A training job is already running",
+                            f"run_id={_active_job.run_id}")
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, cwd=str(ROOT), env=env,
+        )
+        job = _Job(run_id=run_id, proc=proc, log_path=log_path)
+        job.start_monitor()
         _active_job = job
 
     return ok_resp({"run_id": run_id, "status": "started"})
@@ -548,6 +545,8 @@ async def training_logs(request: Request, run_id: str = "", offset: int = 0):
         skipped = 0
         with log_path.open() as fh:
             while True:
+                if await request.is_disconnected():
+                    break
                 line = fh.readline()
                 if not line:
                     if job and job.is_running():
