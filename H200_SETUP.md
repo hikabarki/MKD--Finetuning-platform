@@ -37,7 +37,23 @@ large speedup. Install **after** torch is in place:
 pip install flash-attn --no-build-isolation
 ```
 
-## 4. Get the dataset
+## 4. Get the model
+
+`models/` is git-ignored (~24 GB), so the clone has no model weights. Either:
+
+```bash
+# Option A — download from HuggingFace via the platform's helper
+export HF_TOKEN=<your-hf-token>     # if the model is gated
+python scripts/ft_add_model.py nvidia/Nemotron-Nano-12B-v2-VL-BF16
+#   (confirm the exact repo id on huggingface.co — the local folder name
+#    nvidia__nvidia-nemotron-nano-12b-v2-vl-bf16 is the sanitized form)
+
+# Option B — rsync the already-downloaded model from the source machine
+rsync -avhP models/nvidia__nvidia-nemotron-nano-12b-v2-vl-bf16/ \
+  user@h200:/path/to/ft-platform-refactor/models/nvidia__nvidia-nemotron-nano-12b-v2-vl-bf16/
+```
+
+## 5. Get the dataset
 
 The code is on Git; the data is not. Pick one:
 
@@ -88,7 +104,7 @@ rsync -avhP datasets/llava-instruct-150k/ \
   user@h200:/path/to/ft-platform-refactor/datasets/llava-instruct-150k/
 ```
 
-## 5. Launch
+## 6. Launch
 
 ```bash
 export FT_PROJECT=$PWD

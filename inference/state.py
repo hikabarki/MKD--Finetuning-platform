@@ -29,8 +29,11 @@ _vllm_lock             = threading.RLock()   # guards _vllm_proc/client/model_id
 _user_model_path_lock  = threading.RLock()
 _user_training_lock    = threading.RLock()
 
-VLLM_PYTHON = "/home/mkd-s002/vLLM-h/keural-rag/venv/bin/python"
-VLLM_PORT   = 8001
+# vLLM may live in a separate venv. Set $VLLM_PYTHON to point at it; otherwise
+# default to the interpreter running the platform (works when vllm is installed
+# in the platform's own venv — the recommended setup on a fresh server).
+VLLM_PYTHON = os.environ.get("VLLM_PYTHON", sys.executable)
+VLLM_PORT   = int(os.environ.get("VLLM_PORT", "8001"))
 
 # ── Project root ──────────────────────────────────────────────────────────────
 # __file__ is inference/state.py, so .parent.parent = project root
