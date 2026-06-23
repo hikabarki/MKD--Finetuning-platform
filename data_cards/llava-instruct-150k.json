@@ -1,0 +1,24 @@
+{
+  "name": "llava-instruct-150k",
+  "rows_raw": 157712,
+  "rows_after_schema": 157712,
+  "lang_distribution": {
+    "en": 157712
+  },
+  "rows_after_quality": 157711,
+  "quality_report": {
+    "short_response": 1,
+    "repetitive": 0,
+    "garbled": 0
+  },
+  "rows_after_length": 157711,
+  "rows_after_pii": 157711,
+  "rows_after_dedup": 157706,
+  "rows_after_decontam": 157706,
+  "decontamination_note": "13-gram overlap check deferred to `ft eval` (see 06_eval_plan.md)",
+  "train_rows": 156129,
+  "val_rows": 1577,
+  "sha256_train": "983ec80efcfef44590a478e52f08e5da59c70cf0ec6528ab497e3a80aa334e43",
+  "sha256_val": "72bece32151d55a2e3bb2c47527944fa3b180917a0d6fcbe0066bf0ce7a73321",
+  "image_paths": "absolute, resolved to images/train2017/"
+}

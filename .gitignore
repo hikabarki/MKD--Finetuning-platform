@@ -4,6 +4,8 @@ datasets/*/normalized.jsonl
 datasets/*/train.jsonl
 datasets/*/val.jsonl
 datasets/*/sample_100.jsonl
+datasets/*/images/
+datasets/**/*.zip
 models/
 checkpoints/*/
 exports/

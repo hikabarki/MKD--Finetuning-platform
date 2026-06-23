@@ -197,7 +197,20 @@ def _load_jsonl_paths(dataset_arg: str) -> list[str]:
     if os.path.isfile(dataset_arg):
         return [dataset_arg]
     if os.path.isdir(dataset_arg):
-        paths = sorted(glob.glob(os.path.join(dataset_arg, "*.jsonl")))
+        # Canonical case: train.jsonl is the training set. val.jsonl is picked
+        # up separately for eval by _build_datasets, so it must NOT be globbed
+        # in here (otherwise it leaks into training). Intermediate artefacts
+        # (normalized.jsonl, sample_100.jsonl) are likewise excluded.
+        train_path = os.path.join(dataset_arg, "train.jsonl")
+        if os.path.isfile(train_path):
+            return [train_path]
+        # Fallback for legacy datasets without a train.jsonl: glob everything
+        # except known non-training files.
+        _excluded = {"val.jsonl", "normalized.jsonl", "sample_100.jsonl"}
+        paths = sorted(
+            p for p in glob.glob(os.path.join(dataset_arg, "*.jsonl"))
+            if os.path.basename(p) not in _excluded
+        )
         if not paths:
             raise ValueError(f"No .jsonl files found in directory: {dataset_arg}")
         return paths
@@ -251,6 +264,10 @@ def _compute_vqa_accuracy(model, processor, jsonl_path: str, n_samples: int = 50
                     text = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
                     inputs = processor(text=text, images=[image], return_tensors="pt").to(device)
                     inputs.pop("image_flags", None)
+                    # Flatten dynamic-tiling batch dim: [1, tiles, C, H, W] → [tiles, C, H, W]
+                    _pv = inputs.get("pixel_values")
+                    if _pv is not None and _pv.dim() == 5:
+                        inputs["pixel_values"] = _pv.reshape(-1, *_pv.shape[2:])
                 else:
                     msgs = [{"role": "user", "content": user_q}]
                     text = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
@@ -362,17 +379,31 @@ def vl_collate_fn(batch: list[dict], processor) -> dict:
         "labels":         labels,
     }
 
-    # C-1: Stack ALL pixel_values from image-bearing samples (not just [:1])
+    # C-1: Concatenate tiles from ALL image-bearing samples along dim 0.
+    # Each sample's pixel_values is [tiles, C, H, W] (variable tile count per
+    # image due to dynamic tiling), so they must be CONCATENATED — not stacked
+    # — into [total_tiles, C, H, W] (4D). torch.stack would add a batch dim
+    # (→ 5D, which the vision encoder rejects) and would fail outright on
+    # images with differing tile counts. The model demuxes tiles back to
+    # images via the <image> placeholder tokens in input_ids.
     has_img_idx = [i for i, b in enumerate(batch) if "pixel_values" in b]
     if has_img_idx:
-        pixel_vals = [batch[i]["pixel_values"] for i in has_img_idx]
-        out["pixel_values"] = torch.stack(pixel_vals)
-
-        # image_flags: per-row indicator (1 = has image, 0 = text-only)
-        image_flags = torch.zeros(len(batch), 1, dtype=torch.long)
+        pixel_vals = []
         for i in has_img_idx:
-            image_flags[i] = 1
-        out["image_flags"] = image_flags
+            pv = batch[i]["pixel_values"]
+            if pv.dim() == 5:        # [1, tiles, C, H, W] → [tiles, C, H, W]
+                pv = pv.reshape(-1, *pv.shape[2:])
+            elif pv.dim() == 3:      # [C, H, W] (single tile) → [1, C, H, W]
+                pv = pv.unsqueeze(0)
+            pixel_vals.append(pv)
+        out["pixel_values"] = torch.cat(pixel_vals, dim=0)
+
+        # image_flags must have ONE entry per image TILE (matching dim 0 of the
+        # vision embeddings the model produces from pixel_values), not one per
+        # sample. The model does `vit_embeds[image_flags == 1]`, so a per-sample
+        # mask of length B mismatches the [total_tiles, ...] embedding tensor.
+        total_tiles = out["pixel_values"].shape[0]
+        out["image_flags"] = torch.ones(total_tiles, 1, dtype=torch.long)
 
     return out
 
@@ -429,6 +460,10 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=1,
                         help="Per-device train batch size (default 1). "
                              "Batch 2 fits 32 GB with 4-bit QLoRA.")
+    parser.add_argument("--max-image-tiles", type=int, default=4,
+                        help="Cap dynamic image tiling (model default 12). "
+                             "Fewer tiles = shorter sequence = less memory. "
+                             "4 keeps a 12B VL model in bf16 under 32 GB.")
     parser.add_argument("--wandb-project", default="",
                         help="W&B project name (empty = disable W&B)")
     parser.add_argument("--wandb-entity", default="",
@@ -484,7 +519,7 @@ def main():
     # Deferred heavy imports
     import torch
     from transformers import AutoModelForCausalLM, AutoProcessor
-    from peft import LoraConfig, TaskType, get_peft_model
+    from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
     from functools import partial
 
     # H-1: Determine device placement based on GPU environment
@@ -513,6 +548,18 @@ def main():
     processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
     if processor.tokenizer.pad_token_id is None:
         processor.tokenizer.pad_token_id = processor.tokenizer.eos_token_id
+
+    # Cap dynamic image tiling. The model defaults to up to 12 tiles per image,
+    # which produces very long sequences (≈256 tokens/tile) and a cross-entropy
+    # logits spike that OOMs a 12B bf16 model on a 32 GB card. Capping the tile
+    # count shrinks the sequence enough to fit. Applies to both the training
+    # dataset and the VQA eval, since they share this processor instance.
+    if hasattr(processor, "image_processor") and hasattr(
+            processor.image_processor, "max_num_tiles"):
+        _was = processor.image_processor.max_num_tiles
+        processor.image_processor.max_num_tiles = args.max_image_tiles
+        print(f"Capped image tiles at {args.max_image_tiles} (was {_was}).",
+              flush=True)
 
     # Build load kwargs
     load_kwargs: dict = dict(
@@ -543,12 +590,32 @@ def main():
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16,
         )
-    else:
-        load_kwargs["dtype"] = torch.bfloat16
+    # Always load the non-quantized layers (embeddings, norms, vision tower) in
+    # bf16. Without this on the 4/8-bit paths they default to fp32, and merging
+    # the bf16 image features into the fp32 text embeddings fails with an
+    # "Index put dtype mismatch" error in the VL forward.
+    load_kwargs["dtype"] = torch.bfloat16
 
     # Load model
     print("Loading model...", flush=True)
     model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)
+
+    # QLoRA: a quantized base model must be prepped before LoRA is attached.
+    # prepare_model_for_kbit_training casts layernorms to fp32, enables input
+    # gradients, and wires up the dequantization path needed for the backward
+    # pass. Without it, 4/8-bit weights fail with a packed-weight matmul error
+    # during training (inference still works, which masks the bug).
+    if args.quant in ("4bit", "8bit"):
+        # The top-level VL wrapper (NemotronH_Nano_VL_V2) doesn't implement
+        # gradient_checkpointing_enable, so tell prepare_* to skip it
+        # (use_gradient_checkpointing=False) — GC is enabled on the inner
+        # language_model further below. We still must enable input grads so
+        # gradients propagate through the frozen quantized base when GC is on.
+        model = prepare_model_for_kbit_training(
+            model, use_gradient_checkpointing=False)
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+        print(f"Prepared {args.quant} model for k-bit training.", flush=True)
 
     # LoRA
     print("Applying LoRA...", flush=True)
@@ -610,10 +677,17 @@ def main():
         save_strategy="steps",
         save_steps=500,
         save_total_limit=2,
-        # H-2: Evaluation
+        # H-2: Evaluation. eval_steps must divide save_steps evenly when
+        # load_best_model_at_end is set (HF Trainer requirement), so keep them
+        # aligned at 500.
         eval_strategy="steps" if eval_dataset is not None else "no",
-        eval_steps=200,
+        eval_steps=500,
         load_best_model_at_end=(eval_dataset is not None),
+        # Only compute eval LOSS — do not gather/accumulate the full logits
+        # tensor across eval samples. With a large vocab and long VL sequences,
+        # logit accumulation OOMs (4+ GiB) even when training itself fits.
+        prediction_loss_only=True,
+        per_device_eval_batch_size=1,
         # M-1: Dataloader performance
         dataloader_num_workers=_n_workers,
         dataloader_pin_memory=(_n_workers > 0),
@@ -654,6 +728,16 @@ def main():
         _vqa_before, _vqa_n = _compute_vqa_accuracy(
             model, processor, _vqa_val_path, n_samples=50, device=device)
         print(f"Baseline VQA accuracy: {_vqa_before:.1%} on {_vqa_n} samples", flush=True)
+
+    # Free the generation KV-cache and fragmentation left by the baseline VQA
+    # generate() pass before training begins. Without this, that residual
+    # allocation tips a 12B bf16 model over the 32 GB limit on the first
+    # optimizer step (the cross-entropy logits spike needs the headroom).
+    import gc as _gc
+    import torch as _torch_cleanup
+    _gc.collect()
+    if _torch_cleanup.cuda.is_available():
+        _torch_cleanup.cuda.empty_cache()
 
     # Train
     print("Starting training...", flush=True)
