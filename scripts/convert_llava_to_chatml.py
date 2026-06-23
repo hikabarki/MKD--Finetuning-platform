@@ -15,7 +15,6 @@ import json
 import sys
 from pathlib import Path
 
-
 ROLE_MAP = {"human": "user", "gpt": "assistant"}
 
 

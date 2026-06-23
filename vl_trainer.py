@@ -22,17 +22,15 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-
 # ---------------------------------------------------------------------------
 # Cache pre-population helper
 # ---------------------------------------------------------------------------
 
+
 def _ensure_vl_cache(model_path: str):
     cache_base = os.path.expanduser("~/.cache/huggingface/modules/transformers_modules")
     model_name_san = (
-        os.path.basename(os.path.normpath(model_path))
-        .replace("-", "_hyphen_")
-        .replace("/", "_")
+        os.path.basename(os.path.normpath(model_path)).replace("-", "_hyphen_").replace("/", "_")
     )
     cache_model_dir = os.path.join(cache_base, model_name_san)
     if not os.path.isdir(cache_model_dir):
@@ -52,6 +50,7 @@ def _ensure_vl_cache(model_path: str):
 # Loss-mask helper (C-2)
 # ---------------------------------------------------------------------------
 
+
 def _build_labels(tokenizer, msgs: list[dict], input_ids) -> "torch.Tensor":
     """Return labels that supervise only assistant-turn tokens.
 
@@ -59,6 +58,7 @@ def _build_labels(tokenizer, msgs: list[dict], input_ids) -> "torch.Tensor":
     turn starts/ends in the token sequence.  Works for single- and multi-turn.
     """
     import torch
+
     labels = torch.full_like(input_ids, -100)
 
     if not msgs:
@@ -67,9 +67,7 @@ def _build_labels(tokenizer, msgs: list[dict], input_ids) -> "torch.Tensor":
     # Compute BOS offset: does the full encoding prepend a BOS token that the
     # no-special-tokens encoding omits?
     try:
-        full_text = tokenizer.apply_chat_template(
-            msgs, tokenize=False, add_generation_prompt=False
-        )
+        full_text = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)
         no_bos_ids = tokenizer.encode(full_text, add_special_tokens=False)
         bos_offset = max(0, min(len(input_ids) - len(no_bos_ids), 2))
     except Exception:
@@ -89,7 +87,7 @@ def _build_labels(tokenizer, msgs: list[dict], input_ids) -> "torch.Tensor":
 
         if msg["role"] == "assistant":
             start = prev_len + bos_offset
-            end   = min(curr_len + bos_offset, len(labels))
+            end = min(curr_len + bos_offset, len(labels))
             if start < end:
                 labels[start:end] = input_ids[start:end]
 
@@ -102,12 +100,13 @@ def _build_labels(tokenizer, msgs: list[dict], input_ids) -> "torch.Tensor":
 # Dataset
 # ---------------------------------------------------------------------------
 
+
 class VLDataset:
     """Reads a single JSONL file and returns tokenised examples with loss masks."""
 
     def __init__(self, jsonl_path: str, processor, max_len: int = 2048):
         self.processor = processor
-        self.max_len   = max_len
+        self.max_len = max_len
         self.items: list[dict] = []
         with open(jsonl_path) as f:
             for line in f:
@@ -120,6 +119,7 @@ class VLDataset:
 
     def _validate_images(self, jsonl_path: str):
         from PIL import Image as _PIL_Image
+
         total = errors = 0
         for item in self.items:
             img_path = item.get("image")
@@ -140,17 +140,17 @@ class VLDataset:
                 f"{jsonl_path} exceeds 5%% threshold. Fix image paths before training."
             )
         if total > 0:
-            print(f"Image validation: {total - errors}/{total} OK "
-                  f"({errors} failures)", flush=True)
+            print(
+                f"Image validation: {total - errors}/{total} OK " f"({errors} failures)", flush=True
+            )
 
     def __len__(self):
         return len(self.items)
 
     def __getitem__(self, idx: int) -> dict:
         from PIL import Image
-        import torch
 
-        item  = self.items[idx]
+        item = self.items[idx]
         convs = item.get("conversations", item.get("messages", []))
         img_path = item.get("image")
 
@@ -164,9 +164,7 @@ class VLDataset:
             msgs.append({"role": role, "content": content})
 
         # C-4: apply_chat_template must not silently swallow errors
-        text = self.processor.apply_chat_template(
-            msgs, tokenize=False, add_generation_prompt=False
-        )
+        text = self.processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)
 
         img = None
         if img_path and os.path.exists(img_path):
@@ -186,9 +184,7 @@ class VLDataset:
         out: dict = {k: v.squeeze(0) for k, v in inputs.items()}
 
         # C-2: Build per-sample loss mask — supervise only assistant turns
-        out["labels"] = _build_labels(
-            self.processor.tokenizer, msgs, out["input_ids"]
-        )
+        out["labels"] = _build_labels(self.processor.tokenizer, msgs, out["input_ids"])
 
         return out
 
@@ -208,7 +204,8 @@ def _load_jsonl_paths(dataset_arg: str) -> list[str]:
         # except known non-training files.
         _excluded = {"val.jsonl", "normalized.jsonl", "sample_100.jsonl"}
         paths = sorted(
-            p for p in glob.glob(os.path.join(dataset_arg, "*.jsonl"))
+            p
+            for p in glob.glob(os.path.join(dataset_arg, "*.jsonl"))
             if os.path.basename(p) not in _excluded
         )
         if not paths:
@@ -217,7 +214,9 @@ def _load_jsonl_paths(dataset_arg: str) -> list[str]:
     raise ValueError(f"--dataset must be a JSONL file or directory: {dataset_arg}")
 
 
-def _compute_vqa_accuracy(model, processor, jsonl_path: str, n_samples: int = 50, device: str = "cuda") -> tuple:
+def _compute_vqa_accuracy(
+    model, processor, jsonl_path: str, n_samples: int = 50, device: str = "cuda"
+) -> tuple:
     """Compute exact-match VQA accuracy on up to n_samples rows from a JSONL file.
     Returns (accuracy_float, total_evaluated).
     """
@@ -240,6 +239,7 @@ def _compute_vqa_accuracy(model, processor, jsonl_path: str, n_samples: int = 50
 
     model.eval()
     import torch as _torch
+
     with _torch.no_grad():
         for row in rows:
             messages = row.get("messages", [])
@@ -253,6 +253,7 @@ def _compute_vqa_accuracy(model, processor, jsonl_path: str, n_samples: int = 50
             if img_paths:
                 try:
                     from PIL import Image as _PILImage
+
                     image = _PILImage.open(img_paths[0]).convert("RGB")
                 except Exception:
                     pass
@@ -261,7 +262,9 @@ def _compute_vqa_accuracy(model, processor, jsonl_path: str, n_samples: int = 50
                 if image is not None:
                     user_text = f"<image>\n{user_q}"
                     msgs = [{"role": "user", "content": user_text}]
-                    text = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+                    text = processor.apply_chat_template(
+                        msgs, tokenize=False, add_generation_prompt=True
+                    )
                     inputs = processor(text=text, images=[image], return_tensors="pt").to(device)
                     inputs.pop("image_flags", None)
                     # Flatten dynamic-tiling batch dim: [1, tiles, C, H, W] → [tiles, C, H, W]
@@ -270,13 +273,21 @@ def _compute_vqa_accuracy(model, processor, jsonl_path: str, n_samples: int = 50
                         inputs["pixel_values"] = _pv.reshape(-1, *_pv.shape[2:])
                 else:
                     msgs = [{"role": "user", "content": user_q}]
-                    text = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+                    text = processor.apply_chat_template(
+                        msgs, tokenize=False, add_generation_prompt=True
+                    )
                     inputs = processor.tokenizer(text, return_tensors="pt").to(device)
 
                 n_in = inputs["input_ids"].shape[1]
-                out = model.generate(**inputs, max_new_tokens=32, do_sample=False,
-                                     pad_token_id=processor.tokenizer.eos_token_id)
-                generated = processor.tokenizer.decode(out[0, n_in:], skip_special_tokens=True).strip()
+                out = model.generate(
+                    **inputs,
+                    max_new_tokens=32,
+                    do_sample=False,
+                    pad_token_id=processor.tokenizer.eos_token_id,
+                )
+                generated = processor.tokenizer.decode(
+                    out[0, n_in:], skip_special_tokens=True
+                ).strip()
 
                 def _norm(s):
                     return _re.sub(r"[^\w\s]", "", s.lower()).strip()
@@ -304,19 +315,21 @@ def _build_datasets(jsonl_paths: list[str], processor, max_len: int):
     Returns (train_dataset, eval_dataset_or_None).
     Prefers a paired val.jsonl in the same directory; falls back to 1 % split.
     """
-    from torch.utils.data import ConcatDataset, Dataset, random_split
     import torch
+    from torch.utils.data import ConcatDataset, Dataset, random_split
 
     class _TorchVLDataset(Dataset):
         def __init__(self, p, proc, ml):
             self._inner = VLDataset(p, proc, ml)
+
         def __len__(self):
             return len(self._inner)
+
         def __getitem__(self, i):
             return self._inner[i]
 
     train_ds_list: list[Dataset] = []
-    eval_ds_list:  list[Dataset] = []
+    eval_ds_list: list[Dataset] = []
 
     for p in jsonl_paths:
         train_ds_list.append(_TorchVLDataset(p, processor, max_len))
@@ -324,21 +337,19 @@ def _build_datasets(jsonl_paths: list[str], processor, max_len: int):
         if val_path.exists():
             eval_ds_list.append(_TorchVLDataset(str(val_path), processor, max_len))
 
-    train_ds = (ConcatDataset(train_ds_list) if len(train_ds_list) > 1
-                else train_ds_list[0])
+    train_ds = ConcatDataset(train_ds_list) if len(train_ds_list) > 1 else train_ds_list[0]
 
     if eval_ds_list:
-        eval_ds = (ConcatDataset(eval_ds_list) if len(eval_ds_list) > 1
-                   else eval_ds_list[0])
+        eval_ds = ConcatDataset(eval_ds_list) if len(eval_ds_list) > 1 else eval_ds_list[0]
     elif len(train_ds) >= 100:
-        n_val   = max(1, int(len(train_ds) * 0.01))
+        n_val = max(1, int(len(train_ds) * 0.01))
         n_train = len(train_ds) - n_val
         train_ds, eval_ds = random_split(
-            train_ds, [n_train, n_val],
+            train_ds,
+            [n_train, n_val],
             generator=torch.Generator().manual_seed(42),
         )
-        print(f"No val.jsonl found — auto-split: {n_train} train / {n_val} val",
-              flush=True)
+        print(f"No val.jsonl found — auto-split: {n_train} train / {n_val} val", flush=True)
     else:
         eval_ds = None
         print("Dataset too small for 1% split — skipping eval.", flush=True)
@@ -349,6 +360,7 @@ def _build_datasets(jsonl_paths: list[str], processor, max_len: int):
 # ---------------------------------------------------------------------------
 # Collator
 # ---------------------------------------------------------------------------
+
 
 def vl_collate_fn(batch: list[dict], processor) -> dict:
     import torch
@@ -374,9 +386,9 @@ def vl_collate_fn(batch: list[dict], processor) -> dict:
         labels[attention_mask == 0] = -100
 
     out = {
-        "input_ids":      input_ids,
+        "input_ids": input_ids,
         "attention_mask": attention_mask,
-        "labels":         labels,
+        "labels": labels,
     }
 
     # C-1: Concatenate tiles from ALL image-bearing samples along dim 0.
@@ -391,9 +403,9 @@ def vl_collate_fn(batch: list[dict], processor) -> dict:
         pixel_vals = []
         for i in has_img_idx:
             pv = batch[i]["pixel_values"]
-            if pv.dim() == 5:        # [1, tiles, C, H, W] → [tiles, C, H, W]
+            if pv.dim() == 5:  # [1, tiles, C, H, W] → [tiles, C, H, W]
                 pv = pv.reshape(-1, *pv.shape[2:])
-            elif pv.dim() == 3:      # [C, H, W] (single tile) → [1, C, H, W]
+            elif pv.dim() == 3:  # [C, H, W] (single tile) → [1, C, H, W]
                 pv = pv.unsqueeze(0)
             pixel_vals.append(pv)
         out["pixel_values"] = torch.cat(pixel_vals, dim=0)
@@ -412,6 +424,7 @@ def vl_collate_fn(batch: list[dict], processor) -> dict:
 # Callback
 # ---------------------------------------------------------------------------
 
+
 class StreamCallback:
     """Streams step-level metrics to stdout for app.py to parse."""
 
@@ -428,7 +441,7 @@ class StreamCallback:
                 if logs and "loss" in logs:
                     step = state.global_step
                     loss = logs["loss"]
-                    lr   = logs.get("learning_rate", 0)
+                    lr = logs.get("learning_rate", 0)
                     print(
                         f"[step {step:4d}] loss={loss:.4f}  lr={lr:.2e}",
                         flush=True,
@@ -441,35 +454,39 @@ class StreamCallback:
 # Argument parser
 # ---------------------------------------------------------------------------
 
+
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="LoRA fine-tuning for Nemotron Nano 12B v2 VL"
+    parser = argparse.ArgumentParser(description="LoRA fine-tuning for Nemotron Nano 12B v2 VL")
+    parser.add_argument("--model", required=True, help="Local model path")
+    parser.add_argument("--dataset", required=True, help="JSONL file or directory of JSONL files")
+    parser.add_argument(
+        "--output", default=None, help="Output dir for LoRA adapter (default: checkpoints/vl_<ts>)"
     )
-    parser.add_argument("--model",    required=True, help="Local model path")
-    parser.add_argument("--dataset",  required=True,
-                        help="JSONL file or directory of JSONL files")
-    parser.add_argument("--output",   default=None,
-                        help="Output dir for LoRA adapter (default: checkpoints/vl_<ts>)")
-    parser.add_argument("--quant",    choices=["bf16", "8bit", "4bit"], default="bf16")
-    parser.add_argument("--lora-r",   type=int,   default=16)
+    parser.add_argument("--quant", choices=["bf16", "8bit", "4bit"], default="bf16")
+    parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
-    parser.add_argument("--epochs",   type=int,   default=3)
-    parser.add_argument("--lr",       type=float, default=2e-4)
-    parser.add_argument("--max-steps", type=int,  default=0,
-                        help="If >0, overrides --epochs")
-    parser.add_argument("--batch-size", type=int, default=1,
-                        help="Per-device train batch size (default 1). "
-                             "Batch 2 fits 32 GB with 4-bit QLoRA.")
-    parser.add_argument("--max-image-tiles", type=int, default=4,
-                        help="Cap dynamic image tiling (model default 12). "
-                             "Fewer tiles = shorter sequence = less memory. "
-                             "4 keeps a 12B VL model in bf16 under 32 GB.")
-    parser.add_argument("--wandb-project", default="",
-                        help="W&B project name (empty = disable W&B)")
-    parser.add_argument("--wandb-entity", default="",
-                        help="W&B entity / team name")
-    parser.add_argument("--smoke",    action="store_true",
-                        help="Quick validation: run only 5 steps")
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--max-steps", type=int, default=0, help="If >0, overrides --epochs")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Per-device train batch size (default 1). " "Batch 2 fits 32 GB with 4-bit QLoRA.",
+    )
+    parser.add_argument(
+        "--max-image-tiles",
+        type=int,
+        default=4,
+        help="Cap dynamic image tiling (model default 12). "
+        "Fewer tiles = shorter sequence = less memory. "
+        "4 keeps a 12B VL model in bf16 under 32 GB.",
+    )
+    parser.add_argument(
+        "--wandb-project", default="", help="W&B project name (empty = disable W&B)"
+    )
+    parser.add_argument("--wandb-entity", default="", help="W&B entity / team name")
+    parser.add_argument("--smoke", action="store_true", help="Quick validation: run only 5 steps")
     return parser.parse_args()
 
 
@@ -477,17 +494,17 @@ def parse_args():
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main():
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    os.environ["HF_HUB_OFFLINE"]          = "1"
-    os.environ["TOKENIZERS_PARALLELISM"]   = "false"
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
     args = parse_args()
 
     # LOW: Explicit path validation at the start of main()
     if not os.path.isdir(args.model):
-        print(f"ERROR: --model path does not exist or is not a directory: {args.model}",
-              flush=True)
+        print(f"ERROR: --model path does not exist or is not a directory: {args.model}", flush=True)
         sys.exit(1)
     # Dataset existence is validated by _load_jsonl_paths below
 
@@ -498,9 +515,9 @@ def main():
     os.makedirs(args.output, exist_ok=True)
 
     print(f"Output directory : {args.output}", flush=True)
-    print(f"Model            : {args.model}",  flush=True)
+    print(f"Model            : {args.model}", flush=True)
     print(f"Dataset          : {args.dataset}", flush=True)
-    print(f"Quantisation     : {args.quant}",  flush=True)
+    print(f"Quantisation     : {args.quant}", flush=True)
     print(f"LoRA r/alpha     : {args.lora_r}/{args.lora_alpha}", flush=True)
     if args.smoke:
         print("Smoke mode       : ON (5 steps)", flush=True)
@@ -510,22 +527,23 @@ def main():
         os.environ.setdefault("WANDB_PROJECT", args.wandb_project)
         if args.wandb_entity:
             os.environ.setdefault("WANDB_ENTITY", args.wandb_entity)
-        run_name  = f"nemotron-vl_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        run_name = f"nemotron-vl_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         report_to = "wandb"
     else:
-        run_name  = None
+        run_name = None
         report_to = "none"
 
     # Deferred heavy imports
-    import torch
-    from transformers import AutoModelForCausalLM, AutoProcessor
-    from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
     from functools import partial
 
+    import torch
+    from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+    from transformers import AutoModelForCausalLM, AutoProcessor
+
     # H-1: Determine device placement based on GPU environment
-    device     = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
-    n_gpus     = torch.cuda.device_count()
+    n_gpus = torch.cuda.device_count()
 
     if local_rank >= 0:
         # Running under torchrun / accelerate launch
@@ -539,7 +557,7 @@ def main():
     else:
         # Single GPU — dev default (RTX 5090)
         device_map = {"": "cuda:0"}
-        print("Single GPU: device_map={\"\":\"cuda:0\"}", flush=True)
+        print('Single GPU: device_map={"":"cuda:0"}', flush=True)
 
     _ensure_vl_cache(args.model)
 
@@ -555,11 +573,11 @@ def main():
     # count shrinks the sequence enough to fit. Applies to both the training
     # dataset and the VQA eval, since they share this processor instance.
     if hasattr(processor, "image_processor") and hasattr(
-            processor.image_processor, "max_num_tiles"):
+        processor.image_processor, "max_num_tiles"
+    ):
         _was = processor.image_processor.max_num_tiles
         processor.image_processor.max_num_tiles = args.max_image_tiles
-        print(f"Capped image tiles at {args.max_image_tiles} (was {_was}).",
-              flush=True)
+        print(f"Capped image tiles at {args.max_image_tiles} (was {_was}).", flush=True)
 
     # Build load kwargs
     load_kwargs: dict = dict(
@@ -570,6 +588,7 @@ def main():
     # M-2: Flash Attention with graceful fallback
     try:
         import flash_attn  # noqa: F401
+
         load_kwargs["attn_implementation"] = "flash_attention_2"
         print("Using FlashAttention-2.", flush=True)
     except ImportError:
@@ -582,9 +601,11 @@ def main():
 
     if args.quant == "8bit":
         from transformers import BitsAndBytesConfig
+
         load_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
     elif args.quant == "4bit":
         from transformers import BitsAndBytesConfig
+
         load_kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
@@ -611,8 +632,7 @@ def main():
         # (use_gradient_checkpointing=False) — GC is enabled on the inner
         # language_model further below. We still must enable input grads so
         # gradients propagate through the frozen quantized base when GC is on.
-        model = prepare_model_for_kbit_training(
-            model, use_gradient_checkpointing=False)
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
         print(f"Prepared {args.quant} model for k-bit training.", flush=True)
@@ -624,11 +644,16 @@ def main():
         lora_alpha=args.lora_alpha,
         target_modules=[
             # Attention projections (NemotronH / LLaMA-3 attention layers)
-            "q_proj", "k_proj", "v_proj", "o_proj",
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
             # Mamba SSM projections (hybrid NemotronH layers)
-            "in_proj", "out_proj",
+            "in_proj",
+            "out_proj",
             # MLP projections (SwiGLU feed-forward blocks)
-            "up_proj", "down_proj",
+            "up_proj",
+            "down_proj",
             # NOTE: Vision encoder layers (modeling.py mlp1 / mlp2) use unnamed
             # nn.Sequential — not directly targetable by module name. To fine-tune
             # the vision-language projection, add vision_projection training via
@@ -726,7 +751,8 @@ def main():
     if _vqa_val_path:
         print("Computing baseline VQA accuracy (before training)...", flush=True)
         _vqa_before, _vqa_n = _compute_vqa_accuracy(
-            model, processor, _vqa_val_path, n_samples=50, device=device)
+            model, processor, _vqa_val_path, n_samples=50, device=device
+        )
         print(f"Baseline VQA accuracy: {_vqa_before:.1%} on {_vqa_n} samples", flush=True)
 
     # Free the generation KV-cache and fragmentation left by the baseline VQA
@@ -734,7 +760,9 @@ def main():
     # allocation tips a 12B bf16 model over the 32 GB limit on the first
     # optimizer step (the cross-entropy logits spike needs the headroom).
     import gc as _gc
+
     import torch as _torch_cleanup
+
     _gc.collect()
     if _torch_cleanup.cuda.is_available():
         _torch_cleanup.cuda.empty_cache()
@@ -748,11 +776,14 @@ def main():
     if _vqa_val_path:
         print("Computing fine-tuned VQA accuracy (after training)...", flush=True)
         _vqa_after, _vqa_n = _compute_vqa_accuracy(
-            model, processor, _vqa_val_path, n_samples=50, device=device)
+            model, processor, _vqa_val_path, n_samples=50, device=device
+        )
         print(f"Fine-tuned VQA accuracy: {_vqa_after:.1%} on {_vqa_n} samples", flush=True)
-        _vqa_metrics = {"vqa_accuracy_before": round(_vqa_before, 4),
-                        "vqa_accuracy_after":  round(_vqa_after,  4),
-                        "vqa_n_samples": _vqa_n}
+        _vqa_metrics = {
+            "vqa_accuracy_before": round(_vqa_before, 4),
+            "vqa_accuracy_after": round(_vqa_after, 4),
+            "vqa_n_samples": _vqa_n,
+        }
         # Write metrics file so the eval dashboard can read it
         with open(Path(args.output) / "vqa_metrics.json", "w") as _mf:
             json.dump(_vqa_metrics, _mf)
@@ -776,6 +807,7 @@ def main():
 
     try:
         import gc
+
         gc.collect()
         torch.cuda.empty_cache()
         print("GPU memory cleared.", flush=True)

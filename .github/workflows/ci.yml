@@ -19,11 +19,11 @@ jobs:
       - name: Install dev deps
         run: pip install black ruff mypy types-requests
       - name: black --check
-        run: black --check .
+        run: black --check --line-length=100 .
       - name: ruff
         run: ruff check . --select=E,W,F,I
       - name: mypy
-        run: mypy api.py inference/ platform/ --ignore-missing-imports --no-error-summary
+        run: mypy api.py inference/ ft_platform/ --ignore-missing-imports --no-error-summary
 
   security:
     name: Security scan
@@ -36,7 +36,7 @@ jobs:
       - run: pip install bandit
       - name: bandit (high+medium only)
         run: |
-          bandit -r api.py inference/ platform/ ui/ vl_trainer.py \
+          bandit -r api.py inference/ ft_platform/ ui/ vl_trainer.py \
             -ll -ii -f txt
 
   test:
