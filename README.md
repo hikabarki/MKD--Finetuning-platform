@@ -142,7 +142,7 @@ curl -X POST http://localhost:8000/api/training/start \
 ## Project Structure
 
 ```
-ft-platform-refactor/
+MKD--Finetuning-platform/
 ├── app.py                      # Entry point — Gradio UI launcher
 ├── api.py                      # FastAPI REST API (port 8000)
 ├── vl_trainer.py               # Vision-language fine-tuning trainer
