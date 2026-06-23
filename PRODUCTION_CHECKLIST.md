@@ -77,7 +77,7 @@ ruff check api.py inference/ ft_platform/ ui/
 bandit -r api.py inference/ ft_platform/ ui/ -ll
 
 # Docker build (requires NVIDIA Container Toolkit)
-docker build -t ft-platform:v1.0.0 .
+docker build -t mkd-finetuning-platform:v1.0.0 .
 ```
 
 ## Known Omissions (intentional, documented)

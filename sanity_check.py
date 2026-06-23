@@ -11,8 +11,13 @@ PASS = "\033[32m✓\033[0m"
 FAIL = "\033[31m✗\033[0m"
 WARN = "\033[33m⚠\033[0m"
 
-MODEL_DIR = "/home/mkd-s002/fine-tune/ft-platform/models/nvidia__nvidia-nemotron-nano-12b-v2-vl-bf16"
-APP_PY    = "/home/mkd-s002/fine-tune/ft-platform/app.py"
+# Paths are derived from this script's location so the check is portable across
+# machines (it lives at the project root). Override the root with $FT_PROJECT.
+_HERE     = os.path.dirname(os.path.abspath(__file__))
+_ROOT     = os.environ.get("FT_PROJECT", _HERE)
+_HOME     = os.path.expanduser("~")
+MODEL_DIR = os.path.join(_ROOT, "models", "nvidia__nvidia-nemotron-nano-12b-v2-vl-bf16")
+APP_PY    = os.path.join(_ROOT, "app.py")
 
 errors = []
 warnings = []
@@ -27,10 +32,9 @@ print("\n══ 1. File-level fix presence ══")
 
 import glob
 
-all_mnh = [f for f in glob.glob("/home/mkd-s002/**modeling_nemotron_h.py",recursive=False)]
-all_mnh += glob.glob("/home/mkd-s002/.cache/huggingface/modules/transformers_modules/***/modeling_nemotron_h.py")
-all_mnh += glob.glob("/home/mkd-s002/.cache/huggingface/hub/***/modeling_nemotron_h.py")
-all_mnh += glob.glob("/home/mkd-s002/fine-tune/ft-platform/models/*/modeling_nemotron_h.py")
+all_mnh  = glob.glob(f"{_HOME}/.cache/huggingface/modules/transformers_modules/***/modeling_nemotron_h.py")
+all_mnh += glob.glob(f"{_HOME}/.cache/huggingface/hub/***/modeling_nemotron_h.py")
+all_mnh += glob.glob(os.path.join(_ROOT, "models", "*", "modeling_nemotron_h.py"))
 
 # Filter out venv/uv cache/other envs
 SKIP = ["venv","\.cache/uv","RAG-Context","LLM-Comparison","vision-encoder","open-webui"]

@@ -67,7 +67,7 @@ Both are optional in development (`""` disables the check).
 
 ```bash
 # Build
-docker build -t ft-platform:v1.0.0 .
+docker build -t mkd-finetuning-platform:v1.0.0 .
 
 # Run (single container)
 docker run --gpus all -p 7860:7860 -p 8000:8000 \
@@ -76,7 +76,7 @@ docker run --gpus all -p 7860:7860 -p 8000:8000 \
   -e HF_TOKEN=<hf_token> \
   -e ALLOWED_HOSTS="localhost,*.mkd.kr" \
   -v /data/ft-projects:/workspace/ft-projects \
-  ft-platform:v1.0.0
+  mkd-finetuning-platform:v1.0.0
 
 # Full stack (api + ui + redis)
 docker compose up
