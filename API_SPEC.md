@@ -104,7 +104,7 @@ Removes the dataset directory and data card.
 
 ### `POST /api/models/add`
 ```json
-{ "hf_model_id": "nvidia/Nemotron-Nano-VL-8B-v1", "local_name": "nemotron-vl-8b" }
+{ "hf_model_id": "google/gemma-4-12b", "local_name": "gemma-4-12b" }
 ```
 
 ### `GET /api/models`
@@ -112,7 +112,7 @@ Removes the dataset directory and data card.
 {
   "ok": true,
   "data": [
-    {"name":"nvidia__nvidia-nemotron-nano-12b-v2-vl-bf16","is_vl":true,"vram_bf16_gb":24.1}
+    {"name":"gemma-4-12b","is_vl":true,"vram_bf16_gb":24.1}
   ]
 }
 ```
@@ -127,7 +127,7 @@ Removes the dataset directory and data card.
 Returns `202 Accepted`.
 ```json
 {
-  "model":         "nvidia__nvidia-nemotron-nano-12b-v2-vl-bf16",
+  "model":         "gemma-4-12b",
   "dataset":       "ko-vqa",
   "mode":          "vl",
   "quant":         "bf16",
@@ -196,7 +196,7 @@ Returns `202 Accepted`.
 ### `GET /api/eval/runs`
 Returns all runs visible in the Evaluation Dashboard. Every completed training run (Quick Start, Custom Mix, Expert) is **automatically registered** — no manual eval step needed.
 ```json
-{"ok":true,"data":{"runs":["run_2026-06-18_0900","vl_nvidia__nvidia-nemotron-nano-12b-v2-vl-bf16_20260618_090512"]}}
+{"ok":true,"data":{"runs":["run_2026-06-18_0900","vl_gemma-4-12b_20260618_090512"]}}
 ```
 
 ### `GET /api/eval/results/{run_id}`
@@ -247,9 +247,9 @@ Returns `202 Accepted`.
 ```json
 {
   "export_dir":  "exports/run_2026-06-16_0543/merged",
-  "hf_repo":     "mkd-hika/nemotron-ko-vqa",
+  "hf_repo":     "mkd-hika/gemma-ko-vqa",
   "license":     "apache-2.0",
-  "description": "Korean VQA fine-tune of Nemotron Nano VL"
+  "description": "Korean VQA fine-tune of Gemma 4 12B"
 }
 ```
 

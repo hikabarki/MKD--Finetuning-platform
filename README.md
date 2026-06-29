@@ -106,7 +106,7 @@ python app.py
 | `HF_TOKEN` | For publish | — | Hugging Face write token for model publishing |
 | `ALLOWED_HOSTS` | Prod | `localhost,127.0.0.1,*.mkd.kr` | Comma-separated allowed `Host` headers |
 | `FT_PROJECT` | No | CWD | Root directory for datasets, models, checkpoints, logs |
-| `NEMOTRON_REVISION_SHA` | No | `None` (main) | Pinned HF Hub commit SHA for supply-chain protection |
+| `MODEL_REVISION_SHA` | No | `None` (main) | Pinned HF Hub commit SHA for supply-chain protection |
 | `REDIS_URL` | No | — | Redis URL for job queuing in multi-worker deployments |
 | `CUDA_VISIBLE_DEVICES` | No | all | GPU device selection |
 
@@ -126,7 +126,7 @@ uvicorn api:app          # REST API   → http://localhost:8000
 curl -X POST http://localhost:8000/api/models/add \
   -H "Authorization: Bearer $API_SECRET" \
   -H "Content-Type: application/json" \
-  -d '{"hf_model_id": "nvidia/Nemotron-Nano-12B-VL"}'
+  -d '{"hf_model_id": "google/gemma-4-12b"}'
 
 # 4. Add a dataset
 curl -X POST http://localhost:8000/api/datasets/add \
@@ -134,7 +134,7 @@ curl -X POST http://localhost:8000/api/datasets/add \
 
 # 5. Start training
 curl -X POST http://localhost:8000/api/training/start \
-  -d '{"model": "Nemotron-Nano-12B-VL", "dataset": "my-dataset"}'
+  -d '{"model": "Gemma 4 12B", "dataset": "my-dataset"}'
 ```
 
 ---
@@ -234,8 +234,8 @@ make security
 
 ## Supported Models
 
-- **NVIDIA Nemotron-Nano-12B-VL BF16** — vision-language (default)
-- **NVIDIA Nemotron-3-Nano-4B BF16** — text-only (fallback)
+- **Gemma 4 12B BF16** — vision-language (default)
+- **Gemma 4-3-Nano-4B BF16** — text-only (fallback)
 - Any HuggingFace-compatible causal LM
 
 ---

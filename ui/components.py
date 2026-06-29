@@ -85,7 +85,10 @@ def list_models() -> list[str]:
 
 def list_configs() -> list[str]:
     d = ROOT / "configs"
-    return sorted([p.name for p in d.glob("run_*.yaml")], reverse=True) if d.exists() else []
+    if not d.exists():
+        return []
+    files = list(d.glob("run_*.yaml")) + list(d.glob("vl_*.json"))
+    return sorted([p.name for p in files], reverse=True)
 
 
 def list_checkpoints() -> list[str]:
@@ -107,30 +110,43 @@ def get_gpu_html() -> str:
              "--format=csv,noheader,nounits"],
             text=True, timeout=4,
         ).strip().splitlines()
+        def _int(val: str, default: int = 0) -> int:
+            try:
+                return int(val)
+            except (ValueError, TypeError):
+                return default
+
         cards = []
         for row in rows:
             idx, name, util, mu, mt, temp, pwr = [p.strip() for p in row.split(",")]
-            util_i  = int(util)
+            util_i  = _int(util)
+            mu_i    = _int(mu)
+            mt_i    = _int(mt)
             bar_col = "#3fb950" if util_i < 70 else ("#d29922" if util_i < 90 else "#f85149")
+            vram_pct = int(mu_i / mt_i * 100) if mt_i else 0
+            util_str = f"{util_i}%" if util not in ("[Not Found]", "N/A", "") else "N/A"
+            vram_str = f"{mu_i:,}/{mt_i:,} MiB" if mt_i else "N/A"
+            temp_str = f"{temp}°C" if temp not in ("[Not Found]", "N/A", "") else "N/A"
+            pwr_str  = f"{pwr}W"   if pwr  not in ("[Not Found]", "N/A", "") else "N/A"
             cards.append(f"""
 <div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px 18px;">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
     <span style="color:#e6edf3;font-weight:600;font-size:14px;">GPU {idx} · {name}</span>
-    <span style="color:#8b949e;font-size:12px;">{temp}°C · {pwr}W</span>
+    <span style="color:#8b949e;font-size:12px;">{temp_str} · {pwr_str}</span>
   </div>
   <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
     <span style="color:#8b949e;font-size:12px;width:36px;">Util</span>
     <div style="flex:1;background:#21262d;border-radius:4px;height:8px;">
       <div style="width:{util_i}%;background:{bar_col};border-radius:4px;height:8px;transition:width 0.3s;"></div>
     </div>
-    <span style="color:{bar_col};font-size:12px;font-weight:600;width:36px;">{util}%</span>
+    <span style="color:{bar_col};font-size:12px;font-weight:600;width:36px;">{util_str}</span>
   </div>
   <div style="display:flex;align-items:center;gap:10px;">
     <span style="color:#8b949e;font-size:12px;width:36px;">VRAM</span>
     <div style="flex:1;background:#21262d;border-radius:4px;height:8px;">
-      <div style="width:{int(int(mu)/int(mt)*100)}%;background:#58a6ff;border-radius:4px;height:8px;"></div>
+      <div style="width:{vram_pct}%;background:#58a6ff;border-radius:4px;height:8px;"></div>
     </div>
-    <span style="color:#58a6ff;font-size:12px;font-weight:600;width:80px;">{int(mu):,}/{int(mt):,} MiB</span>
+    <span style="color:#58a6ff;font-size:12px;font-weight:600;width:80px;">{vram_str}</span>
   </div>
 </div>""")
         return "\n".join(cards)
@@ -311,7 +327,8 @@ def next_step_card(command: str) -> str:
 def run_ft(args: list[str]):
     cmd  = [PYTHON, str(SCRIPTS / "ft")] + args
     env  = {**os.environ, "FT_PROJECT": str(ROOT),
-            "PYTHONUNBUFFERED": "1", "WANDB_DISABLED": "true", "FT_UI": "1"}
+            "PYTHONUNBUFFERED": "1", "WANDB_DISABLED": "true", "FT_UI": "1",
+            "PYTHONNOUSERSITE": "1", "PYTHONPATH": ""}
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, bufsize=1, env=env, cwd=str(ROOT))
     output = ""

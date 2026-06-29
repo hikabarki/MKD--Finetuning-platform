@@ -44,13 +44,13 @@ pip install flash-attn --no-build-isolation
 ```bash
 # Option A — download from HuggingFace via the platform's helper
 export HF_TOKEN=<your-hf-token>     # if the model is gated
-python scripts/ft_add_model.py nvidia/Nemotron-Nano-12B-v2-VL-BF16
+python scripts/ft_add_model.py nvidia/Gemma 4-Nano-12B-v2-VL-BF16
 #   (confirm the exact repo id on huggingface.co — the local folder name
-#    nvidia__nvidia-nemotron-nano-12b-v2-vl-bf16 is the sanitized form)
+#    gemma-4-12b is the sanitized form)
 
 # Option B — rsync the already-downloaded model from the source machine
-rsync -avhP models/nvidia__nvidia-nemotron-nano-12b-v2-vl-bf16/ \
-  user@h200:/path/to/ft-platform-refactor/models/nvidia__nvidia-nemotron-nano-12b-v2-vl-bf16/
+rsync -avhP models/gemma-4-12b/ \
+  user@h200:/path/to/ft-platform-refactor/models/gemma-4-12b/
 ```
 
 ## 5. Get the dataset

@@ -171,18 +171,20 @@ def build_metrics_df(data: dict) -> pd.DataFrame:
         return pd.DataFrame(columns=cols)
     bl = data["train_loss"][0];  al = data["train_loss"][-1]
     bp = data["train_ppl"][0];   ap = data["train_ppl"][-1]
+    def _pct(before, after):
+        if before == 0:
+            return "N/A"
+        return f"{(after - before) / before * 100:+.1f}%"
     rows = [
-        ("Train Loss",       f"{bl:.4f}", f"{al:.4f}", f"{(al-bl)/bl*100:+.1f}%"),
-        ("Train Perplexity", f"{bp:.3f}", f"{ap:.3f}", f"{(ap-bp)/bp*100:+.1f}%"),
+        ("Train Loss",       f"{bl:.4f}", f"{al:.4f}", _pct(bl, al)),
+        ("Train Perplexity", f"{bp:.3f}", f"{ap:.3f}", _pct(bp, ap)),
     ]
     if data.get("eval_loss") and len(data["eval_loss"]) >= 2:
         el_b = data["eval_loss"][0]; el_a = data["eval_loss"][-1]
-        rows.append(("Eval Loss", f"{el_b:.4f}", f"{el_a:.4f}",
-                     f"{(el_a-el_b)/el_b*100:+.1f}%"))
+        rows.append(("Eval Loss", f"{el_b:.4f}", f"{el_a:.4f}", _pct(el_b, el_a)))
     if data.get("eval_ppl") and len(data["eval_ppl"]) >= 2:
         ep_b = data["eval_ppl"][0]; ep_a = data["eval_ppl"][-1]
-        rows.append(("Eval Perplexity", f"{ep_b:.3f}", f"{ep_a:.3f}",
-                     f"{(ep_a-ep_b)/ep_b*100:+.1f}%"))
+        rows.append(("Eval Perplexity", f"{ep_b:.3f}", f"{ep_a:.3f}", _pct(ep_b, ep_a)))
     if "vqa_accuracy_before" in data and "vqa_accuracy_after" in data:
         vb  = data["vqa_accuracy_before"]; va = data["vqa_accuracy_after"]
         n   = data.get("vqa_n_samples", "?")

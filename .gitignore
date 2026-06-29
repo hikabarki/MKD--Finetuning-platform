@@ -47,3 +47,19 @@ eval_results/.lm_eval_*
 
 # Gradio cache
 .gradio/
+
+# Auto-generated VL configs (regenerated each training run)
+configs/vl_*.json
+
+# Per-run VL eval results
+eval_results/vl_*
+
+# Documents (kept in docs/ locally, not in repo)
+docs/*.docx
+docs/*.pptx
+
+# Virtual environment
+venv/
+
+# Build artifacts
+shim/*.so

@@ -141,9 +141,16 @@ class _Job:
                     line = raw.rstrip()
                     lf.write(line + "\n")
                     lf.flush()
+                    # Parse total steps emitted at train start:
+                    # "TOTAL_STEPS=1200"
+                    if line.startswith("TOTAL_STEPS="):
+                        try:
+                            self.total_steps = int(line.split("=", 1)[1])
+                        except Exception:
+                            pass
                     # Parse step/loss from StreamCallback format:
-                    # "[step  420] loss=0.8231  lr=1.85e-04"
-                    if line.startswith("[step"):
+                    # "[step  420] loss=0.8231  lr=1.85e-04  epoch=0.35"
+                    elif line.startswith("[step"):
                         parts = line.split()
                         try:
                             self.step = int(parts[1].rstrip("]"))
@@ -152,6 +159,13 @@ class _Job:
                             self.phase = "training"
                         except Exception:
                             pass
+                        # Parse epoch if present
+                        for p in parts:
+                            if p.startswith("epoch="):
+                                try:
+                                    self.epoch = float(p.split("=")[1])
+                                except Exception:
+                                    pass
                     if "EXPORT_PATH=" in line:
                         self.phase = "done"
             self.proc.wait()
@@ -168,6 +182,44 @@ class _Job:
 
 _active_job: _Job | None = None
 _active_job_lock = threading.Lock()
+
+# Lightweight tracker for background eval/export jobs
+class _BgJob:
+    def __init__(self, run_id: str, kind: str, proc: subprocess.Popen, log_path: Path):
+        self.run_id   = run_id
+        self.kind     = kind  # "eval" or "export"
+        self.proc     = proc
+        self.log_path = log_path
+        self.start_ts = time.time()
+        self._thread: threading.Thread | None = None
+
+    def start_tail(self):
+        def _tail():
+            with self.log_path.open("w") as lf:
+                for raw in self.proc.stdout:  # type: ignore[union-attr]
+                    lf.write(raw); lf.flush()
+            self.proc.wait()
+        self._thread = threading.Thread(target=_tail, daemon=True)
+        self._thread.start()
+
+    def is_running(self) -> bool:
+        return self.proc.poll() is None
+
+    def elapsed(self) -> float:
+        return time.time() - self.start_ts
+
+    def status_dict(self) -> dict:
+        return {
+            "run_id":          self.run_id,
+            "kind":            self.kind,
+            "running":         self.is_running(),
+            "exit_code":       self.proc.returncode,
+            "elapsed_seconds": round(self.elapsed()),
+            "log":             str(self.log_path),
+        }
+
+_bg_jobs: dict[str, _BgJob] = {}
+_bg_jobs_lock = threading.Lock()
 
 # ── Helper utilities ──────────────────────────────────────────────────────────
 
@@ -214,7 +266,8 @@ def _list_models() -> list[dict]:
             try:
                 cfg = json.loads(cfg_path.read_text())
                 is_vl = "vision_config" in cfg or any(
-                    "VL" in str(v) for v in cfg.get("auto_map", {}).values()
+                    "vl" in str(v).lower() or "vision" in str(v).lower()
+                    for v in cfg.get("auto_map", {}).values()
                 )
                 params = cfg.get("num_parameters") or cfg.get("hidden_size", 4096)
                 if isinstance(params, int) and params > 10_000:
@@ -238,16 +291,24 @@ def _get_gpu_info() -> list[dict]:
              "--format=csv,noheader,nounits"],
             text=True, timeout=4,
         ).strip().splitlines()
+        def _si(v: str, default: int = 0) -> int:
+            try:
+                return int(v)
+            except (ValueError, TypeError):
+                return default
+
         gpus = []
         for row in out:
             idx, name, used, total, util = [x.strip() for x in row.split(",")]
+            used_i  = _si(used)
+            total_i = _si(total)
             gpus.append({
-                "index":         int(idx),
-                "name":          name,
-                "vram_used_gb":  round(int(used) / 1024, 2),
-                "vram_total_gb": round(int(total) / 1024, 2),
-                "vram_free_gb":  round((int(total) - int(used)) / 1024, 2),
-                "utilization_pct": int(util),
+                "index":           _si(idx),
+                "name":            name,
+                "vram_used_gb":    round(used_i / 1024, 2),
+                "vram_total_gb":   round(total_i / 1024, 2),
+                "vram_free_gb":    round((total_i - used_i) / 1024, 2),
+                "utilization_pct": _si(util),
             })
         return gpus
     except Exception:
@@ -259,16 +320,6 @@ def _disk_free_gb(path: Path = ROOT) -> float:
     st = _sh.disk_usage(str(path))
     return round(st.free / 1e9, 1)
 
-
-def _run_ft(args_list: list[str]) -> tuple[int, str]:
-    """Run a `ft` CLI command synchronously. Returns (returncode, stdout+stderr)."""
-    cmd = [PYTHON, str(SCRIPTS / f"ft_{args_list[0].replace('-', '_')}.py")]
-    cmd += args_list[1:]
-    result = subprocess.run(
-        cmd, capture_output=True, text=True,
-        cwd=str(ROOT), timeout=3600,
-    )
-    return result.returncode, (result.stdout + result.stderr)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -319,6 +370,7 @@ class DatasetAddRequest(BaseModel):
 def dataset_add(req: DatasetAddRequest):
     cmd = [PYTHON, str(SCRIPTS / "ft_add_dataset.py"), req.source]
     if req.name:
+        _safe_name(req.name)
         cmd += ["--name", req.name]
     if req.instruction_col:
         cmd += ["--instruction-col", req.instruction_col]
@@ -455,8 +507,9 @@ def training_start(req: TrainingStartRequest):
     ds_path    = str(ROOT / "datasets" / req.dataset)
 
     if req.mode == "vl":
-        cmd = [
-            PYTHON, str(ROOT / "vl_trainer.py"),
+        trainer_script = str(ROOT / "vl_trainer.py")
+        cmd = [PYTHON, trainer_script]
+        cmd += [
             "--model",       model_path,
             "--dataset",     ds_path,
             "--output",      str(ROOT / "checkpoints" / run_id),
@@ -476,11 +529,38 @@ def training_start(req: TrainingStartRequest):
         if req.smoke:
             cmd.append("--smoke")
     else:
-        # Text path via Axolotl — ft configure + ft train
-        return err_resp("Text mode training via API not yet supported; use Gradio UI.")
+        # Text path via Axolotl — first generate config, then train
+        _safe_name(req.model)
+        cfg_cmd = [PYTHON, str(SCRIPTS / "ft_configure.py"),
+                   f"--model={req.model}", f"--dataset={req.dataset}",
+                   f"--quantize={'4bit' if req.quant == '4bit' else 'none'}",
+                   f"--epochs={req.epochs}", f"--lr={req.learning_rate}"]
+        if req.wandb_project:
+            cfg_cmd += [f"--wandb-project={req.wandb_project}"]
+        if req.wandb_entity:
+            cfg_cmd += [f"--wandb-entity={req.wandb_entity}"]
+        cfg_result = subprocess.run(cfg_cmd, capture_output=True, text=True,
+                                    cwd=str(ROOT), timeout=60)
+        if cfg_result.returncode != 0:
+            return err_resp("ft configure failed", cfg_result.stderr[-500:])
+
+        # Find the latest config file
+        cfg_dir = ROOT / "configs"
+        configs = sorted(cfg_dir.glob("*.yaml"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not configs:
+            configs = sorted(cfg_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not configs:
+            return err_resp("No config file generated by ft configure")
+        latest_cfg = str(configs[0])
+
+        cmd = [PYTHON, str(SCRIPTS / "ft_train.py"), latest_cfg]
+        if req.max_steps:
+            cmd += ["--max-steps", str(req.max_steps)]
 
     env = {**os.environ,
+           "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES", "0"),
            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+           "HF_ENABLE_PARALLEL_LOADING": "0",
            "HF_HUB_OFFLINE": "1",
            "TOKENIZERS_PARALLELISM": "false",
            "PYTHONUNBUFFERED": "1"}
@@ -505,9 +585,9 @@ def training_start(req: TrainingStartRequest):
 def training_stop():
     with _active_job_lock:
         job = _active_job
-    if job is None or not job.is_running():
-        return err_resp("No training job is running")
-    job.proc.terminate()
+        if job is None or not job.is_running():
+            return err_resp("No training job is running")
+        job.proc.terminate()
     return ok_resp({"stopped": job.run_id})
 
 
@@ -528,7 +608,8 @@ def training_status():
         "learning_rate":    job.lr,
         "epoch":            job.epoch,
         "elapsed_seconds":  round(job.elapsed()),
-        "eta_seconds":      None,  # computed once total_steps is known
+        "eta_seconds":      (round((job.elapsed() / job.step) * (job.total_steps - job.step))
+                             if job.step > 0 and job.total_steps > 0 else None),
         "gpu_vram_used_gb": vram_used,
         "phase":            job.phase,
     })
@@ -594,15 +675,21 @@ def eval_start(req: EvalStartRequest):
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, cwd=str(ROOT),
     )
-
-    def _tail():
-        with log_path.open("w") as lf:
-            for raw in proc.stdout:  # type: ignore[union-attr]
-                lf.write(raw); lf.flush()
-        proc.wait()
-
-    threading.Thread(target=_tail, daemon=True).start()
+    job = _BgJob(run_id=run_id, kind="eval", proc=proc, log_path=log_path)
+    job.start_tail()
+    with _bg_jobs_lock:
+        _bg_jobs[run_id] = job
     return ok_resp({"run_id": run_id, "status": "started"})
+
+
+@app.get("/api/eval/status/{run_id}", dependencies=[Depends(require_auth)])
+def eval_status(run_id: str):
+    _safe_name(run_id)
+    with _bg_jobs_lock:
+        job = _bg_jobs.get(run_id)
+    if job is None:
+        raise HTTPException(404, f"No eval job with run_id '{run_id}'")
+    return ok_resp(job.status_dict())
 
 
 @app.get("/api/eval/results/{run_id}", dependencies=[Depends(require_auth)])
@@ -646,15 +733,21 @@ def export_start(req: ExportRequest):
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, cwd=str(ROOT),
     )
-
-    def _tail():
-        with log_path.open("w") as lf:
-            for raw in proc.stdout:  # type: ignore[union-attr]
-                lf.write(raw); lf.flush()
-        proc.wait()
-
-    threading.Thread(target=_tail, daemon=True).start()
+    job = _BgJob(run_id=run_id, kind="export", proc=proc, log_path=log_path)
+    job.start_tail()
+    with _bg_jobs_lock:
+        _bg_jobs[run_id] = job
     return ok_resp({"run_id": run_id, "status": "started", "log": str(log_path)})
+
+
+@app.get("/api/export/status/{run_id}", dependencies=[Depends(require_auth)])
+def export_job_status(run_id: str):
+    _safe_name(run_id)
+    with _bg_jobs_lock:
+        job = _bg_jobs.get(run_id)
+    if job is None:
+        raise HTTPException(404, f"No export job with run_id '{run_id}'")
+    return ok_resp(job.status_dict())
 
 
 @app.get("/api/export/status", dependencies=[Depends(require_auth)])
@@ -808,6 +901,7 @@ async def chat(req: ChatRequest):
                     **inputs,
                     max_new_tokens=req.max_tokens,
                     do_sample=False,
+                    repetition_penalty=1.1,
                     streamer=streamer,
                 )
 

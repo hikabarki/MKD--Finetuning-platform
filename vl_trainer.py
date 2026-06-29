@@ -1,5 +1,5 @@
 """
-vl_trainer.py — LoRA fine-tuning for NVIDIA Nemotron Nano 12B v2 VL.
+vl_trainer.py — LoRA fine-tuning for multimodal vision-language models (Gemma 4 12B).
 
 Called by app.py as a subprocess:
     python vl_trainer.py --model /path/to/model --dataset /path/to/data.jsonl [options]
@@ -51,11 +51,13 @@ def _ensure_vl_cache(model_path: str):
 # ---------------------------------------------------------------------------
 
 
-def _build_labels(tokenizer, msgs: list[dict], input_ids) -> "torch.Tensor":
+def _build_labels(tokenizer, msgs: list[dict], input_ids, prompt_fn=None) -> "torch.Tensor":
     """Return labels that supervise only assistant-turn tokens.
 
-    Strategy: apply_chat_template progressively to find where each assistant
-    turn starts/ends in the token sequence.  Works for single- and multi-turn.
+    Strategy: use prompt_fn (or apply_chat_template) progressively to find
+    where each assistant turn starts/ends in the token sequence.
+
+    prompt_fn: callable(msgs) -> str.  Falls back to tokenizer.apply_chat_template.
     """
     import torch
 
@@ -64,10 +66,17 @@ def _build_labels(tokenizer, msgs: list[dict], input_ids) -> "torch.Tensor":
     if not msgs:
         return labels
 
+    def _render(msgs_subset):
+        """Render messages to text using prompt_fn or apply_chat_template."""
+        if prompt_fn is not None:
+            return prompt_fn(msgs_subset)
+        return tokenizer.apply_chat_template(
+            msgs_subset, tokenize=False, add_generation_prompt=False)
+
     # Compute BOS offset: does the full encoding prepend a BOS token that the
     # no-special-tokens encoding omits?
     try:
-        full_text = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)
+        full_text = _render(msgs)
         no_bos_ids = tokenizer.encode(full_text, add_special_tokens=False)
         bos_offset = max(0, min(len(input_ids) - len(no_bos_ids), 2))
     except Exception:
@@ -77,9 +86,7 @@ def _build_labels(tokenizer, msgs: list[dict], input_ids) -> "torch.Tensor":
 
     for i, msg in enumerate(msgs):
         try:
-            text_i = tokenizer.apply_chat_template(
-                msgs[: i + 1], tokenize=False, add_generation_prompt=False
-            )
+            text_i = _render(msgs[: i + 1])
             ids_i = tokenizer.encode(text_i, add_special_tokens=False)
             curr_len = len(ids_i)
         except Exception:
@@ -108,11 +115,17 @@ class VLDataset:
         self.processor = processor
         self.max_len = max_len
         self.items: list[dict] = []
+        _skipped = 0
         with open(jsonl_path) as f:
             for line in f:
                 line = line.strip()
                 if line:
-                    self.items.append(json.loads(line))
+                    try:
+                        self.items.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        _skipped += 1
+        if _skipped:
+            print(f"WARNING: skipped {_skipped} malformed JSONL lines in {jsonl_path}", flush=True)
 
         # C-3: Pre-flight image validation — raise if failure rate > 5%
         self._validate_images(jsonl_path)
@@ -163,8 +176,33 @@ class VLDataset:
             content = c.get("content") or c.get("value", "")
             msgs.append({"role": role, "content": content})
 
-        # C-4: apply_chat_template must not silently swallow errors
-        text = self.processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)
+        # Build prompt with Gemma 4 fallback (no chat_template on processor).
+        _inner_tok = getattr(self.processor, "tokenizer", self.processor)
+        _sot = getattr(_inner_tok, "sot_token", None)
+        _eot = getattr(_inner_tok, "eot_token", None)
+        _bos = getattr(_inner_tok, "bos_token", None) or "<bos>"
+        _img_tok = getattr(self.processor, "image_token", None) or \
+                   getattr(_inner_tok, "image_token", None) or "<image>"
+
+        def _make_prompt(msgs_):
+            try:
+                return self.processor.apply_chat_template(
+                    msgs_, tokenize=False, add_generation_prompt=False)
+            except (ValueError, AttributeError):
+                pass
+            try:
+                return _inner_tok.apply_chat_template(
+                    msgs_, tokenize=False, add_generation_prompt=False)
+            except (ValueError, AttributeError):
+                pass
+            parts = [_bos]
+            for m in msgs_:
+                role = "model" if m["role"] in ("assistant", "model") else "user"
+                if _sot and _eot:
+                    parts.append(f"{_sot}{role}\n{m['content'].strip()}{_eot}")
+                else:
+                    parts.append(f"<start_of_turn>{role}\n{m['content'].strip()}<end_of_turn>\n")
+            return "".join(parts)
 
         img = None
         if img_path and os.path.exists(img_path):
@@ -173,18 +211,35 @@ class VLDataset:
             except Exception:
                 img = None
 
+        # Inject image token into first user message if image present.
         if img is not None:
-            inputs = self.processor(text=text, images=[img], return_tensors="pt")
+            msgs_with_img = []
+            _injected = False
+            for m in msgs:
+                if m["role"] == "user" and not _injected:
+                    msgs_with_img.append({"role": "user",
+                                          "content": f"{_img_tok}\n{m['content']}"})
+                    _injected = True
+                else:
+                    msgs_with_img.append(m)
+            text = _make_prompt(msgs_with_img)
+        else:
+            text = _make_prompt(msgs)
+
+        if img is not None:
+            inputs = self.processor(text=text, images=[img], return_tensors="pt",
+                                    add_special_tokens=False)
             inputs.pop("num_patches", None)
         else:
-            inputs = self.processor(text=text, return_tensors="pt")
+            inputs = _inner_tok(text, return_tensors="pt", add_special_tokens=False)
             inputs.pop("num_patches", None)
 
         # Squeeze batch dimension
         out: dict = {k: v.squeeze(0) for k, v in inputs.items()}
 
         # C-2: Build per-sample loss mask — supervise only assistant turns
-        out["labels"] = _build_labels(self.processor.tokenizer, msgs, out["input_ids"])
+        out["labels"] = _build_labels(_inner_tok, msgs, out["input_ids"],
+                                      prompt_fn=_make_prompt)
 
         return out
 
@@ -228,7 +283,10 @@ def _compute_vqa_accuracy(
         for line in _Path(jsonl_path).read_text().splitlines():
             line = line.strip()
             if line:
-                rows.append(json.loads(line))
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
     except Exception:
         return 0.0, 0
 
@@ -259,13 +317,45 @@ def _compute_vqa_accuracy(
                     pass
 
             try:
+                # Resolve image token and build prompt robustly (handles Gemma 4
+                # which has no chat_template and uses <|image|> not <image>).
+                _inner_tok = getattr(processor, "tokenizer", processor)
+                _sot = getattr(_inner_tok, "sot_token", None)
+                _eot = getattr(_inner_tok, "eot_token", None)
+                _bos = getattr(_inner_tok, "bos_token", None) or "<bos>"
+                _img_tok = getattr(processor, "image_token", None) or \
+                           getattr(_inner_tok, "image_token", None) or "<image>"
+
+                def _make_prompt(msgs, add_gen=True):
+                    """apply_chat_template with Gemma4 fallback."""
+                    try:
+                        return processor.apply_chat_template(
+                            msgs, tokenize=False, add_generation_prompt=add_gen)
+                    except (ValueError, AttributeError):
+                        pass
+                    try:
+                        return _inner_tok.apply_chat_template(
+                            msgs, tokenize=False, add_generation_prompt=add_gen)
+                    except (ValueError, AttributeError):
+                        pass
+                    # Manual fallback
+                    parts = [_bos]
+                    for m in msgs:
+                        role = "model" if m["role"] in ("assistant", "model") else "user"
+                        if _sot and _eot:
+                            parts.append(f"{_sot}{role}\n{m['content'].strip()}{_eot}")
+                        else:
+                            parts.append(f"<start_of_turn>{role}\n{m['content'].strip()}<end_of_turn>\n")
+                    if add_gen:
+                        parts.append(f"{_sot}model\n" if _sot else "<start_of_turn>model\n")
+                    return "".join(parts)
+
                 if image is not None:
-                    user_text = f"<image>\n{user_q}"
+                    user_text = f"{_img_tok}\n{user_q}"
                     msgs = [{"role": "user", "content": user_text}]
-                    text = processor.apply_chat_template(
-                        msgs, tokenize=False, add_generation_prompt=True
-                    )
-                    inputs = processor(text=text, images=[image], return_tensors="pt").to(device)
+                    text = _make_prompt(msgs)
+                    inputs = processor(text=text, images=[image], return_tensors="pt",
+                                       add_special_tokens=False).to(device)
                     inputs.pop("image_flags", None)
                     # Flatten dynamic-tiling batch dim: [1, tiles, C, H, W] → [tiles, C, H, W]
                     _pv = inputs.get("pixel_values")
@@ -273,19 +363,24 @@ def _compute_vqa_accuracy(
                         inputs["pixel_values"] = _pv.reshape(-1, *_pv.shape[2:])
                 else:
                     msgs = [{"role": "user", "content": user_q}]
-                    text = processor.apply_chat_template(
-                        msgs, tokenize=False, add_generation_prompt=True
-                    )
-                    inputs = processor.tokenizer(text, return_tensors="pt").to(device)
+                    text = _make_prompt(msgs)
+                    inputs = _inner_tok(text, return_tensors="pt",
+                                        add_special_tokens=False).to(device)
 
                 n_in = inputs["input_ids"].shape[1]
+                _eos_ids = [_inner_tok.eos_token_id]
+                if _eot:
+                    _eot_id = _inner_tok.convert_tokens_to_ids(_eot)
+                    if _eot_id and _eot_id != _inner_tok.eos_token_id:
+                        _eos_ids.append(_eot_id)
                 out = model.generate(
                     **inputs,
                     max_new_tokens=32,
                     do_sample=False,
-                    pad_token_id=processor.tokenizer.eos_token_id,
+                    eos_token_id=_eos_ids,
+                    pad_token_id=_inner_tok.eos_token_id,
                 )
-                generated = processor.tokenizer.decode(
+                generated = _inner_tok.decode(
                     out[0, n_in:], skip_special_tokens=True
                 ).strip()
 
@@ -437,13 +532,17 @@ class StreamCallback:
             cls._TrainerCallback = TrainerCallback
 
         class _Impl(TrainerCallback):
+            def on_train_begin(self, args, state, control, **kwargs):
+                print(f"TOTAL_STEPS={state.max_steps}", flush=True)
+
             def on_log(self, args, state, control, logs=None, **kwargs):
                 if logs and "loss" in logs:
                     step = state.global_step
                     loss = logs["loss"]
                     lr = logs.get("learning_rate", 0)
+                    epoch = logs.get("epoch", state.epoch or 0)
                     print(
-                        f"[step {step:4d}] loss={loss:.4f}  lr={lr:.2e}",
+                        f"[step {step:4d}] loss={loss:.4f}  lr={lr:.2e}  epoch={epoch:.2f}",
                         flush=True,
                     )
 
@@ -456,7 +555,7 @@ class StreamCallback:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="LoRA fine-tuning for Nemotron Nano 12B v2 VL")
+    parser = argparse.ArgumentParser(description="LoRA fine-tuning for multimodal vision-language models")
     parser.add_argument("--model", required=True, help="Local model path")
     parser.add_argument("--dataset", required=True, help="JSONL file or directory of JSONL files")
     parser.add_argument(
@@ -499,6 +598,9 @@ def main():
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    # Disable transformers 5.x threaded model loading — it uses ThreadPoolExecutor
+    # which causes CUDA driver initialization errors on some NVIDIA environments.
+    os.environ["HF_ENABLE_PARALLEL_LOADING"] = "0"
 
     args = parse_args()
 
@@ -527,7 +629,7 @@ def main():
         os.environ.setdefault("WANDB_PROJECT", args.wandb_project)
         if args.wandb_entity:
             os.environ.setdefault("WANDB_ENTITY", args.wandb_entity)
-        run_name = f"nemotron-vl_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        run_name = f"gemma-vl_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         report_to = "wandb"
     else:
         run_name = None
@@ -551,11 +653,12 @@ def main():
         device_map = {"": local_rank}
         print(f"Distributed mode: LOCAL_RANK={local_rank}", flush=True)
     elif n_gpus > 1:
-        # Single-script multi-GPU — HF Trainer handles sharding
-        device_map = "auto"
-        print(f"Multi-GPU (single script): {n_gpus} GPUs, device_map=auto", flush=True)
+        # Multi-GPU without torchrun: load on GPU 0 only.
+        # For true data parallelism, launch with torchrun --nproc_per_node=N
+        device_map = {"": "cuda:0"}
+        print(f"Multi-GPU detected ({n_gpus} GPUs) but no torchrun — using GPU 0 only. "
+              f"Use torchrun for data parallelism.", flush=True)
     else:
-        # Single GPU — dev default (RTX 5090)
         device_map = {"": "cuda:0"}
         print('Single GPU: device_map={"":"cuda:0"}', flush=True)
 
@@ -591,13 +694,12 @@ def main():
 
         load_kwargs["attn_implementation"] = "flash_attention_2"
         print("Using FlashAttention-2.", flush=True)
-    except ImportError:
-        print(
-            "WARNING: flash-attn not installed — using eager attention. "
-            "For faster training install it: pip install flash-attn --no-build-isolation",
-            flush=True,
-        )
-        load_kwargs["attn_implementation"] = "eager"
+    except Exception:
+        # SDPA with cuDNN backend can fail on some environments.
+        # Disable cuDNN SDPA, let PyTorch use flash_sdp or math fallback.
+        torch.backends.cuda.enable_cudnn_sdp(False)
+        load_kwargs["attn_implementation"] = "sdpa"
+        print("Using PyTorch SDPA (cuDNN disabled, flash_sdp/math).", flush=True)
 
     if args.quant == "8bit":
         from transformers import BitsAndBytesConfig
@@ -618,6 +720,13 @@ def main():
     load_kwargs["dtype"] = torch.bfloat16
 
     # Load model
+    # Disable transformers 5.x threaded weight loading — ThreadPoolExecutor
+    # causes CUDA driver initialization errors on NVIDIA cloud environments.
+    try:
+        import transformers.core_model_loading as _cml
+        _cml.GLOBAL_WORKERS = 1
+    except Exception:
+        pass
     print("Loading model...", flush=True)
     model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)
 
@@ -627,7 +736,7 @@ def main():
     # pass. Without it, 4/8-bit weights fail with a packed-weight matmul error
     # during training (inference still works, which masks the bug).
     if args.quant in ("4bit", "8bit"):
-        # The top-level VL wrapper (NemotronH_Nano_VL_V2) doesn't implement
+        # The top-level VL wrapper doesn't implement
         # gradient_checkpointing_enable, so tell prepare_* to skip it
         # (use_gradient_checkpointing=False) — GC is enabled on the inner
         # language_model further below. We still must enable input grads so
@@ -643,12 +752,12 @@ def main():
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
         target_modules=[
-            # Attention projections (NemotronH / LLaMA-3 attention layers)
+            # Attention projections (Gemma attention layers)
             "q_proj",
             "k_proj",
             "v_proj",
             "o_proj",
-            # Mamba SSM projections (hybrid NemotronH layers)
+            # Gate/value projections
             "in_proj",
             "out_proj",
             # MLP projections (SwiGLU feed-forward blocks)
@@ -725,6 +834,8 @@ def main():
         # LOW: Reproducibility
         seed=42,
         remove_unused_columns=False,
+        # LoRA freezes most parameters — DDP must not error on unused params
+        ddp_find_unused_parameters=False,
     )
 
     collator = partial(vl_collate_fn, processor=processor)
@@ -790,20 +901,23 @@ def main():
         # Output parseable line for app.py
         print(f"VQA_METRICS={json.dumps(_vqa_metrics)}", flush=True)
 
-    # LOW: Save adapter only.
-    # To produce a deployable merged model run: ft export <output_dir> --merge
-    print("Saving LoRA adapter and processor...", flush=True)
-    model.save_pretrained(args.output)
-    processor.save_pretrained(args.output)
+    # Save adapter only for real training runs — skip for smoke tests
+    if args.smoke:
+        print("Smoke test complete — skipping adapter save.", flush=True)
+        print(f"EXPORT_PATH={args.output}", flush=True)
+    else:
+        print("Saving LoRA adapter and processor...", flush=True)
+        model.save_pretrained(args.output)
+        processor.save_pretrained(args.output)
 
-    # Copy custom model .py files so trust_remote_code works from the adapter dir
-    for py_file in Path(args.model).glob("*.py"):
-        shutil.copy2(str(py_file), str(Path(args.output) / py_file.name))
+        # Copy custom model .py files so trust_remote_code works from the adapter dir
+        for py_file in Path(args.model).glob("*.py"):
+            shutil.copy2(str(py_file), str(Path(args.output) / py_file.name))
 
-    print(f"Adapter saved to: {args.output}", flush=True)
-    print("To merge LoRA into base model for deployment run:", flush=True)
-    print(f"    ft export {args.output} --merge", flush=True)
-    print(f"EXPORT_PATH={args.output}", flush=True)  # parsed by app.py
+        print(f"Adapter saved to: {args.output}", flush=True)
+        print("To merge LoRA into base model for deployment run:", flush=True)
+        print(f"    ft export {args.output} --merge", flush=True)
+        print(f"EXPORT_PATH={args.output}", flush=True)
 
     try:
         import gc

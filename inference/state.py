@@ -38,20 +38,21 @@ VLLM_PORT   = int(os.environ.get("VLLM_PORT", "8001"))
 # ── Project root ──────────────────────────────────────────────────────────────
 # __file__ is inference/state.py, so .parent.parent = project root
 ROOT    = Path(os.environ.get("FT_PROJECT", Path(__file__).resolve().parent.parent))
-SCRIPTS = ROOT / "scripts"
+# SCRIPTS always points to the platform code directory (not the project data dir)
+_PLATFORM = Path(__file__).resolve().parent.parent
+SCRIPTS = _PLATFORM / "scripts"
 PYTHON  = sys.executable
 
 # ── Default model for General User Mode ───────────────────────────────────────
-DEFAULT_BASE_MODEL = "nvidia/NVIDIA-Nemotron-Nano-VL-12B-v2"
-DEFAULT_BASE_DIR   = "nvidia__nvidia-nemotron-nano-12b-v2-vl-bf16"
-_FALLBACK_BASE_DIR = "nvidia__nvidia-nemotron-3-nano-4b-bf16"
-NEMOTRON_HF_ID     = "nvidia/NVIDIA-Nemotron-Nano-VL-12B-v2"
+DEFAULT_BASE_MODEL = "google/gemma-4-12b"
+DEFAULT_BASE_DIR   = "gemma-4-12b"
+_FALLBACK_BASE_DIR = "gemma-4-12b"
+MODEL_HF_ID = "google/gemma-4-12b"
 
 # Pin to a specific HF Hub commit to prevent silent supply-chain updates.
-# Set NEMOTRON_REVISION_SHA env var to a full 40-char commit SHA; None = "main".
-REVISION_SHA: str | None = os.environ.get("NEMOTRON_REVISION_SHA")
+# Set MODEL_REVISION_SHA env var to a full 40-char commit SHA; None = "main".
+REVISION_SHA: str | None = os.environ.get("MODEL_REVISION_SHA")
 
 _MODEL_DISPLAY_INFO: dict = {
-    "nvidia__nvidia-nemotron-nano-12b-v2-vl-bf16": "Nemotron VL 12B · image+text  (25 GB VRAM)",
-    "nvidia__nvidia-nemotron-3-nano-4b-bf16":       "Nemotron 4B · BF16  (4.3 GB VRAM)",
+    "gemma-4-12b": "Gemma 4 12B · image+text  (23 GB VRAM)",
 }

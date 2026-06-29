@@ -34,19 +34,38 @@ from ft_common import (
 
 
 def find_base_model(ckpt_dir: Path, root: Path) -> str | None:
-    """Try to read base model id from the axolotl config saved in the checkpoint."""
-    for f in ["config.json", "axolotl_config.yaml", "training_args.json"]:
-        p = ckpt_dir / f
-        if p.exists():
+    """Try to read base model id from the checkpoint's adapter or config files."""
+    # 1. Check adapter_config.json (PEFT standard) — in ckpt_dir or sub-checkpoints
+    search_dirs = [ckpt_dir]
+    # Also check sub-checkpoints (checkpoint-NNN/) sorted by step number descending
+    sub_ckpts = sorted(ckpt_dir.glob("checkpoint-*"), key=lambda p: p.stat().st_mtime, reverse=True)
+    search_dirs.extend(sub_ckpts)
+
+    for d in search_dirs:
+        adapter_cfg = d / "adapter_config.json"
+        if adapter_cfg.exists():
             try:
-                if f.endswith(".json"):
-                    d = json.loads(p.read_text())
-                    for key in ("_name_or_path", "base_model", "model_name_or_path"):
-                        if key in d:
-                            return d[key]
+                data = json.loads(adapter_cfg.read_text())
+                base = data.get("base_model_name_or_path")
+                if base:
+                    return base
             except Exception:
                 pass
-    # Walk parent to find recipe yaml
+
+    # 2. Check config.json, training_args.json
+    for d in search_dirs:
+        for f in ["config.json", "training_args.json"]:
+            p = d / f
+            if p.exists():
+                try:
+                    data = json.loads(p.read_text())
+                    for key in ("_name_or_path", "base_model", "model_name_or_path"):
+                        if key in data:
+                            return data[key]
+                except Exception:
+                    pass
+
+    # 3. Fall back to recipe YAML configs
     for yaml_file in (root / "configs").glob("*.yaml"):
         try:
             for line in yaml_file.read_text().splitlines():
@@ -170,7 +189,7 @@ for _fname in ("tokenizer.json", "tokenizer_config.json",
     _src = Path(base_path) / _fname
     if _src.exists():
         _sh.copy2(_src, Path(out_dir) / _fname)
-# Also copy processor files for VLMs (e.g. Nemotron-Omni, Qwen2-VL)
+# Also copy processor files for VLMs (e.g. Gemma 4-Omni, Qwen2-VL)
 for _fname in ("preprocessor_config.json", "processor_config.json",
                "chat_template.json", "image_processing_config.json"):
     _src = Path(base_path) / _fname
@@ -238,6 +257,99 @@ print("AWQ quantization done.")
         return True
     except Exception as e:
         warn(f"AWQ failed: {e}")
+        return False
+
+
+def quantize_gptq(merged_dir: Path, gptq_dir: Path) -> bool:
+    """Quantize merged model to GPTQ 4-bit."""
+    info(f"Quantizing to GPTQ: {gptq_dir.name}")
+    gptq_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        quant_script = f"""
+from transformers import AutoModelForCausalLM, AutoTokenizer, GPTQConfig
+
+model_path = "{merged_dir}"
+save_path  = "{gptq_dir}"
+
+print("Loading tokenizer...")
+tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
+print("Loading model with GPTQ quantization config...")
+gptq_config = GPTQConfig(bits=4, dataset="c4", tokenizer=tok)
+model = AutoModelForCausalLM.from_pretrained(
+    model_path, quantization_config=gptq_config,
+    device_map="auto", trust_remote_code=True)
+
+print("Saving GPTQ model...")
+model.save_pretrained(save_path, safetensors=True)
+tok.save_pretrained(save_path)
+print("GPTQ quantization done.")
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", quant_script],
+            capture_output=True, text=True, timeout=7200,
+        )
+        if result.returncode != 0:
+            warn(f"GPTQ quantization failed: {result.stderr[-500:]}")
+            warn("Install: pip install optimum auto-gptq")
+            return False
+        ok(f"GPTQ model saved to {gptq_dir}")
+        return True
+    except Exception as e:
+        warn(f"GPTQ failed: {e}")
+        return False
+
+
+def quantize_bnb(merged_dir: Path, bnb_dir: Path, bits: int = 4) -> bool:
+    """Save merged model with BitsAndBytes quantization (4-bit or 8-bit)."""
+    info(f"Quantizing to BnB {bits}-bit: {bnb_dir.name}")
+    bnb_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        quant_script = f"""
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoProcessor, BitsAndBytesConfig
+
+model_path = "{merged_dir}"
+save_path  = "{bnb_dir}"
+bits = {bits}
+
+if bits == 4:
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+    )
+else:
+    bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+
+print(f"Loading model with BnB {{bits}}-bit quantization...")
+model = AutoModelForCausalLM.from_pretrained(
+    model_path, quantization_config=bnb_config,
+    device_map="auto", trust_remote_code=True)
+
+print("Saving quantized model...")
+model.save_pretrained(save_path, safetensors=True)
+
+# Save tokenizer/processor
+try:
+    proc = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+    proc.save_pretrained(save_path)
+except Exception:
+    tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    tok.save_pretrained(save_path)
+print(f"BnB {{bits}}-bit quantization done.")
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", quant_script],
+            capture_output=True, text=True, timeout=3600,
+        )
+        if result.returncode != 0:
+            warn(f"BnB {bits}-bit quantization failed: {result.stderr[-500:]}")
+            return False
+        ok(f"BnB {bits}-bit model saved to {bnb_dir}")
+        return True
+    except Exception as e:
+        warn(f"BnB {bits}-bit failed: {e}")
         return False
 
 
@@ -410,8 +522,9 @@ def main():
     ap.add_argument("--merge", action="store_true", default=True,
                     help="Merge LoRA adapters into base (default: on)")
     ap.add_argument("--no-merge", action="store_false", dest="merge")
-    ap.add_argument("--quantize", default="awq", choices=["awq", "gptq", "gguf", "none"],
-                    help="Quantization format (default: awq)")
+    ap.add_argument("--quantize", default="none",
+                    choices=["awq", "gptq", "gguf", "bnb-4bit", "bnb-8bit", "none"],
+                    help="Quantization format (default: none/bf16)")
     ap.add_argument("--gguf", action="store_true", help="Also produce GGUF Q4_K_M")
     ap.add_argument("--output-dir", default=None, help="Override export dir")
     args = ap.parse_args()
@@ -436,27 +549,48 @@ def main():
         sys.exit(2)
     info(f"Base model: {base_model}")
 
+    # Resolve the actual adapter directory — may be the top-level ckpt_dir
+    # or the latest sub-checkpoint (checkpoint-NNN/) if training was interrupted.
+    adapter_dir = ckpt_dir
+    if not (ckpt_dir / "adapter_config.json").exists():
+        sub_ckpts = sorted(ckpt_dir.glob("checkpoint-*"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for sc in sub_ckpts:
+            if (sc / "adapter_config.json").exists():
+                adapter_dir = sc
+                info(f"Using sub-checkpoint: {sc.name} (top-level has no adapter)")
+                break
+
     # 1. Merge
     merged_dir = export_dir / "merged"
     merge_ok = False
     if args.merge:
-        merge_ok = merge_lora(ckpt_dir, base_model, merged_dir)
+        merge_ok = merge_lora(adapter_dir, base_model, merged_dir)
     else:
         warn("Skipping LoRA merge (--no-merge). Quantization will use adapter dir directly.")
         merged_dir = ckpt_dir
         merge_ok = True
 
     # 2. Quantize
-    source_for_quant = merged_dir if merge_ok else ckpt_dir
+    source_for_quant = merged_dir if merge_ok else adapter_dir
     if args.quantize == "awq":
         awq_dir = export_dir / "awq"
         quantize_awq(source_for_quant, awq_dir)
+    elif args.quantize == "gptq":
+        gptq_dir = export_dir / "gptq"
+        quantize_gptq(source_for_quant, gptq_dir)
+    elif args.quantize == "bnb-4bit":
+        bnb_dir = export_dir / "bnb-4bit"
+        quantize_bnb(source_for_quant, bnb_dir, bits=4)
+    elif args.quantize == "bnb-8bit":
+        bnb_dir = export_dir / "bnb-8bit"
+        quantize_bnb(source_for_quant, bnb_dir, bits=8)
 
     # 3. Tokenizer copy
     copy_tokenizer(ckpt_dir, export_dir)
 
     # 4. Inference test
-    test_model = export_dir / ("awq" if args.quantize == "awq" else "merged")
+    _quant_dirs = {"awq": "awq", "gptq": "gptq", "bnb-4bit": "bnb-4bit", "bnb-8bit": "bnb-8bit"}
+    test_model = export_dir / _quant_dirs.get(args.quantize, "merged")
     if test_model.exists():
         info("Running inference test on exported model...")
         run_inference_test(test_model, export_dir / "inference_test.json")

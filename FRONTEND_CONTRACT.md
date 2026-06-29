@@ -92,7 +92,7 @@ const { data } = await (await fetch(`/api/datasets/${name}/sample`, { headers })
 const { data } = await (await fetch("/api/training/start", {
   method: "POST", headers,
   body: JSON.stringify({
-    model:         "nvidia__nvidia-nemotron-nano-12b-v2-vl-bf16",
+    model:         "gemma-4-12b",
     dataset:       "ko-vqa",
     mode:          "vl",
     quant:         "bf16",

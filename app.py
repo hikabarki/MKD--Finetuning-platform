@@ -29,7 +29,7 @@ from inference import state as _state
 from inference.state import (
     ROOT, SCRIPTS, PYTHON, VLLM_PYTHON, VLLM_PORT,
     DEFAULT_BASE_MODEL, DEFAULT_BASE_DIR, _FALLBACK_BASE_DIR,
-    NEMOTRON_HF_ID, _MODEL_DISPLAY_INFO,
+    MODEL_HF_ID, _MODEL_DISPLAY_INFO,
     _chat_lock, _vllm_lock, _user_model_path_lock, _user_training_lock,
 )
 from inference.vllm_server import _is_vllm_model, _start_vllm_server, _stop_vllm_server
@@ -54,6 +54,165 @@ from ft_platform.eval_dashboard import (
     build_metrics_df, load_eval_run,
 )
 from ui.styles import CSS
+
+
+def _build_vl_cmd(model_path: str, ds_path: str, out_path: str,
+                   quant: str = "bf16", lora_r: int = 16, lr: float = 2e-4,
+                   epochs: int = 1, max_steps: int = 0, smoke: bool = False,
+                   batch_size: int = 1) -> list[str]:
+    """Build vl_trainer.py launch command.
+
+    torchrun (DDP) is disabled — transformers 5.x threaded model loading
+    conflicts with NCCL initialization on multi-GPU, causing CUDA driver
+    errors on rank 1.  Single-GPU training is stable and the 12B model
+    fits comfortably in one H200 (24 GB bf16).
+    """
+    trainer_script = str(ROOT / "vl_trainer.py")
+    cmd = [PYTHON, trainer_script]
+
+    cmd += ["--model", model_path,
+            "--dataset", ds_path,
+            "--output", out_path,
+            "--quant", quant,
+            "--lora-r", str(lora_r),
+            "--lr", str(lr),
+            "--epochs", str(epochs),
+            "--batch-size", str(batch_size)]
+    if max_steps > 0:
+        cmd += ["--max-steps", str(max_steps)]
+    if smoke:
+        cmd.append("--smoke")
+    return cmd
+
+
+def _format_train_line(line: str) -> str | None:
+    """Filter and format VL trainer output lines for the UI.
+
+    Returns formatted HTML line, or None to skip the line entirely.
+    """
+    stripped = line.strip()
+    if not stripped:
+        return None
+
+    # Skip tqdm progress bars and ANSI escape noise
+    if stripped.startswith(("\r", "[A", "\x1b")) or "it/s]" in stripped:
+        # But keep the final 100% line
+        if "100%" in stripped and "it/s]" in stripped:
+            return None  # still skip — we show the summary instead
+        return None
+
+    # Skip noisy warnings
+    if any(w in stripped for w in [
+        "FutureWarning", "UserWarning", "warnings.warn",
+        "DeprecationWarning", "from scipy", "from sklearn",
+        "hf_transfer", "HF_XET_HIGH_PERFORMANCE",
+        "NumPy version", "SciPy",
+    ]):
+        return None
+
+    # Format step metrics as a clean card
+    if stripped.startswith("[step"):
+        import re
+        m = re.match(r'\[step\s+(\d+)\]\s+loss=([\d.]+)\s+lr=([\d.e+-]+)\s*(?:epoch=([\d.]+))?', stripped)
+        if m:
+            step, loss, lr = m.group(1), m.group(2), m.group(3)
+            epoch = m.group(4) or "—"
+            loss_f = float(loss)
+            color = "#3fb950" if loss_f < 1.5 else "#d29922" if loss_f < 3.0 else "#f85149"
+            return (f'<div style="display:flex;gap:24px;padding:4px 0;font-family:monospace;font-size:13px;">'
+                    f'<span style="color:#8b949e;">Step {step}</span>'
+                    f'<span>Loss: <b style="color:{color};">{loss}</b></span>'
+                    f'<span style="color:#8b949e;">LR: {lr}</span>'
+                    f'<span style="color:#8b949e;">Epoch: {epoch}</span></div>')
+
+    # Format JSON summary lines (train/eval results)
+    if stripped.startswith("{") and ("train_loss" in stripped or "eval_loss" in stripped):
+        try:
+            import json as _j
+            d = _j.loads(stripped.replace("'", '"'))
+            parts = []
+            if "train_loss" in d:
+                parts.append(f'Train Loss: <b style="color:#58a6ff;">{float(d["train_loss"]):.4f}</b>')
+            if "eval_loss" in d:
+                parts.append(f'Eval Loss: <b style="color:#58a6ff;">{float(d["eval_loss"]):.4f}</b>')
+            if "train_runtime" in d:
+                mins = float(d["train_runtime"]) / 60
+                parts.append(f'Time: {mins:.1f} min')
+            if "train_samples_per_second" in d:
+                parts.append(f'{float(d["train_samples_per_second"]):.1f} samples/s')
+            if parts:
+                return (f'<div style="background:#0d2a1a;border:1px solid #238636;border-radius:8px;'
+                        f'padding:10px 16px;margin:8px 0;font-size:13px;">'
+                        f'{"  ·  ".join(parts)}</div>')
+        except Exception:
+            pass
+
+    # Format VQA metrics
+    if "VQA_METRICS=" in stripped:
+        try:
+            import json as _j
+            d = _j.loads(stripped.split("=", 1)[1])
+            before = d.get("vqa_accuracy_before", 0)
+            after = d.get("vqa_accuracy_after", 0)
+            n = d.get("vqa_n_samples", "?")
+            delta = (after - before) * 100
+            return (f'<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;'
+                    f'padding:10px 16px;margin:8px 0;font-size:13px;">'
+                    f'VQA Accuracy ({n} samples): '
+                    f'<b>{before:.1%}</b> → <b style="color:#3fb950;">{after:.1%}</b> '
+                    f'(<span style="color:{"#3fb950" if delta >= 0 else "#f85149"};">{delta:+.1f}pp</span>)'
+                    f'</div>')
+        except Exception:
+            pass
+
+    # Format key status lines
+    if stripped.startswith("TOTAL_STEPS="):
+        total = stripped.split("=", 1)[1]
+        return (f'<div style="color:#58a6ff;font-size:13px;padding:4px 0;">'
+                f'Total training steps: <b>{total}</b></div>')
+
+    if stripped.startswith("EXPORT_PATH="):
+        path = stripped.split("=", 1)[1]
+        name = path.rsplit("/", 1)[-1]
+        return (f'<div style="background:#0d2a1a;border:1px solid #238636;border-radius:8px;'
+                f'padding:10px 16px;margin:8px 0;color:#3fb950;font-weight:600;">'
+                f'Training complete — saved to {name}</div>')
+
+    # Keep other informational lines (Loading, Applying LoRA, etc.)
+    if any(k in stripped for k in [
+        "Loading", "Applying LoRA", "Trainable", "Train samples",
+        "Eval  samples", "Gradient checkpointing", "SDPA", "FlashAttention",
+        "Single GPU", "Distributed", "Multi-GPU", "Capped image",
+        "GPU memory", "Saving", "Adapter saved", "VQA accuracy",
+        "Computing", "Fine-tuned", "Output directory", "Model ",
+        "Dataset ", "Quantisation", "LoRA r/alpha", "Smoke mode",
+    ]):
+        return f'<div style="color:#8b949e;font-size:12px;padding:2px 0;">{stripped}</div>'
+
+    return None
+
+
+def _register_vqa_metrics(model: str, vqa_metrics: dict) -> None:
+    """Write VQA metrics to log + eval_results so the eval dashboard can find the run."""
+    import datetime as _dt
+    run_name = f"vl_{model}_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    log_dir = ROOT / "logs"; log_dir.mkdir(exist_ok=True)
+    eval_dir = ROOT / "eval_results" / run_name; eval_dir.mkdir(parents=True, exist_ok=True)
+    log_lines = [
+        json.dumps({"loss": vqa_metrics.get("vqa_accuracy_before", 0), "ppl": 1.0}),
+        json.dumps({"loss": vqa_metrics.get("vqa_accuracy_after",  0), "ppl": 1.0}),
+        json.dumps({"vqa_accuracy_before": vqa_metrics["vqa_accuracy_before"],
+                    "vqa_accuracy_after":  vqa_metrics["vqa_accuracy_after"],
+                    "vqa_n_samples":       vqa_metrics.get("vqa_n_samples", 0)}),
+    ]
+    (log_dir / f"train_{run_name}.log").write_text("\n".join(log_lines))
+    (eval_dir / "summary.md").write_text(
+        f"# VL Training: {model}\n\n"
+        f"| Metric | Before | After | Change |\n|---|---|---|---|\n"
+        f"| VQA Accuracy | {vqa_metrics['vqa_accuracy_before']:.1%} | "
+        f"{vqa_metrics['vqa_accuracy_after']:.1%} | "
+        f"{(vqa_metrics['vqa_accuracy_after']-vqa_metrics['vqa_accuracy_before'])*100:+.1f}pp |\n"
+    )
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
@@ -232,12 +391,43 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
 
                 gr.HTML('<div style="height:4px;"></div>')
 
+                with gr.Accordion("Manage datasets  —  download · upload · clean", open=False):
+                    qs_mgmt_radio = gr.Radio(
+                        ["Download from HuggingFace", "Upload a file", "Clean a dataset"],
+                        value="Download from HuggingFace", label="Action",
+                    )
+                    with gr.Group(visible=True) as qs_panel_hf:
+                        with gr.Row():
+                            qs_hf_id  = gr.Textbox(label="HuggingFace dataset ID",
+                                                   placeholder="liuhaotian/LLaVA-Instruct-150K", scale=3)
+                            qs_hf_nm  = gr.Textbox(label="Local name  (optional)", placeholder="auto", scale=1)
+                            qs_hf_btn = gr.Button("Download & Normalize", variant="primary", scale=0)
+                    with gr.Group(visible=False) as qs_panel_upload:
+                        with gr.Row():
+                            qs_up_file = gr.File(
+                                label="File  (.jsonl .json .csv .parquet .pdf)",
+                                file_types=[".jsonl", ".json", ".csv", ".parquet", ".pdf"], scale=3)
+                            qs_up_nm  = gr.Textbox(label="Local name", placeholder="my-dataset", scale=1)
+                            qs_up_btn = gr.Button("Upload & Normalize", variant="secondary", scale=0)
+                    with gr.Group(visible=False) as qs_panel_clean:
+                        with gr.Row():
+                            qs_clean_dd  = gr.Dropdown(choices=list_datasets(), label="Dataset to clean", scale=3)
+                            qs_clean_rf  = gr.Button("↺", size="sm", variant="secondary", scale=0)
+                            qs_clean_btn = gr.Button("Clean", variant="primary", scale=0)
+                    qs_mgmt_out = gr.HTML(terminal_wrap(""))
+
                 user_qs_dataset = gr.Radio(
                     ["Use the built-in example dataset",
+                     "Use a server dataset",
                      "Upload my own data file"],
                     value="Use the built-in example dataset",
                     label="Training data",
-                    info="The built-in dataset is good for a quick test. Upload your own data for real results.",
+                    info="Use 'Manage datasets' above to download or clean new datasets first.",
+                )
+                user_qs_server_dd = gr.Dropdown(
+                    choices=list_cleaned_datasets(),
+                    label="Select server dataset",
+                    visible=False,
                 )
                 user_qs_file = gr.File(
                     label="Your data file  (.jsonl, .json or .csv)",
@@ -281,7 +471,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
         def get_model_choices():
             choices = []
             # VL 12B first so it appears as the top radio option
-            preferred_order = [DEFAULT_BASE_DIR, _FALLBACK_BASE_DIR]
+            preferred_order = list(dict.fromkeys([DEFAULT_BASE_DIR, _FALLBACK_BASE_DIR]))
             all_models = list_models()
             ordered = [m for m in preferred_order if m in all_models] + \
                       [m for m in all_models if m not in preferred_order]
@@ -293,7 +483,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                 # Format: "folder-name  (friendly info)" — folder-name prefix is used
                 # by run_user_custommix for fuzzy-matching back to the folder.
                 choices.append(f"{m}  ({friendly})" if friendly else m)
-            return choices or [f"{_FALLBACK_BASE_DIR}  (Nemotron 4B · BF16  (4.3 GB VRAM))"]
+            return choices or [f"{_FALLBACK_BASE_DIR}  (Gemma 4 12B · image+text  (23 GB VRAM))"]
 
         def get_cm_dataset_choices():
             choices = []
@@ -342,7 +532,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
             with gr.Row():
                 def _default_model_choice():
                     choices = get_model_choices()
-                    # Prefer VL 12B, then any Nemotron, then first available
+                    # Prefer Gemma 4 12B, then first available
                     for priority in (DEFAULT_BASE_DIR, _FALLBACK_BASE_DIR):
                         for c in choices:
                             if c.startswith(priority):
@@ -358,6 +548,33 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                 cm_model_refresh = gr.Button("↺", size="sm", variant="secondary", scale=0)
 
             gr.HTML('<div style="height:8px;"></div>')
+
+            with gr.Accordion("Manage datasets  —  download · upload · clean", open=False):
+                cm_mgmt_radio = gr.Radio(
+                    ["Download from HuggingFace", "Upload a file", "Clean a dataset"],
+                    value="Download from HuggingFace", label="Action",
+                )
+                with gr.Group(visible=True) as cm_panel_hf:
+                    with gr.Row():
+                        cm_hf_id  = gr.Textbox(label="HuggingFace dataset ID",
+                                               placeholder="liuhaotian/LLaVA-Instruct-150K", scale=3)
+                        cm_hf_nm  = gr.Textbox(label="Local name  (optional)", placeholder="auto", scale=1)
+                        cm_hf_btn = gr.Button("Download & Normalize", variant="primary", scale=0)
+                with gr.Group(visible=False) as cm_panel_upload:
+                    with gr.Row():
+                        cm_up_file = gr.File(
+                            label="File  (.jsonl .json .csv .parquet .pdf)",
+                            file_types=[".jsonl", ".json", ".csv", ".parquet", ".pdf"], scale=3)
+                        cm_up_nm  = gr.Textbox(label="Local name", placeholder="my-dataset", scale=1)
+                        cm_up_btn = gr.Button("Upload & Normalize", variant="secondary", scale=0)
+                with gr.Group(visible=False) as cm_panel_clean:
+                    with gr.Row():
+                        cm_clean_dd  = gr.Dropdown(choices=list_datasets(), label="Dataset to clean", scale=3)
+                        cm_clean_rf  = gr.Button("↺", size="sm", variant="secondary", scale=0)
+                        cm_clean_btn = gr.Button("Clean", variant="primary", scale=0)
+                cm_mgmt_out = gr.HTML(terminal_wrap(""))
+
+            gr.HTML('<div style="height:4px;"></div>')
 
             with gr.Row():
                 user_cm_dataset = gr.CheckboxGroup(
@@ -423,6 +640,115 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
             cm_model_refresh.click(lambda: gr.Radio(choices=get_model_choices()),       outputs=user_cm_model)
             cm_ds_refresh.click(lambda: gr.CheckboxGroup(choices=get_cm_dataset_choices()), outputs=user_cm_dataset)
 
+            # ── Quick Start accordion wiring ───────────────────────────────────
+            def _qs_switch(choice):
+                return (
+                    gr.Group(visible=choice == "Download from HuggingFace"),
+                    gr.Group(visible=choice == "Upload a file"),
+                    gr.Group(visible=choice == "Clean a dataset"),
+                )
+            qs_mgmt_radio.change(_qs_switch, inputs=qs_mgmt_radio,
+                                 outputs=[qs_panel_hf, qs_panel_upload, qs_panel_clean])
+
+            def _qs_hf_download(hf_id, hf_nm):
+                args = ["add-dataset", hf_id.strip()]
+                if hf_nm.strip():
+                    args += ["--name", hf_nm.strip()]
+                yield from run_ft(args)
+
+            qs_hf_btn.click(_qs_hf_download, inputs=[qs_hf_id, qs_hf_nm],
+                            outputs=qs_mgmt_out, show_progress=False
+            ).then(lambda: (gr.Dropdown(choices=list_datasets()),
+                            gr.Dropdown(choices=list_cleaned_datasets())),
+                   outputs=[qs_clean_dd, user_qs_server_dd])
+
+            def _qs_upload(f, nm):
+                if f is None:
+                    yield terminal_wrap("No file selected.")
+                    return
+                p = Path(f.name if hasattr(f, "name") else str(f))
+                args = ["add-dataset", str(p)]
+                if nm.strip():
+                    args += ["--name", nm.strip()]
+                yield from run_ft(args)
+
+            qs_up_btn.click(_qs_upload, inputs=[qs_up_file, qs_up_nm],
+                            outputs=qs_mgmt_out, show_progress=False
+            ).then(lambda: (gr.Dropdown(choices=list_datasets()),
+                            gr.Dropdown(choices=list_cleaned_datasets())),
+                   outputs=[qs_clean_dd, user_qs_server_dd])
+
+            def _qs_clean(name):
+                if not name:
+                    yield terminal_wrap("Select a dataset first.")
+                    return
+                yield from run_ft(["clean-dataset", name])
+
+            qs_clean_btn.click(_qs_clean, inputs=qs_clean_dd,
+                               outputs=qs_mgmt_out, show_progress=False
+            ).then(lambda: gr.Dropdown(choices=list_cleaned_datasets()),
+                   outputs=user_qs_server_dd)
+            qs_clean_rf.click(lambda: gr.Dropdown(choices=list_datasets()), outputs=qs_clean_dd)
+
+            def _qs_toggle_ds(choice):
+                return (
+                    gr.Dropdown(visible=choice == "Use a server dataset",
+                                choices=list_cleaned_datasets()),
+                    gr.File(visible=choice == "Upload my own data file"),
+                )
+            user_qs_dataset.change(_qs_toggle_ds, inputs=user_qs_dataset,
+                                   outputs=[user_qs_server_dd, user_qs_file])
+
+            # ── Custom Mix accordion wiring ────────────────────────────────────
+            def _cm_switch(choice):
+                return (
+                    gr.Group(visible=choice == "Download from HuggingFace"),
+                    gr.Group(visible=choice == "Upload a file"),
+                    gr.Group(visible=choice == "Clean a dataset"),
+                )
+            cm_mgmt_radio.change(_cm_switch, inputs=cm_mgmt_radio,
+                                 outputs=[cm_panel_hf, cm_panel_upload, cm_panel_clean])
+
+            def _cm_hf_download(hf_id, hf_nm):
+                args = ["add-dataset", hf_id.strip()]
+                if hf_nm.strip():
+                    args += ["--name", hf_nm.strip()]
+                yield from run_ft(args)
+
+            cm_hf_btn.click(_cm_hf_download, inputs=[cm_hf_id, cm_hf_nm],
+                            outputs=cm_mgmt_out, show_progress=False
+            ).then(lambda: (gr.Dropdown(choices=list_datasets()),
+                            gr.CheckboxGroup(choices=get_cm_dataset_choices())),
+                   outputs=[cm_clean_dd, user_cm_dataset])
+
+            def _cm_upload(f, nm):
+                if f is None:
+                    yield terminal_wrap("No file selected.")
+                    return
+                p = Path(f.name if hasattr(f, "name") else str(f))
+                args = ["add-dataset", str(p)]
+                if nm.strip():
+                    args += ["--name", nm.strip()]
+                yield from run_ft(args)
+
+            cm_up_btn.click(_cm_upload, inputs=[cm_up_file, cm_up_nm],
+                            outputs=cm_mgmt_out, show_progress=False
+            ).then(lambda: (gr.Dropdown(choices=list_datasets()),
+                            gr.CheckboxGroup(choices=get_cm_dataset_choices())),
+                   outputs=[cm_clean_dd, user_cm_dataset])
+
+            def _cm_clean(name):
+                if not name:
+                    yield terminal_wrap("Select a dataset first.")
+                    return
+                yield from run_ft(["clean-dataset", name])
+
+            cm_clean_btn.click(_cm_clean, inputs=cm_clean_dd,
+                               outputs=cm_mgmt_out, show_progress=False
+            ).then(lambda: gr.CheckboxGroup(choices=get_cm_dataset_choices()),
+                   outputs=user_cm_dataset)
+            cm_clean_rf.click(lambda: gr.Dropdown(choices=list_datasets()), outputs=cm_clean_dd)
+
         # Screen 3: Progress
         with gr.Group(visible=False) as user_screen3:
             gr.HTML("""
@@ -481,9 +807,9 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                 <div style="flex:2;height:2px;background:#238636;margin-bottom:16px;"></div>
                 <div style="flex:1;text-align:center;">
                   <div style="display:inline-block;width:28px;height:28px;line-height:28px;
-                              border-radius:50%;background:#1f6feb;color:#fff;font-size:13px;
-                              font-weight:700;">3</div>
-                  <div style="color:#58a6ff;font-size:12px;margin-top:4px;font-weight:600;">Chat</div>
+                              border-radius:50%;background:#238636;color:#fff;font-size:13px;
+                              font-weight:700;">&#10003;</div>
+                  <div style="color:#3fb950;font-size:12px;margin-top:4px;font-weight:600;">Chat</div>
                 </div>
               </div>
             </div>
@@ -758,12 +1084,12 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
     _user_last_model_path = {"path": None}   # shared state for inline chat
     _user_training_proc   = {"proc": None}   # track subprocess for cancellation
 
-    def run_user_quickstart(dataset_choice, upload_file, model_name, test_mode=True, test_steps=50, max_steps=0):
-        dataset = "alpaca"
-        # Priority: VL 12B → Nemotron 4B BF16 → Qwen 7B → Qwen 3B
+    def run_user_quickstart(dataset_choice, upload_file, server_ds, model_name, test_mode=True, test_steps=50, max_steps=0):
+        dataset = "llava-instruct-150k"
+        # Priority: Gemma 4 12B (default)
         _model_priority = [
-            DEFAULT_BASE_DIR,   # nvidia__nvidia-nemotron-nano-12b-v2-vl-bf16  (VL 12B — default)
-            _FALLBACK_BASE_DIR, # nvidia__nvidia-nemotron-3-nano-4b-bf16        (4B fallback)
+            DEFAULT_BASE_DIR,   # gemma-4-12b  (default)
+            _FALLBACK_BASE_DIR, # gemma-4-12b  (same, fallback)
         ]
         model = DEFAULT_BASE_DIR
         for _m in _model_priority:
@@ -773,8 +1099,13 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
         test_steps = int(test_steps or 50)
         max_steps  = int(max_steps  or 0)
 
+        # Server dataset selected explicitly
+        if dataset_choice == "Use a server dataset" and server_ds:
+            dataset = server_ds.split("  ")[0].strip()
+            test_mode = False
+
         # If customer uploaded their own file, prepare it first (add → clean)
-        if dataset_choice != "Use the built-in example dataset" and upload_file is not None:
+        elif dataset_choice != "Use the built-in example dataset" and upload_file is not None:
             import re as _re_qs
             _upath = Path(upload_file.name if hasattr(upload_file, "name") else str(upload_file))
             _ds_slug = _re_qs.sub(r"[^a-z0-9]+", "-", _upath.stem.lower()).strip("-")[:30] or "my-dataset"
@@ -789,17 +1120,17 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
         # For test mode: create a tiny 100-row dataset to skip preprocessing wait
         if test_mode:
             import json as _j
-            src = ROOT / "datasets" / "alpaca" / "train.jsonl"
-            tiny_dir = ROOT / "datasets" / "alpaca_tiny"
+            src = ROOT / "datasets" / "llava-instruct-150k" / "train.jsonl"
+            tiny_dir = ROOT / "datasets" / "llava-instruct-150k-tiny"
             tiny_dir.mkdir(exist_ok=True)
             if src.exists():
                 rows = [_j.loads(l) for l in src.read_text().splitlines()[:100] if l.strip()]
                 (tiny_dir / "train.jsonl").write_text("\n".join(_j.dumps(r) for r in rows))
                 (tiny_dir / "val.jsonl").write_text("\n".join(_j.dumps(r) for r in rows[:10]))
                 # minimal data card
-                (ROOT / "data_cards" / "alpaca_tiny.json").write_text(
-                    _j.dumps({"name": "alpaca_tiny", "train_rows": 100, "val_rows": 10}))
-                dataset = "alpaca_tiny"
+                (ROOT / "data_cards" / "llava-instruct-150k-tiny.json").write_text(
+                    _j.dumps({"name": "llava-instruct-150k-tiny", "train_rows": 100, "val_rows": 10}))
+                dataset = "llava-instruct-150k-tiny"
 
         import subprocess as _sp_qs
         model_path = str(ROOT / "models" / model)
@@ -810,30 +1141,22 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
             ds_path = str(ROOT / "datasets" / dataset)
             if not Path(ds_path).exists():
                 ds_path = str(ROOT / "cleaned_datasets" / dataset)
-            out_path = str(ROOT / "checkpoints" / f"vl_{model}")
-            epochs_vl = 1
-            cmd = [
-                "python", str(ROOT / "vl_trainer.py"),
-                "--model", model_path,
-                "--dataset", ds_path,
-                "--output", out_path,
-                "--quant", "bf16",
-                "--lora-r", "16",
-                "--lr", "2e-4",
-                "--epochs", str(epochs_vl),
-            ]
-            if test_mode:
-                cmd += ["--max-steps", str(test_steps)]
-            elif max_steps > 0:
-                cmd += ["--max-steps", str(max_steps)]
+            out_path = str(ROOT / "checkpoints" / f"vl_{model}_{time.strftime('%Y%m%d_%H%M%S')}")
+            _ms = test_steps if test_mode else max_steps
+            cmd = _build_vl_cmd(model_path, ds_path, out_path,
+                                max_steps=_ms, epochs=1)
 
             yield build_progress_html("configure"), terminal_wrap("Setting up VL training...")
             yield build_progress_html("smoke"), terminal_wrap("Starting VL trainer (smoke + train + merge)...")
 
             env = {**os.environ,
+                   "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES", "0"),
                    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                   "HF_ENABLE_PARALLEL_LOADING": "0",
                    "HF_HUB_OFFLINE": "1",
-                   "TOKENIZERS_PARALLELISM": "false"}
+                   "TOKENIZERS_PARALLELISM": "false",
+                   "PYTHONPATH": "",
+                   "PYTHONNOUSERSITE": "1"}
             export_path = None
             vqa_metrics = {}
             buf = []
@@ -863,27 +1186,8 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                     if candidates:
                         _user_last_model_path["path"] = str(candidates[0])
 
-            # Register VQA metrics in eval dashboard (same as Custom Mix VL path)
             if vqa_metrics:
-                import datetime as _dt_qs
-                _qs_vl_run = f"vl_{model}_{_dt_qs.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                _qs_log_dir = ROOT / "logs"; _qs_log_dir.mkdir(exist_ok=True)
-                _qs_eval_dir = ROOT / "eval_results" / _qs_vl_run; _qs_eval_dir.mkdir(parents=True, exist_ok=True)
-                _qs_log_lines = [
-                    json.dumps({"loss": vqa_metrics.get("vqa_accuracy_before", 0), "ppl": 1.0}),
-                    json.dumps({"loss": vqa_metrics.get("vqa_accuracy_after",  0), "ppl": 1.0}),
-                    json.dumps({"vqa_accuracy_before": vqa_metrics["vqa_accuracy_before"],
-                                "vqa_accuracy_after":  vqa_metrics["vqa_accuracy_after"],
-                                "vqa_n_samples":       vqa_metrics.get("vqa_n_samples", 0)}),
-                ]
-                (_qs_log_dir / f"train_{_qs_vl_run}.log").write_text("\n".join(_qs_log_lines))
-                (_qs_eval_dir / "summary.md").write_text(
-                    f"# VL Training: {model}\n\n"
-                    f"| Metric | Before | After | Change |\n|---|---|---|---|\n"
-                    f"| VQA Accuracy | {vqa_metrics['vqa_accuracy_before']:.1%} | "
-                    f"{vqa_metrics['vqa_accuracy_after']:.1%} | "
-                    f"{(vqa_metrics['vqa_accuracy_after']-vqa_metrics['vqa_accuracy_before'])*100:+.1f}pp |\n"
-                )
+                _register_vqa_metrics(model, vqa_metrics)
 
             yield build_progress_html("done"), terminal_wrap(
                 'Waiting for GPU memory to clear before loading chat model...')
@@ -1013,7 +1317,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
 
         if not ds_names:
             available_ds = list_cleaned_datasets()
-            ds_names = [available_ds[0]] if available_ds else ["alpaca"]
+            ds_names = [available_ds[0]] if available_ds else ["llava-instruct-150k"]
         dataset = ds_names[0]
 
         model_path = str(ROOT / "models" / model)
@@ -1025,27 +1329,21 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
             ds_path = str(ROOT / "datasets" / dataset)
             if not Path(ds_path).exists():
                 ds_path = str(ROOT / "cleaned_datasets" / dataset)  # legacy fallback
-            out_path = str(ROOT / "checkpoints" / f"vl_{model}")
-            cmd = [
-                "python", str(ROOT / "vl_trainer.py"),
-                "--model", model_path,
-                "--dataset", ds_path,
-                "--output", out_path,
-                "--quant", "bf16",
-                "--lora-r", "16",
-                "--lr", "2e-4",
-                "--epochs", str(epochs),
-            ]
-            if max_steps > 0:
-                cmd += ["--max-steps", str(max_steps)]
+            out_path = str(ROOT / "checkpoints" / f"vl_{model}_{time.strftime('%Y%m%d_%H%M%S')}")
+            cmd = _build_vl_cmd(model_path, ds_path, out_path,
+                                max_steps=max_steps, epochs=epochs)
 
             yield build_progress_html("configure"), terminal_wrap("Setting up VL training...")
             yield build_progress_html("smoke"), terminal_wrap("Starting VL trainer (smoke + train + merge)...")
 
             env = {**os.environ,
+                   "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES", "0"),
                    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                   "HF_ENABLE_PARALLEL_LOADING": "0",
                    "HF_HUB_OFFLINE": "1",
-                   "TOKENIZERS_PARALLELISM": "false"}
+                   "TOKENIZERS_PARALLELISM": "false",
+                   "PYTHONPATH": "",
+                   "PYTHONNOUSERSITE": "1"}
             export_path = None
             vqa_metrics = {}
             buf = []
@@ -1076,27 +1374,8 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                     if candidates:
                         _user_last_model_path["path"] = str(candidates[0])
 
-            # Write VQA metrics to log so the eval dashboard can find this run
             if vqa_metrics:
-                import datetime as _dt_vqa
-                _vl_run = f"vl_{model}_{_dt_vqa.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                _log_dir = ROOT / "logs"; _log_dir.mkdir(exist_ok=True)
-                _eval_dir = ROOT / "eval_results" / _vl_run; _eval_dir.mkdir(parents=True, exist_ok=True)
-                _log_lines = [
-                    json.dumps({"loss": vqa_metrics.get("vqa_accuracy_before", 0), "ppl": 1.0}),
-                    json.dumps({"loss": vqa_metrics.get("vqa_accuracy_after",  0), "ppl": 1.0}),
-                    json.dumps({"vqa_accuracy_before": vqa_metrics["vqa_accuracy_before"],
-                                "vqa_accuracy_after":  vqa_metrics["vqa_accuracy_after"],
-                                "vqa_n_samples":       vqa_metrics.get("vqa_n_samples", 0)}),
-                ]
-                (_log_dir / f"train_{_vl_run}.log").write_text("\n".join(_log_lines))
-                (_eval_dir / "summary.md").write_text(
-                    f"# VL Training: {model}\n\n"
-                    f"| Metric | Before | After | Change |\n|---|---|---|---|\n"
-                    f"| VQA Accuracy | {vqa_metrics['vqa_accuracy_before']:.1%} | "
-                    f"{vqa_metrics['vqa_accuracy_after']:.1%} | "
-                    f"{(vqa_metrics['vqa_accuracy_after']-vqa_metrics['vqa_accuracy_before'])*100:+.1f}pp |\n"
-                )
+                _register_vqa_metrics(model, vqa_metrics)
 
             # Kill ALL processes that hold VRAM and wait for memory to be fully released
             yield build_progress_html("done"), terminal_wrap(
@@ -1233,7 +1512,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
     ).then(show_cancel_btn, outputs=_btn_outs
     ).then(
         run_user_quickstart,
-        inputs=[user_qs_dataset, user_qs_file, user_qs_name, user_qs_test_mode, user_qs_test_steps, user_qs_max_steps],
+        inputs=[user_qs_dataset, user_qs_file, user_qs_server_dd, user_qs_name, user_qs_test_mode, user_qs_test_steps, user_qs_max_steps],
         outputs=[user_progress_html, user_progress_out],
         show_progress=False,
     ).then(show_home_btn, outputs=_btn_outs
@@ -1257,6 +1536,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
     def cancel_training():
         import subprocess as _sp, signal as _sig
         try:
+            _sp.run(["pkill", "-f", "vl_trainer.py"],     capture_output=True)
             _sp.run(["pkill", "-f", "axolotl.cli.train"], capture_output=True)
             _sp.run(["pkill", "-f", "ft_train.py"],       capture_output=True)
         except Exception:
@@ -1271,6 +1551,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
 
     def do_cancel():
         import subprocess as _sp
+        _sp.run(["pkill", "-f", "vl_trainer.py"],     capture_output=True)
         _sp.run(["pkill", "-f", "axolotl.cli.train"], capture_output=True)
         _sp.run(["pkill", "-f", "ft_train.py"],       capture_output=True)
         return (
@@ -1401,7 +1682,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
         try:
             if image is not None and not _state._chat_is_vision:
                 reply = ("⚠️ This model is text-only and cannot process images. "
-                         "Load a vision-language model (e.g. Nemotron 12B VL) to use image input.")
+                         "Load a vision-language model (e.g. Gemma 4 12B) to use image input.")
             else:
                 import re as _re_hist
                 msgs = [{"role": "system", "content": "You are a helpful assistant."}]
@@ -1418,7 +1699,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                             msgs.append({"role": t["role"], "content": content})
                 msgs.append({"role": "user", "content": message})
                 # 512 for VL (image present) keeps causal mask under ~2 GiB; 256 for text
-                _max_tok = 512 if (image is not None and _state._chat_is_vision) else 256
+                _max_tok = 200 if (image is not None and _state._chat_is_vision) else 80
                 reply = _generate_reply(msgs, max_tokens=_max_tok, image=image)
         except Exception as e:
             import traceback as _tb_gen
@@ -1643,9 +1924,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                     derived = name.strip() or fpath.stem.lower().replace(" ", "-")
                     if fpath.suffix.lower() == ".pdf":
                         try:
-                            import sys as _sys
-                            _sys.path.insert(0, str(ROOT))
-                            from pdf_utils import pdf_dataset_to_jsonl
+                            from ft_platform.pdf_utils import pdf_dataset_to_jsonl
                             ds_dir = ROOT / "datasets" / derived
                             ds_dir.mkdir(parents=True, exist_ok=True)
                             yield terminal_wrap(f"Converting PDF to image dataset: <b>{derived}</b>...")
@@ -1879,6 +2158,9 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                                               label="Max chars per example")
                         clean_val = gr.Slider(0.005, 0.1, value=0.01, step=0.005,
                                               label="Validation ratio")
+                        clean_minresp = gr.Slider(1, 100, value=10, step=1,
+                                                  label="Min response chars  (auto=1 for image/VQA datasets)",
+                                                  info="Short-answer datasets (VQA, classification) should use 1")
                         clean_nopii = gr.Checkbox(label="Skip PII scrub  (not recommended)")
                         with gr.Row():
                             clean_ref_btn = gr.Button("↺ Refresh", size="sm", variant="secondary")
@@ -1896,30 +2178,24 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                     with gr.Column(scale=2):
                         card_out = gr.HTML(terminal_wrap(""))
 
-                def do_clean(n, mc, vr, nopii):
-                    args = ["clean-dataset", n, "--max-chars", str(int(mc)), "--val-ratio", str(vr)]
+                def do_clean(n, mc, vr, minresp, nopii):
+                    args = ["clean-dataset", n, "--max-chars", str(int(mc)),
+                            "--val-ratio", str(vr),
+                            "--min-response-chars", str(int(minresp))]
                     if nopii: args.append("--no-pii")
                     yield from run_ft(args)
 
-                def do_clean_and_preview(n, mc, vr, nopii):
+                def do_clean_and_preview(n, mc, vr, minresp, nopii):
                     # Stream cleaning output, then auto-load preview + data card
                     last = ""
-                    for chunk in do_clean(n, mc, vr, nopii):
+                    for chunk in do_clean(n, mc, vr, minresp, nopii):
                         last = chunk
                         yield last, terminal_wrap(""), terminal_wrap("")
                     yield last, read_sample(n), read_data_card(n)
 
                 clean_ref_btn.click(lambda: gr.Dropdown(choices=list_datasets()), outputs=clean_dd)
-                clean_btn.click(
-                    do_clean_and_preview,
-                    inputs=[clean_dd, clean_max, clean_val, clean_nopii],
-                    outputs=[clean_out, sample_out, card_out],
-                    show_progress=False,
-                )
-
-                # Wire here so clean_dd is in scope — auto-fills Tab 2 when dataset selected in Tab 1
-                existing_ds_use.click(use_existing_ds, inputs=existing_ds_cb,
-                                      outputs=[existing_ds_info, add_ds_out, clean_dd])
+                # NOTE: clean_btn.click and existing_ds_use.click are wired in Tab 4 section
+                # using .then() chains to also auto-fill cfg_ds after the primary handler runs.
 
             # ── 3 · Add Model ─────────────────────────────────────────────────────
             with gr.Tab("3 · Model"):
@@ -2077,7 +2353,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                         cfg_yaml = gr.Code(label="Generated YAML (text mode) / Config summary (VL mode)",
                                            language="yaml", lines=22, interactive=False)
 
-                def do_configure(model, ds, mode, quant, lora_r, lr, epochs, seq,
+                def do_configure(model, ds, mode, quant, lora_r, img_res, lr, epochs, seq,
                                  wandb_on, wandb_project, wandb_entity):
                     if mode == "multimodal":
                         # For VL mode, write a JSON config file instead of Axolotl YAML
@@ -2095,6 +2371,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                             "dataset": ds,
                             "quant": quant_map.get(quant, "bf16"),
                             "lora_r": int(lora_r),
+                            "img_res": int(img_res or 224),
                             "lr": lr,
                             "epochs": int(epochs),
                             "seq_len": int(seq),
@@ -2128,7 +2405,7 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
     
                 cfg_btn.click(do_configure,
                               inputs=[cfg_model, cfg_ds, cfg_mode, cfg_quant, cfg_lora_r,
-                                      cfg_lr, cfg_epochs, cfg_seq,
+                                      cfg_img_res, cfg_lr, cfg_epochs, cfg_seq,
                                       cfg_wandb_enable, cfg_wandb_project, cfg_wandb_entity],
                               outputs=[cfg_out, cfg_yaml], show_progress=False)
 
@@ -2137,44 +2414,71 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                                        inputs=existing_model_dd,
                                        outputs=[model_server_info, cfg_model])
 
-                # Cross-tab: Tab 2 "Clean" done → auto-fill cfg_ds in Tab 4
+                # Cross-tab: after Tab 2 "Clean" completes, auto-fill cfg_ds in Tab 4
+                # Uses .then() to chain AFTER the primary clean handler, not overwrite it
                 clean_btn.click(
+                    do_clean_and_preview,
+                    inputs=[clean_dd, clean_max, clean_val, clean_minresp, clean_nopii],
+                    outputs=[clean_out, sample_out, card_out],
+                    show_progress=False,
+                ).then(
                     lambda ds: gr.Dropdown(value=ds),
                     inputs=clean_dd, outputs=cfg_ds,
                 )
 
-                # Cross-tab: Tab 1 "Use selected" → auto-fill cfg_ds in Tab 4
+                # Cross-tab: after Tab 1 "Use selected", auto-fill cfg_ds in Tab 4
                 existing_ds_use.click(
-                    lambda ds_name: gr.Dropdown(value=ds_name),
+                    use_existing_ds, inputs=existing_ds_cb,
+                    outputs=[existing_ds_info, add_ds_out, clean_dd],
+                ).then(
+                    lambda ds: gr.Dropdown(value=ds),
                     inputs=clean_dd, outputs=cfg_ds,
                 )
 
             # ── 5 · Train ─────────────────────────────────────────────────────────
             with gr.Tab("5 · Train"):
+                gr.HTML('<h3 style="color:#e6edf3;margin:0 0 4px;">Train your model</h3>'
+                        '<p style="color:#8b949e;font-size:13px;margin:0 0 16px;">'
+                        'Run a quick smoke test first, then start the full training run.</p>')
+
                 def _recipe_label_html():
                     cfg = list_configs()[0] if list_configs() else "none — run Configure first"
-                    return (f'<div style="color:#8b949e;font-size:13px;margin-bottom:12px;">'
-                            f'Using recipe: <span style="color:#58a6ff;font-weight:600;">{cfg}</span></div>')
+                    return (f'<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;'
+                            f'padding:10px 16px;margin-bottom:16px;">'
+                            f'<span style="color:#8b949e;font-size:12px;">Active recipe:</span> '
+                            f'<span style="color:#58a6ff;font-weight:600;font-size:13px;">{cfg}</span></div>')
 
                 train_recipe_label = gr.HTML(value=_recipe_label_html())
 
-                with gr.Row():
-                    smoke_steps = gr.Number(
-                        label="Smoke test steps", value=50, precision=0,
-                        minimum=10, maximum=200,
-                        info="10 ≈ 30 sec · 50 ≈ 2 min · 200 ≈ 8 min", scale=1,
-                    )
-                    train_max_steps = gr.Number(
-                        label="Max training steps (0 = run all epochs)",
-                        value=0, precision=0, minimum=0, scale=1,
-                        info="e.g. 200 for a quick test · 0 = use epochs from Configure",
-                    )
+                with gr.Row(equal_height=True):
+                    with gr.Column(scale=1):
+                        gr.HTML('<div style="color:#e6edf3;font-size:14px;font-weight:600;margin-bottom:8px;">'
+                                'Quick Smoke Test</div>'
+                                '<div style="color:#8b949e;font-size:12px;margin-bottom:12px;">'
+                                'Validates config works before committing to a full run.</div>')
+                        smoke_steps = gr.Slider(
+                            label="Steps", value=50, minimum=10, maximum=200, step=10,
+                            info="10 ≈ 30 sec · 50 ≈ 2 min · 200 ≈ 8 min",
+                        )
+                        smoke_btn = gr.Button("Run Smoke Test", variant="secondary", size="lg")
 
-                with gr.Row():
-                    smoke_btn      = gr.Button("Smoke Test",         variant="secondary", scale=1)
-                    train_btn      = gr.Button("Start Full Training", variant="primary",   scale=2)
-                    dev_cancel_btn = gr.Button("Cancel",              variant="stop",      scale=0, visible=False)
+                    with gr.Column(scale=1):
+                        gr.HTML('<div style="color:#e6edf3;font-size:14px;font-weight:600;margin-bottom:8px;">'
+                                'Full Training</div>'
+                                '<div style="color:#8b949e;font-size:12px;margin-bottom:12px;">'
+                                'Train on the complete dataset. Set 0 to run all epochs.</div>')
+                        train_max_steps = gr.Number(
+                            label="Max steps  (0 = full epochs)",
+                            value=0, precision=0, minimum=0,
+                            info="100 ≈ 5 min · 500 ≈ 30 min · 1000 ≈ 1 hr",
+                        )
+                        train_btn = gr.Button("Start Full Training", variant="primary", size="lg")
 
+                dev_cancel_btn = gr.Button("Cancel Training", variant="stop", visible=False)
+
+                gr.HTML('<div style="border-top:1px solid #30363d;margin:16px 0 12px;"></div>'
+                        '<p style="color:#8b949e;font-size:11px;font-weight:600;'
+                        'letter-spacing:0.06em;margin:0 0 8px;">TRAINING OUTPUT</p>')
                 train_out = gr.HTML(terminal_wrap(""))
 
                 def _latest_config():
@@ -2216,23 +2520,15 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                         ds_path = str(_ds_canonical if _ds_canonical.exists() else _ds_legacy)
                     else:
                         ds_path = ds_name
-                    out_path   = str(ROOT / "checkpoints" / f"vl_{model_name}")
+                    out_path   = str(ROOT / "checkpoints" / f"vl_{model_name}_{time.strftime('%Y%m%d_%H%M%S')}")
                     quant      = quant_map.get(cfg_data.get("quant", "bf16"), "bf16")
                     lora_r     = cfg_data.get("lora_r", 16)
                     lr         = cfg_data.get("lr", 2e-4)
                     epochs     = cfg_data.get("epochs", 3)
-                    cmd = [
-                        "python", str(ROOT / "vl_trainer.py"),
-                        "--model", model_path,
-                        "--dataset", ds_path,
-                        "--output", out_path,
-                        "--quant", quant,
-                        "--lora-r", str(lora_r),
-                        "--lr", str(lr),
-                        "--epochs", str(int(epochs)),
-                    ]
-                    if smoke:
-                        cmd.append("--smoke")
+                    cmd = _build_vl_cmd(model_path, ds_path, out_path,
+                                        quant=quant, lora_r=int(lora_r),
+                                        lr=float(lr), epochs=int(epochs),
+                                        smoke=bool(smoke))
                     return cmd
 
                 def do_smoke(steps):
@@ -2245,18 +2541,25 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                     if vl_cfg:
                         import subprocess as _sp
                         cmd = _vl_train_cmd(vl_cfg, smoke=True)
-                        yield gr.Button(visible=True), terminal_wrap(f"Running VL smoke test ({c})...")
+                        yield gr.Button(visible=True), terminal_wrap("Starting VL smoke test...")
+                        _vl_env = {**os.environ,
+                                   "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES", "0"),
+                                   "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                                   "HF_ENABLE_PARALLEL_LOADING": "0",
+                                   "HF_HUB_OFFLINE": "1",
+                                   "TOKENIZERS_PARALLELISM": "false",
+                                   "PYTHONPATH": "",
+                                   "PYTHONNOUSERSITE": "1",
+                                   "PYTHONUNBUFFERED": "1"}
                         with _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True,
-                                       env={**os.environ,
-                                            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-                                            "HF_HUB_OFFLINE": "1",
-                                            "TOKENIZERS_PARALLELISM": "false"}) as proc:
+                                       bufsize=1, env=_vl_env) as proc:
                             buf = []
                             for line in proc.stdout:
-                                buf.append(line.rstrip())
-                                yield gr.Button(visible=True), terminal_wrap("\n".join(buf[-200:]))
-                        chunk = terminal_wrap("\n".join(buf[-200:]))
-                        yield gr.Button(visible=False), chunk
+                                formatted = _format_train_line(line)
+                                if formatted is not None:
+                                    buf.append(formatted)
+                                    yield gr.Button(visible=True), '<div style="padding:8px 12px;">' + "".join(buf[-50:]) + '</div>'
+                        yield gr.Button(visible=False), '<div style="padding:8px 12px;">' + "".join(buf[-50:]) + '</div>'
                         return
                     yield gr.Button(visible=True), terminal_wrap(f"Running smoke test with {c}...")
                     for chunk in run_ft(["smoke-test", f"configs/{c}", "--steps", str(int(steps))]):
@@ -2275,18 +2578,25 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                         cmd = _vl_train_cmd(vl_cfg, smoke=False)
                         if int(max_steps or 0) > 0:
                             cmd += ["--max-steps", str(int(max_steps))]
-                        yield gr.Button(visible=True), terminal_wrap(f"Starting VL training ({c})...")
+                        yield gr.Button(visible=True), terminal_wrap("Starting VL training...")
+                        _vl_env = {**os.environ,
+                                   "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES", "0"),
+                                   "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                                   "HF_ENABLE_PARALLEL_LOADING": "0",
+                                   "HF_HUB_OFFLINE": "1",
+                                   "TOKENIZERS_PARALLELISM": "false",
+                                   "PYTHONPATH": "",
+                                   "PYTHONNOUSERSITE": "1",
+                                   "PYTHONUNBUFFERED": "1"}
                         with _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True,
-                                       env={**os.environ,
-                                            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-                                            "HF_HUB_OFFLINE": "1",
-                                            "TOKENIZERS_PARALLELISM": "false"}) as proc:
+                                       bufsize=1, env=_vl_env) as proc:
                             buf = []
                             for line in proc.stdout:
-                                buf.append(line.rstrip())
-                                yield gr.Button(visible=True), terminal_wrap("\n".join(buf[-200:]))
-                        chunk = terminal_wrap("\n".join(buf[-200:]))
-                        yield gr.Button(visible=False), chunk
+                                formatted = _format_train_line(line)
+                                if formatted is not None:
+                                    buf.append(formatted)
+                                    yield gr.Button(visible=True), '<div style="padding:8px 12px;">' + "".join(buf[-50:]) + '</div>'
+                        yield gr.Button(visible=False), '<div style="padding:8px 12px;">' + "".join(buf[-50:]) + '</div>'
                         return
                     cmd = ["train", f"configs/{c}"]
                     if int(max_steps or 0) > 0:
@@ -2426,8 +2736,12 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
                                                    allow_custom_value=True, scale=3)
                             exp_ref = gr.Button("↺", size="sm", variant="secondary", scale=0)
                         with gr.Row():
-                            exp_quant = gr.Radio(["awq", "none"], value="awq",
-                                                  label="Quantization format")
+                            exp_quant = gr.Radio(
+                                ["none", "awq", "gptq", "bnb-4bit", "bnb-8bit"],
+                                value="none",
+                                label="Quantization format",
+                                info="none = bf16 (best quality) · AWQ/GPTQ = 4-bit (smaller, text models) · BnB = BitsAndBytes (VL compatible)",
+                            )
                             exp_gguf  = gr.Checkbox(label="Also export GGUF  (for llama.cpp)")
                         exp_btn = gr.Button(" Export Model", variant="primary")
                         exp_out = gr.HTML(terminal_wrap(""))
@@ -2637,13 +2951,13 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
     
                 def chat_respond(message, history, system_prompt, max_tokens, image=None):
                     if not message.strip():
-                        yield history or [], ""
+                        yield history or [], "", image
                         return
                     history = list(history or [])
                     if _state._chat_model is None and _state._vllm_client is None:
-                        history.append({"role": "user",      "content": message})
+                        history.append({"role": "user",      "content": _build_chat_content(message, image)})
                         history.append({"role": "assistant", "content": "No model loaded. Please load a model first."})
-                        yield history, ""
+                        yield history, "", None
                         return
                     try:
                         def extract_text(content) -> str:
@@ -2655,30 +2969,35 @@ with gr.Blocks(title="MKD Fine-Tuning Platform") as app:
 
                         if image is not None and not _state._chat_is_vision:
                             reply = ("⚠️ This model is text-only and cannot process images. "
-                                     "Load a vision-language model (e.g. Nemotron 12B VL) to use image input.")
+                                     "Load a vision-language model (e.g. Gemma 4 12B) to use image input.")
                         else:
+                            import re as _re_hist
                             msgs = [{"role": "system", "content": system_prompt}]
                             for turn in history:
                                 if isinstance(turn, dict):
-                                    msgs.append({"role": turn.get("role", "user"),
-                                                 "content": extract_text(turn.get("content", ""))})
+                                    content = extract_text(turn.get("content", ""))
+                                    # Strip base64 images from history to avoid OOM
+                                    content = _re_hist.sub(r'<img\b[^>]*>', '[image]', content).strip()
+                                    if content:
+                                        msgs.append({"role": turn.get("role", "user"),
+                                                     "content": content})
                             msgs.append({"role": "user", "content": message})
                             reply = _generate_reply(msgs, max_tokens=max_tokens, image=image)
                     except Exception as e:
                         reply = f"Error: {e}"
 
-                    history.append({"role": "user",      "content": message})
+                    history.append({"role": "user",      "content": _build_chat_content(message, image)})
                     history.append({"role": "assistant", "content": reply})
-                    yield history, ""
+                    yield history, "", None
 
                 chat_load_btn.click(load_model, inputs=chat_model_dd, outputs=chat_status)
                 chat_unload_btn.click(unload_model, outputs=chat_status)
                 chat_send.click(chat_respond,
                                 inputs=[chat_input, chatbot, chat_system, chat_max_tokens, chat_image],
-                                outputs=[chatbot, chat_input], show_progress=False)
+                                outputs=[chatbot, chat_input, chat_image], show_progress=False)
                 chat_input.submit(chat_respond,
                                   inputs=[chat_input, chatbot, chat_system, chat_max_tokens, chat_image],
-                                  outputs=[chatbot, chat_input], show_progress=False)
+                                  outputs=[chatbot, chat_input, chat_image], show_progress=False)
                 chat_clear.click(lambda: ([], None), outputs=[chatbot, chat_image])
     
         # ── Footer ────────────────────────────────────────────────────────────────
@@ -2698,11 +3017,15 @@ if __name__ == "__main__":
                     "Set ADMIN_PASSWORD env var to enable auth. "
                     "To expose externally use --host 0.0.0.0 (or a reverse proxy)."
     )
-    ap.add_argument("--port",  type=int, default=7860)
+    ap.add_argument("--port",      type=int, default=int(os.environ.get("GRADIO_SERVER_PORT", 7861)))
     # H-7: Default to localhost-only for security.
     # Use --host 0.0.0.0 to expose on the network (behind a firewall / reverse proxy).
-    ap.add_argument("--host",  default="127.0.0.1")
-    ap.add_argument("--share", action="store_true")
+    ap.add_argument("--host",      default="127.0.0.1")
+    ap.add_argument("--share",     action="store_true")
+    ap.add_argument("--root-path", default=os.environ.get("GRADIO_ROOT_PATH", ""),
+                    help="Root path prefix when running behind a reverse proxy "
+                         "(e.g. --root-path /proxy/7861). "
+                         "Also readable from GRADIO_ROOT_PATH env var.")
     args = ap.parse_args()
 
     # H-7: Optional HTTP basic auth via ADMIN_PASSWORD env var
@@ -2757,4 +3080,5 @@ if __name__ == "__main__":
         theme=theme,
         css=CSS,
         max_threads=10,
+        root_path=args.root_path or None,
     )

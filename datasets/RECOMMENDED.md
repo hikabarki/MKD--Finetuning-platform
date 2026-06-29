@@ -22,7 +22,7 @@ Korean-focused deployment (`mkd-hika` W&B entity), the following datasets are re
 | **HuggingFace ID** | `nayohan/llama3-instrction-ko-dataset` |
 | **Size** | ~50 k conversational instruction rows |
 | **Format** | ShareGPT / ChatML — auto-detected by `ft add-dataset` |
-| **Why useful** | Korean conversational instruction-following tuned for LLaMA-3 style chat templates — compatible with Nemotron (also LLaMA-3 based). |
+| **Why useful** | Korean conversational instruction-following tuned for LLaMA-3 style chat templates — compatible with Gemma 4 (also LLaMA-3 based). |
 | **Download** | `ft add-dataset nayohan/llama3-instrction-ko-dataset --name ko-instruct` |
 
 ---
@@ -33,7 +33,7 @@ Korean-focused deployment (`mkd-hika` W&B entity), the following datasets are re
 | **HuggingFace ID** | `HuggingFaceM4/NoCaps` |
 | **Size** | ~15 k image-caption pairs (validation split only; test is held-out) |
 | **Format** | Image + caption → converted to image-caption ChatML by `ft add-dataset` |
-| **Why useful** | High-quality out-of-domain captioning benchmark images; small enough for quick VQA testing with Nemotron Nano VL. Images are COCO-format with diverse subjects. |
+| **Why useful** | High-quality out-of-domain captioning benchmark images; small enough for quick VQA testing with Gemma 4 12B. Images are COCO-format with diverse subjects. |
 | **Download** | `ft add-dataset HuggingFaceM4/NoCaps --name nocaps-vqa` |
 
 ---
@@ -73,7 +73,7 @@ ft clean-dataset ko-vqa --lang ko,en --val-ratio 0.01
 head -3 datasets/ko-vqa/sample_100.jsonl
 
 # 4. Fine-tune the VL model
-ft configure --model nvidia__nvidia-nemotron-nano-12b-v2-vl-bf16 \
+ft configure --model gemma-4-12b \
              --dataset ko-vqa --mode vl --quant bf16
 
 # 5. Train (smoke test first)
@@ -85,5 +85,5 @@ ft eval checkpoints/vl_<timestamp>
 
 # 7. Export + publish
 ft export checkpoints/vl_<timestamp> --merge
-ft publish exports/run_<timestamp>/merged --hf-repo mkd-hika/nemotron-ko-vqa
+ft publish exports/run_<timestamp>/merged --hf-repo mkd-hika/gemma-ko-vqa
 ```

@@ -34,7 +34,7 @@ def test_is_vision_model_empty_dir(tmp_path: Path):
 # ── _is_vl_model ──────────────────────────────────────────────────────────────
 
 def test_is_vl_model_auto_map_vl(tmp_path: Path):
-    cfg = {"auto_map": {"AutoModel": "modeling_vl.NemotronVLModel"}}
+    cfg = {"auto_map": {"AutoModel": "modeling_vl.Gemma4ForConditionalGeneration"}}
     (tmp_path / "config.json").write_text(json.dumps(cfg))
     from inference.chat import _is_vl_model
     assert _is_vl_model(str(tmp_path)) is True

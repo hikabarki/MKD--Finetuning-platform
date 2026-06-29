@@ -371,6 +371,17 @@ def main():
     info(f"Loaded {len(rows)} normalized rows")
     card["rows_raw"] = len(rows)
 
+    # Auto-detect image/VQA datasets and relax the short-response threshold.
+    # VQA answers ("yes", "2", "red") are naturally short — the default of 10
+    # chars would silently drop almost the entire dataset.
+    _is_image_dataset = any(r.get("images") for r in rows[:200])
+    _user_set_minresp = "--min-response-chars" in sys.argv
+    if _is_image_dataset and not _user_set_minresp:
+        info(f"Detected image/VQA dataset — setting min-response-chars=1 "
+             f"(short answers like 'yes'/'no' are valid for VQA). "
+             f"Override with --min-response-chars if needed.")
+        args.min_response_chars = 1
+
     # Schema
     rows = [r for r in rows if schema_valid(r)]
     info(f"After schema validation: {len(rows)} rows")

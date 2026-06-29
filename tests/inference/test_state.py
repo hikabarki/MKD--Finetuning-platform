@@ -17,7 +17,7 @@ def test_root_points_to_repo_root():
 
 
 def test_revision_sha_none_by_default(monkeypatch):
-    monkeypatch.delenv("NEMOTRON_REVISION_SHA", raising=False)
+    monkeypatch.delenv("MODEL_REVISION_SHA", raising=False)
     # Re-evaluate the expression; module is already loaded, but the env var
     # is read at load time. Test the constant is None when env is absent.
     import inference.state as state
@@ -27,14 +27,14 @@ def test_revision_sha_none_by_default(monkeypatch):
 
 def test_revision_sha_from_env(monkeypatch):
     sha = "abc123def456" * 3
-    monkeypatch.setenv("NEMOTRON_REVISION_SHA", sha)
+    monkeypatch.setenv("MODEL_REVISION_SHA", sha)
     # Reimport to pick up env change (use importlib)
     import importlib
     import inference.state as state
     importlib.reload(state)
     assert state.REVISION_SHA == sha
     # Reload back to clean state
-    monkeypatch.delenv("NEMOTRON_REVISION_SHA", raising=False)
+    monkeypatch.delenv("MODEL_REVISION_SHA", raising=False)
     importlib.reload(state)
 
 

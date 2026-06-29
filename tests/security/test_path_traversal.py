@@ -36,7 +36,7 @@ def test_safe_name_rejects_bad_input(bad):
     "mymodel",
     "dataset-v2",
     "run_2026-06-18_0900",
-    "nvidia__nemotron-nano-12b",
+    "google__gemma-4-12b",
     "abc123",
     "my.model.ckpt",
     "A" * 50,

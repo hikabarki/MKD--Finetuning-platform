@@ -13,12 +13,21 @@ def test_is_vllm_model_hf_quant_config(tmp_path: Path):
     assert _is_vllm_model(str(tmp_path)) is True
 
 
-def test_is_vllm_model_vllm_arch(tmp_path: Path):
-    """Model with a vLLM-only architecture in config.json → vLLM required."""
-    cfg = {"architectures": ["NemotronH_Nano_Omni_Reasoning_V3"]}
+def test_is_vllm_model_quant_method(tmp_path: Path):
+    """Model with fp8/nvfp4 quantization_config → vLLM required."""
+    cfg = {"architectures": ["Gemma4ForConditionalGeneration"],
+           "quantization_config": {"quant_method": "fp8"}}
     (tmp_path / "config.json").write_text(json.dumps(cfg))
     from inference.vllm_server import _is_vllm_model
     assert _is_vllm_model(str(tmp_path)) is True
+
+
+def test_is_vllm_model_arch_only_not_vllm(tmp_path: Path):
+    """Architecture alone (no quant config) → NOT vLLM (fine-tuned exports use Transformers)."""
+    cfg = {"architectures": ["Gemma4ForConditionalGeneration"]}
+    (tmp_path / "config.json").write_text(json.dumps(cfg))
+    from inference.vllm_server import _is_vllm_model
+    assert _is_vllm_model(str(tmp_path)) is False
 
 
 def test_is_vllm_model_normal_model(tmp_path: Path):

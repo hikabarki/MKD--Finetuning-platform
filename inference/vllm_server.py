@@ -13,7 +13,13 @@ from inference import state as _state
 
 
 def _is_vllm_model(path: str) -> bool:
-    """True if the model needs vLLM (pre-quantized NVFP4/FP8 not loadable by transformers)."""
+    """True if the model needs vLLM (pre-quantized NVFP4/FP8 not loadable by transformers).
+
+    Architecture alone is NOT sufficient — fine-tuned LoRA exports share the
+    same architecture as the base model but are perfectly loadable by
+    Transformers.  Only route to vLLM when explicit quantization config files
+    or quant_method markers indicate a format Transformers cannot handle.
+    """
     p = Path(path)
     if (p / "hf_quant_config.json").exists():
         return True
@@ -22,12 +28,10 @@ def _is_vllm_model(path: str) -> bool:
         import json
         try:
             c = json.loads(cfg.read_text())
-            arch = c.get("architectures", [""])[0]
-            vllm_archs = {
-                "NemotronH_Nano_Omni_Reasoning_V3",
-                "NemotronH_Super_Omni_Reasoning_V3",
-            }
-            if arch in vllm_archs:
+            # Check for quantization methods that require vLLM (NVFP4, FP8, etc.)
+            qcfg = c.get("quantization_config", {})
+            quant_method = qcfg.get("quant_method", "")
+            if quant_method in ("fp8", "nvfp4", "modelopt"):
                 return True
         except Exception:
             pass

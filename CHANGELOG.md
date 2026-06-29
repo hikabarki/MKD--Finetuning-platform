@@ -22,7 +22,7 @@ All notable changes from the original monolithic `app.py` to the production-read
 | B1 | `inference/vllm_server.py` — `is_ready()` returns `False` instead of raising when vLLM not started |
 | B2 | `vl_trainer.py` — `_compute_vqa_accuracy` now raises `RuntimeError` if >50 % of samples fail (was silently returning 0.0) |
 | B3 | `ft_platform/log_parser.py` — `parse_training_log` no longer crashes on malformed ANSI sequences |
-| B4 | `inference/chat.py` — `prepare_inputs_for_generation` patch applied; prevents `NoneType.shape` crash in NemotronH VL inference |
+| B4 | `inference/chat.py` — `prepare_inputs_for_generation` patch applied; prevents `NoneType.shape` crash in Gemma 4H VL inference |
 
 ### Structural Changes
 
