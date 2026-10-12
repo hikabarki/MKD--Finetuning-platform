@@ -6,6 +6,8 @@ Production-grade fine-tuning platform for **NVIDIA GPUs** supporting text and vi
 
 ## Architecture
 
+![MKD Fine-Tuning Platform architecture](docs/mkd_ft_architecture.png)
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        app.py (entry)                        │
