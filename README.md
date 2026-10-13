@@ -15,7 +15,7 @@ Start with the [architecture](#architecture), [deployment instructions](#deploym
 
 ## Architecture
 
-![MKD Fine-Tuning Platform architecture](docs/mkd_ft_architecture.png)
+![MKD Fine-Tuning Platform architecture](docs/mkd_ft_architecture.svg)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
