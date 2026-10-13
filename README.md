@@ -4,6 +4,15 @@ Production-grade fine-tuning platform for **NVIDIA GPUs** supporting text and vi
 
 ---
 
+## Evaluate this project
+
+Start with the [architecture](#architecture), [deployment instructions](#deployment), and [API specification](API_SPEC.md). The UI uses Gradio, the REST API uses FastAPI, and GPU workloads require NVIDIA hardware.
+
+**Validation scope:** the repository documents tests and a training configuration, but this presentation update did not execute a GPU training run. No new training metrics or UI screenshots are claimed. Consult the [CI runs](https://github.com/mkd-hika/MKD--Finetuning-platform/actions) for the current automated-check status.
+
+**License:** the repository currently states internal use for MKD Co., Ltd. Public visibility does not grant an open-source license.
+
+
 ## Architecture
 
 ![MKD Fine-Tuning Platform architecture](docs/mkd_ft_architecture.png)
